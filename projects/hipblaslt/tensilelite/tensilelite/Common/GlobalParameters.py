@@ -499,6 +499,10 @@ defaultInternalSupportParams = {
     # ready flags could wait on parts no resident workgroup runs. Derived in
     # Solution.py; False keeps older/custom kernels' dynamic tiles whole.
     "SupportStreamKArrivalFixup": False,
+    # Pure CAPABILITY: the StreamK Hybrid kernel's dynamic sub-mode reduces
+    # split tiles in parallel (PostGSU) when the host sets bit 29 of SKTiles.
+    # Derived in Solution.py; False keeps older/custom kernels from the bit.
+    "SupportStreamKDynamicParallel": False,
     # Use GG as G's backend
     "UseUniversalArgs": True,
     "UseSFC": False,

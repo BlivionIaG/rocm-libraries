@@ -1398,6 +1398,9 @@ namespace TensileLite
             // SupportStreamKArrivalFixup (GlobalParameters.py): dynamic tiles
             // are split only for these. Older/custom kernels leave this false.
             bool arrivalFixup       = false;
+            // SupportStreamKDynamicParallel (GlobalParameters.py): the parallel
+            // bit is set only for these. Older/custom kernels leave this false.
+            bool dynamicParallel    = false;
             bool useUniversalArgs   = true;
             bool useSFC             = false;
         };
