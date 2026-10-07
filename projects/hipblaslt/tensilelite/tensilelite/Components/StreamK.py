@@ -20,7 +20,7 @@
 # CTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ################################################################################
 
-from ..ExecutionPolicy import isPersistent, isPersistentDataParallel, hasStaticAssignment, hasDynamicAssignment, hasHybridAssignment
+from ..ExecutionPolicy import isPersistent, isPersistentDataParallel, hasStaticAssignment, hasDynamicAssignment, hasHybridAssignment, usesStreamKArrivalFixup
 from rocisa.enum import CacheScope
 from rocisa.code import Module, Label
 from rocisa.container import vgpr, sgpr, mgpr, SMEMModifiers, MUBUFModifiers, DSModifiers, replaceHolder, EXEC, VOP3PModifiers, ContinuousRegister
@@ -4141,11 +4141,15 @@ class StreamKHybrid(StreamK):
     # Summation order: see emitArrivalDynamicStore.
     # ------------------------------------------------------------------
     def usesArrivalFixup(self, writer, kernel):
-        # The ticket broadcast borrows LDS[0, 64*4), so LDS must be idle across
-        # the epilogue (no PAP prefetch). Otherwise use per-part ready flags.
-        return (kernel["DebugStreamK"] == 0
-                and writer.states.asmCaps["HasSAtomic"]
-                and not writer.isPrefetchAcrossPersistentEnabled(kernel))
+        # Gating: see usesStreamKArrivalFixup.
+        uses = usesStreamKArrivalFixup(kernel["DebugStreamK"],
+                                       writer.states.asmCaps["HasSAtomic"],
+                                       writer.isPrefetchAcrossPersistentEnabled(kernel))
+        # Must match the SupportStreamKArrivalFixup the host splits on.
+        advertised = kernel.get("InternalSupportParams", {}).get("SupportStreamKArrivalFixup")
+        assert advertised is None or bool(advertised) == uses, \
+            "SupportStreamKArrivalFixup=%s disagrees with the emitted fixup protocol" % advertised
+        return uses
 
     def emitArrival(self, writer, kernel, arrivalDone, tmpSgprBlock=None):
         """Count this part in on its tile after its partial is released.

@@ -472,6 +472,19 @@ namespace TensileLite
             return d;
         }
 
+        if(!in.allowSplit || in.tiles == 0 || in.splitCUs == 0 || in.tiles >= in.splitCUs)
+            return whole;
+
+        // Largest factor that fits (origami grid_k_split_aware).
+        for(const size_t split : StreamKDynamicSplitFactors)
+        {
+            if(in.tiles * split > in.splitCUs
+               || itersPerTile / split < StreamKDynamicMinItersPerWI)
+                continue;
+            const StreamKDynamicSplit d = decompose(in.tiles, split);
+            if(d.skSplit >= 2 && fits(d.skTiles, d.skSplit))
+                return d;
+        }
         return whole;
     }
 
@@ -7532,9 +7545,21 @@ namespace TensileLite
             in.maxGrid             = pAMDGPU->computeUnitCount * std::min(occupancy, size_t{3});
             if(pAMDGPU->persistentMaxCUs > 0)
                 in.maxGrid = std::min(in.maxGrid, static_cast<size_t>(pAMDGPU->persistentMaxCUs));
+            // A fixed grid (TENSILE_STREAMK_FIXED_GRID) caps the split, so every
+            // part keeps a workgroup of its own.
+            if(pAMDGPU->persistentFixedGrid > 0)
+                in.maxGrid
+                    = std::min(in.maxGrid, static_cast<size_t>(pAMDGPU->persistentFixedGrid));
+            // One part per CU, within the grid above.
+            in.splitCUs = std::min(static_cast<size_t>(pAMDGPU->computeUnitCount), in.maxGrid);
             in.overrideTiles = pAMDGPU->skTiles;
             in.overrideSplit = pAMDGPU->skSplit;
         }
+        // Split only arrival-fixup kernels (see InternalArgsSupport::arrivalFixup).
+        // Uniform summation order and grouped GEMM keep every tile whole.
+        in.allowSplit = internalArgsSupport.arrivalFixup && sizeMapping.hasHybridAssignment()
+                        && !problem.getParams().uniformSummationOrder()
+                        && !problem.groupedGemm();
         // Arrival counters (and per-part flags) start after the queue counters.
         const size_t prefixEntries = streamKQueueRegionBytes(hardware) / sizeof(int);
         in.flagSlots = prefixEntries < StreamKFlagElements ? StreamKFlagElements - prefixEntries : 0;

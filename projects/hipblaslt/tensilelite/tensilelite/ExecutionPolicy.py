@@ -95,6 +95,14 @@ def hasHybridAssignment(state):
     return _policy(state).assignment == WorkAssignment.HYBRID
 
 
+def usesStreamKArrivalFixup(debugStreamK, hasSAtomic, prefetchAcrossPersistent):
+    """Whether a StreamK Hybrid kernel fixes its dynamic sub-mode's split tiles
+    up by last arrival. Needs a returning scalar atomic; DebugStreamK keeps
+    per-part ready flags, and PAP keeps the LDS the arrival borrows live.
+    Shared by StreamKHybrid.usesArrivalFixup and SupportStreamKArrivalFixup."""
+    return debugStreamK == 0 and bool(hasSAtomic) and not prefetchAcrossPersistent
+
+
 def requiresPartialReduction(state):
     return isStreamK(state) and not state.get("StreamKAtomic", 0)
 
