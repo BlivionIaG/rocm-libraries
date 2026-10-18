@@ -323,20 +323,25 @@ if(HIPDNN_ENABLE_KERNEL_INGESTOR)
         "${HIPDNN_BUILD_PLUGIN_ENGINE_DIR}/${HIPKERNELPROVIDER_TEST_DESCRIPTOR_SUBDIR}"
     )
 
-    # Two test descriptor roots, one per test binary. The unit root holds two packed
-    # subtrees and the integration root holds three. A sixth packed subtree, the unit
-    # binary's copy of archive_fixture, stages beside the two roots and not inside the unit
-    # root, so the unit engine does not discover it. All six are wired in
+    # Two test descriptor roots, one per test binary, plus sibling slotted fixture roots
+    # (`slotted`, `slotted_hsaco`, and with rocKE on `slotted_multi_launch`). The unit root
+    # holds two packed subtrees, the integration root three and each slotted root one. One
+    # more packed subtree, the unit binary's copy of archive_fixture, stages beside the two
+    # roots and not inside the unit root, so the unit engine does not discover it. All are
+    # wired in
     # descriptor-packaging/cmake/HkpPackaging.cmake. The packer stages each authored
     # subtree per architecture: it rewrites an authored hip descriptor to kpack and writes
     # the archive beside it. An embedded_source descriptor names a kernel compiled into a
     # binary and JIT-compiled at load; for one of those the packer stamps the shard
     # architecture and records the authored values in the descriptor's provenance sidecar,
-    # and the subtree gets descriptors and no archive. Both roots stage into the build tree
+    # and the subtree gets descriptors and no archive. Every root stages into the build tree
     # rather than being read from the source tree, so the build tree matches the install
     # tree.
     set(HIPKERNELPROVIDER_TEST_SET_UNIT "unit")
     set(HIPKERNELPROVIDER_TEST_SET_INTEGRATION "integration")
+    set(HIPKERNELPROVIDER_TEST_SET_SLOTTED "slotted")
+    set(HIPKERNELPROVIDER_TEST_SET_SLOTTED_HSACO "slotted_hsaco")
+    set(HIPKERNELPROVIDER_TEST_SET_SLOTTED_MULTI_LAUNCH "slotted_multi_launch")
     set(HIPKERNELPROVIDER_UNIT_BUILD_DIR
         "${HIPKERNELPROVIDER_TEST_DESCRIPTOR_BUILD_DIR}/${HIPKERNELPROVIDER_TEST_SET_UNIT}")
     set(HIPKERNELPROVIDER_INTEGRATION_BUILD_DIR
@@ -344,8 +349,8 @@ if(HIPDNN_ENABLE_KERNEL_INGESTOR)
 
     # Not a test root: the production tree's provenance sidecars install here. It shares
     # the folder with the test sets, so it must not reuse unit, integration,
-    # unit_archive_fixture, test_kpack_binary (src/tests/CMakeLists.txt) or the census
-    # folder HkpPackaging.cmake installs.
+    # unit_archive_fixture, slotted, slotted_hsaco, slotted_multi_launch, test_kpack_binary
+    # (src/tests/CMakeLists.txt) or the census folder HkpPackaging.cmake installs.
     set(HIPKERNELPROVIDER_TEST_SET_PROVENANCE "provenance")
 
     set(HIPKERNELPROVIDER_TEST_DESCRIPTOR_SOURCE_ROOT
