@@ -63,6 +63,8 @@ For example, to run ``fp32`` GEMM with validation, use this command:
 
 The norm check of D fails when any one batch's ``norm_error`` reaches the same limit ``hipblaslt-test`` uses for the GEMM. The limit is the largest tolerance among the output and both input types (1e-5 for f32, 0.01 for f16, 0.1 for bf16); f32 output with ``c_f32_fast_bf16_r`` uses at least 0.5. For example, f16 inputs with f32 output use 0.01. The limit applies to each batch; ``hipblaslt-test`` applies the same limit to the sum of the batches instead, so with many batches it can fail a result the bench passes. The bench then prints the failing batch and its error to stderr, and the solution it was for. If D's type has no norm limit, or isn't one the norm check can compare, the bench prints that D was not verified and counts it as a failed check. By default the exit code is 0 whether or not a check fails. With ``--verify_strict``, the bench exits with code 2 when any check of D failed. It checks D only: the checks of E, the bias gradient and amaxD, and ``--ulp``, don't affect the exit code. Only the first launch of each solution is compared with the reference; the launches timed by ``--iters`` and ``--cold_iters`` are not checked.
 
+To catch a solution that is wrong only on some launches, add ``--verify_all_iters``. After timing each solution, the bench relaunches it ``--iters`` more times, untimed, and compares each relaunch's D bit for bit with the first launch's D. When a relaunch differs, the bench prints the first element that changed and whether that relaunch still passes the allclose check against the CPU reference; a solution whose summation order changes from launch to launch can differ and still pass. A difference counts as a failed check for ``--verify_strict``.
+
 For more information, run the command with the ``--help`` option. The output of this command is shown below.
 
 .. code-block:: bash
@@ -103,6 +105,7 @@ For more information, run the command with the ``--help`` option. The output of 
    --HMM                              Parameter requesting the use of HipManagedMemory
    --verify |-v                       Validate GPU results with CPU?
    --verify_strict                    Exit with code 2 if a --verify check of D fails (norm_error above its limit, or allclose failed). Checks D only. Implies --verify.
+   --verify_all_iters                 After timing, relaunch each solution --iters more times, untimed, and check that every relaunch gives the same D, bit for bit, as the first launch. Implies --verify.
    --iters |-i <value>                Iterations to run inside timing loop                                                (Default value is: 10)
    --cold_iters |-j <value>           Cold Iterations to run before entering the timing loop                              (Default value is: 2)
    --algo_method <value>              Use different algorithm search API. Options: heuristic, all, index.                 (Default value is: heuristic)

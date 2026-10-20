@@ -118,4 +118,10 @@ namespace hipblaslt_bench_options
             arg.norm_check_assert = false;
         }
     }
+
+    bool& verify_all_iters()
+    {
+        static bool v = false;
+        return v;
+    }
 }
