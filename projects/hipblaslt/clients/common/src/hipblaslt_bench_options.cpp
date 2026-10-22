@@ -119,9 +119,9 @@ namespace hipblaslt_bench_options
         }
     }
 
-    bool& verify_all_iters()
+    int32_t& post_bench_verify_iters()
     {
-        static bool v = false;
+        static int32_t v = 0;
         return v;
     }
 }

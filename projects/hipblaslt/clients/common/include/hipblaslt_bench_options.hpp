@@ -32,8 +32,8 @@ struct Arguments;
 // for each of the norm and allclose checks. With verify_strict set, verification_exit_code
 // turns a run that would exit 0 into exit code 2 when any check failed.
 //
-// verify_all_iters relaunches each solution --iters more times after timing, untimed, and
-// checks that every relaunch gives the same D, bit for bit, as the first launch.
+// post_bench_verify_iters is the number of untimed relaunches of each solution after timing
+// (0 turns them off); every relaunch must give the same D, bit for bit, as the first launch.
 namespace hipblaslt_bench_options
 {
     int32_t&     cotenant_cus();
@@ -50,5 +50,5 @@ namespace hipblaslt_bench_options
     int64_t&     verification_failures();
     int          verification_exit_code(int ret);
     void         apply_strict_verification(Arguments& arg);
-    bool&        verify_all_iters();
+    int32_t&     post_bench_verify_iters();
 }
