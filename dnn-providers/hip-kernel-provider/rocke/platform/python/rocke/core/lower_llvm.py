@@ -64,6 +64,8 @@ from .ir import (
     Value,
     VectorType,
     _buffer_op_bytes,
+    _global_ptr_offset_op_error,
+    _global_ptr_to_i64_op_error,
     _if_else_branch_yield,
     _is_unsigned,
     _refuse_non_u8_source,
@@ -5508,10 +5510,25 @@ class _Lowerer:
             f"{self._operand(ptr)}, i64 {off64}"
         )
 
+    def _op_tile_global_ptr_offset(self, op: Op) -> None:
+        # ptr + byte_off without ``inbounds``: the result may point outside
+        # the allocation, so the compiler must not assume it does not.
+        error = _global_ptr_offset_op_error(op)
+        if error:
+            raise ValueError(error)
+        ptr, off = op.operands
+        self._current().emit(
+            f"  {op.result.name} = getelementptr i8, ptr addrspace(1) "
+            f"{self._operand(ptr)}, i64 {self._operand(off)}"
+        )
+
     def _op_tile_global_ptr_to_i64(self, op: Op) -> None:
-        if len(op.operands) != 1 or len(op.results) != 1:
-            raise ValueError("global_ptr_to_i64 expects one operand and one result")
+        error = _global_ptr_to_i64_op_error(op)
+        if error:
+            raise ValueError(error)
         (ptr,) = op.operands
+        # A parameter's addr_space override can move the header's type away
+        # from the IR type the rule above checked.
         if self._ptr_llvm_type(ptr) != "ptr addrspace(1)":
             raise TypeError("global_ptr_to_i64 ptr must be a global pointer")
         self._current().emit(
