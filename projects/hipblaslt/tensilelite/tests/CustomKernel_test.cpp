@@ -251,3 +251,115 @@ TEST(CustomKernelTest, ComputeUnitsHonorTheCuBudget)
     EXPECT_EQ(computeUnitsLaunch(0, 96), std::make_pair(size_t{96}, int32_t{96}));
     EXPECT_EQ(computeUnitsLaunch(4 * cus, 0), std::make_pair(size_t{cus}, int32_t{cus}));
 }
+
+namespace
+{
+    KernelInvocation longShortCall(size_t  m,
+                                   size_t  n,
+                                   size_t  batch,
+                                   int16_t compiledGsu = 1,
+                                   int16_t runtimeGsu  = 0)
+    {
+        constexpr size_t k = 64;
+
+        ContractionSolution solution;
+        configureProbeKernel(solution, {CustomArgType::uint32, CustomArgSemantic::SizeFree0});
+        solution.customKernel.macrotile = TensileLite::dim3(256, 4, 64);
+        solution.customKernel.grid
+            = {CustomGridSize::TilesLong, CustomGridSize::TilesShort, CustomGridSize::Batch};
+        solution.sizeMapping.globalSplitU = compiledGsu;
+
+        ContractionProblemGemm problem
+            = ContractionProblemGemm::GEMM(false, false, m, n, k, m, k, m, 0.0, false, batch);
+        problem.setComputeInputTypeA(rocisa::DataType::Float);
+        problem.setComputeInputTypeB(rocisa::DataType::Float);
+        problem.setParams().setGSU(runtimeGsu);
+
+        AMDGPU            device = probeDevice();
+        ContractionInputs inputs;
+        StreamKSettings   sk;
+
+        return solution.generateCustomCall<false>(problem, inputs, device, sk);
+    }
+
+    void expectLongShortGrid(size_t m, size_t n, size_t batch, TensileLite::dim3 expected)
+    {
+        TensileLite::dim3 const grid = longShortCall(m, n, batch).numWorkGroups;
+        EXPECT_EQ(grid.x, expected.x);
+        EXPECT_EQ(grid.y, expected.y);
+        EXPECT_EQ(grid.z, expected.z);
+    }
+}
+
+// The long extent is tiled by macrotile.x and the short one by macrotile.y, whichever
+// of M and N is longer.
+TEST(CustomKernelTest, LongShortGridIsOrientationAgnostic)
+{
+    expectLongShortGrid(5000, 3, 1, TensileLite::dim3(20, 1, 1));
+    expectLongShortGrid(3, 5000, 1, TensileLite::dim3(20, 1, 1));
+}
+
+TEST(CustomKernelTest, LongShortGridRoundsTailsUp)
+{
+    expectLongShortGrid(1025, 9, 1, TensileLite::dim3(5, 3, 1));
+    expectLongShortGrid(9, 1025, 1, TensileLite::dim3(5, 3, 1));
+    expectLongShortGrid(1024, 8, 1, TensileLite::dim3(4, 2, 1));
+}
+
+TEST(CustomKernelTest, LongShortGridCarriesTheBatch)
+{
+    expectLongShortGrid(512, 4, 3, TensileLite::dim3(2, 1, 3));
+}
+
+// The long/short grids launch one slice per tile, so a split-K run would leave D unwritten.
+TEST(CustomKernelTest, LongShortGridRejectsSplitK)
+{
+    EXPECT_THROW(longShortCall(512, 4, 1, /*compiled*/ 16), std::runtime_error);
+    EXPECT_THROW(longShortCall(512, 4, 1, /*compiled*/ 1, /*runtime*/ 4), std::runtime_error);
+    EXPECT_NO_THROW(longShortCall(512, 4, 1, /*compiled*/ 1, /*runtime*/ 0));
+}
+
+namespace
+{
+    constexpr char libraryCodeObject[] = "TensileLibrary_shard_gfx950.co";
+    constexpr char customCodeObject[]  = "TensileLibrary_shard_Generated_gfx950.co";
+
+    void configureCodeObjectProbe(ContractionSolution& solution, std::string const& customFile)
+    {
+        configureProbeKernel(solution, {CustomArgType::uint32, CustomArgSemantic::SizeFree0});
+        solution.sizeMapping.globalSplitU = 1;
+        solution.codeObjectFilename       = std::string(libraryCodeObject);
+        solution.customKernel.codeObjectFile = customFile;
+    }
+
+    std::string launchedCodeObject(ContractionSolution const& solution)
+    {
+        ContractionProblemGemm problem = dummyProblem();
+        AMDGPU                 device  = probeDevice();
+        ContractionInputs inputs;
+        StreamKSettings   sk;
+
+        return solution.generateCustomCall<false>(problem, inputs, device, sk).codeObjectFile;
+    }
+}
+
+TEST(CustomKernelTest, CustomKernelDefaultsToTheLibraryCodeObject)
+{
+    ContractionSolution solution;
+    configureCodeObjectProbe(solution, "");
+
+    EXPECT_EQ(launchedCodeObject(solution), libraryCodeObject);
+    EXPECT_EQ(solution.customKernelCodeObjectFile(), libraryCodeObject);
+}
+
+// Only the custom kernel's launch follows its own file; the library's helper kernels
+// keep resolving in the library's code object.
+TEST(CustomKernelTest, CustomKernelHonorsItsOwnCodeObject)
+{
+    ContractionSolution solution;
+    configureCodeObjectProbe(solution, customCodeObject);
+
+    EXPECT_EQ(launchedCodeObject(solution), customCodeObject);
+    EXPECT_EQ(solution.customKernelCodeObjectFile(), customCodeObject);
+    EXPECT_EQ(solution.codeObjectFilename.load(), libraryCodeObject);
+}

@@ -164,6 +164,8 @@ namespace TensileLite
         case CustomGridSize::TilesXYBatchGSU:  return "TilesXYBatchGSU";
         case CustomGridSize::TilesYGSU:        return "TilesYGSU";
         case CustomGridSize::ComputeUnits:     return "ComputeUnits";
+        case CustomGridSize::TilesLong:        return "TilesLong";
+        case CustomGridSize::TilesShort:       return "TilesShort";
         case CustomGridSize::CustomGridSize_Count:
             break;
         }
@@ -188,6 +190,8 @@ namespace TensileLite
             {"TilesXYBatchGSU",  CustomGridSize::TilesXYBatchGSU},
             {"TilesYGSU",        CustomGridSize::TilesYGSU},
             {"ComputeUnits",     CustomGridSize::ComputeUnits},
+            {"TilesLong",        CustomGridSize::TilesLong},
+            {"TilesShort",       CustomGridSize::TilesShort},
         };
 
         auto it = lookup.find(str);
@@ -2553,22 +2557,22 @@ namespace TensileLite
         }
     }
 
-    void ContractionSolution::calculateTiles(dim3& tiles,
-                                             ContractionSolution::Problem const& problem) const
+    void ContractionSolution::calculateFreeExtents(dim3& extents,
+                                                   ContractionSolution::Problem const& problem) const
     {
-        tiles.x = 1;
-        tiles.y = 1;
+        extents.x = 1;
+        extents.y = 1;
 
         for(size_t i = 0; i < problem.freeIndicesA().size(); i++)
         {
-            tiles.x *= problem.freeSizeA(i);
+            extents.x *= problem.freeSizeA(i);
         }
         for(size_t i = 0; i < problem.freeIndicesB().size(); i++)
         {
-            tiles.y *= problem.freeSizeB(i);
+            extents.y *= problem.freeSizeB(i);
         }
 
-        tiles.z = 1;
+        extents.z = 1;
         for(size_t i = 0; i < problem.batchIndices().size(); i++)
         {
             // if(sizeMapping.packBatchDims & 0x1)
@@ -2576,14 +2580,32 @@ namespace TensileLite
             // if(sizeMapping.packBatchDims & 0x2)
             //     numWorkGroups.y *= problem.batchSize(i);
             if(!sizeMapping.packBatchDims)
-                tiles.z *= problem.batchSize(i);
+                extents.z *= problem.batchSize(i);
         }
 
         if(problem.transposeC01())
-            std::swap(tiles.x, tiles.y);
+            std::swap(extents.x, extents.y);
+    }
+
+    void ContractionSolution::calculateTiles(dim3& tiles,
+                                             ContractionSolution::Problem const& problem) const
+    {
+        calculateFreeExtents(tiles, problem);
 
         tiles.x = CeilDivide(tiles.x, customKernel.macrotile.x);
         tiles.y = CeilDivide(tiles.y, customKernel.macrotile.y);
+    }
+
+    void ContractionSolution::calculateLongShortTiles(
+        dim3& tiles, ContractionSolution::Problem const& problem) const
+    {
+        // Sizing by extent rather than by A/B keeps the grid independent of the skinny orientation.
+        dim3 extents;
+        calculateFreeExtents(extents, problem);
+
+        tiles.x = CeilDivide(std::max(extents.x, extents.y), customKernel.macrotile.x);
+        tiles.y = CeilDivide(std::min(extents.x, extents.y), customKernel.macrotile.y);
+        tiles.z = extents.z;
     }
 
     void ContractionSolution::calculateGrid(dim3&                               workGroupSize,
@@ -2828,6 +2850,13 @@ namespace TensileLite
         return rv;
     }
 
+    std::string ContractionSolution::customKernelCodeObjectFile() const
+    {
+        if(!customKernel.codeObjectFile.empty())
+            return customKernel.codeObjectFile;
+        return codeObjectFilename.load();
+    }
+
     template <bool T_Debug>
     KernelInvocation ContractionSolution::generateCustomCall(ContractionSolution::Problem const& problem,
                                                 ContractionInputs const&            inputs,
@@ -2860,6 +2889,8 @@ namespace TensileLite
 
         dim3 tiles;
         calculateTiles(tiles, problem);
+        dim3 longShortTiles;
+        calculateLongShortTiles(longShortTiles, problem);
 
         uint32_t autoGsuVal = calculateAutoGSU(problem, &hardware);
         uint32_t gsu = problem.getParams().gsu() > 0 ? problem.getParams().gsu() : autoGsuVal;
@@ -2977,6 +3008,12 @@ namespace TensileLite
                 case CustomGridSize::ComputeUnits:
                     dim = static_cast<size_t>(computeUnits);
                     break;
+                case CustomGridSize::TilesLong:
+                    dim = longShortTiles.x;
+                    break;
+                case CustomGridSize::TilesShort:
+                    dim = longShortTiles.y;
+                    break;
                 default:
                     throw std::runtime_error(concatenate("Invalid CustomGridSize value: ", static_cast<int>(size)));
                     break;
@@ -2999,6 +3036,8 @@ namespace TensileLite
             case CustomGridSize::Batch:
             case CustomGridSize::TilesXY:
             case CustomGridSize::TilesXYBatch:
+            case CustomGridSize::TilesLong:
+            case CustomGridSize::TilesShort:
                 return true;
             default:
                 return false;
@@ -3706,7 +3745,7 @@ namespace TensileLite
                 rv.args.appendPadding(arg.padding);
         }
 
-        rv.codeObjectFile = codeObjectFilename.load();
+        rv.codeObjectFile = customKernelCodeObjectFile();
         return rv;
     }
 

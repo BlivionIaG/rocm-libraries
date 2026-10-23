@@ -701,6 +701,17 @@ validParameters = { # we need to make sure this matches develop
     "AssertStrideBEqual": -1,
     "AssertStrideCEqual": -1,
     "AssertStrideDEqual": -1,
+    # Stride multiple per tensor, same {index: value} form: the stride at that
+    # index must be a multiple of value, e.g. {1: 4} for a leading dimension
+    # that is a multiple of 4 elements.
+    "AssertStrideAMultiple": -1,
+    "AssertStrideBMultiple": -1,
+    "AssertStrideCMultiple": -1,
+    "AssertStrideDMultiple": -1,
+    # A kernel without an alpha scale (resp. without a C read) declares that it
+    # only serves alpha == 1 (resp. beta == 0).
+    "AssertAlphaOne": [False, True],
+    "AssertBetaZero": [False, True],
     # Assertions that require arithmetic intensity to be specified value.
     # Arithmetic intensity measures the ratio of computation to memory bandwidth required for a problem.
     # These predicates can be used to adjust solution selection compute-bound or memory-bound problems.
@@ -1437,6 +1448,10 @@ ASSERT_DIM_MAP_PARAMETERS = (
     "AssertStrideBEqual",
     "AssertStrideCEqual",
     "AssertStrideDEqual",
+    "AssertStrideAMultiple",
+    "AssertStrideBMultiple",
+    "AssertStrideCMultiple",
+    "AssertStrideDMultiple",
 )
 
 
@@ -1455,6 +1470,9 @@ def checkAssertSizeMapIsValid(name, value):
         if type(val) is not int:
             msgBase = "Invalid parameter value: {} = {}\nSize must be int, got {}"
             raise Exception(msgBase.format(name, value, type(val).__name__))
+        if name.endswith("Multiple") and val != -1 and val < 1:
+            msgBase = "Invalid parameter value: {} = {}\nMultiple must be >= 1"
+            raise Exception(msgBase.format(name, value))
 
 
 def checkSpaceFillAlgoIsValid(name, value):
