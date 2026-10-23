@@ -311,6 +311,79 @@ static void emitValuSgprWriteNop(IRBuilder &builder) {
   builder.create<rocisa::SNop>(valuWriteSgprReadWaitStates - 1);
 }
 
+// Creates SInst for an SGPR dst and VInst otherwise, both from (dst, src0,
+// src1) and any trailing arguments, such as the comment VAShiftRightI32
+// requires.
+template <typename SInst, typename VInst, typename... Trailing>
+static void createForKind(IRBuilder &builder, RegisterRef dst, Operand src0,
+                          Operand src1, const Trailing &...trailing) {
+  if (dst.kind == RegisterKind::sgpr)
+    builder.create<SInst>(dst.container(), src0, src1, trailing...);
+  else
+    builder.create<VInst>(dst.container(), src0, src1, trailing...);
+}
+
+namespace {
+
+// The sources of one 32-bit word of a result of two operands; select picks a
+// when the condition holds.
+struct WordSources {
+  Operand a;
+  Operand b;
+};
+
+// The low word, then the high word of a pair; one word for a single register.
+using Words = std::vector<WordSources>;
+
+} // namespace
+
+static Words wordSources(int32_t width, Operand a, Operand b) {
+  if (width == 1)
+    return Words{WordSources{a, b}};
+  return Words{WordSources{operandHalf(a, 0), operandHalf(b, 0)},
+               WordSources{operandHalf(a, 1), operandHalf(b, 1)}};
+}
+
+// Writing a half of dst first clobbers that register, which the step that
+// writes the other half must not read.
+static bool isSafeOrder(RegisterRef dst, const Words &words, bool highFirst) {
+  int32_t first = highFirst ? 1 : 0;
+  const WordSources &other = words[1 - first];
+  for (Operand source : {other.a, other.b})
+    if (source.isRegister() && source.reg() == dst.slice(first))
+      return false;
+  return true;
+}
+
+// Returns whether the high half is written first. When neither order is safe,
+// the high step's copy of dst's low register moves to a temporary of dst's kind
+// so that low-first works. The copy is a plain move, so callers may emit this
+// before setting SCC.
+static bool orderHalves(IRBuilder &builder, RegisterRef dst, Words &words,
+                        Temporaries &temps) {
+  if (words.size() == 1 || isSafeOrder(dst, words, false))
+    return false;
+  if (isSafeOrder(dst, words, true))
+    return true;
+  RegisterRef clobbered = dst.slice(0);
+  for (Operand *word : {&words[1].a, &words[1].b})
+    if (word->isRegister() && word->reg() == clobbered)
+      *word = copyToTemporary(builder, dst.kind, 1, *word, temps);
+  assert(isSafeOrder(dst, words, false) && "unsafe half order");
+  return false;
+}
+
+// Visits the words in write order, passing each with its destination register.
+template <typename Emit>
+static void emitWords(RegisterRef dst, const Words &words, bool highFirst,
+                      Emit emit) {
+  int32_t count = static_cast<int32_t>(words.size());
+  for (int32_t i = 0; i < count; ++i) {
+    int32_t index = highFirst ? count - 1 - i : i;
+    emit(dst.slice(index), words[index]);
+  }
+}
+
 // Core builder.
 
 // rocisa's SWaitCnt uses -1 for a counter that is not waited on.
@@ -448,33 +521,44 @@ void IRBuilder::movb64(RegisterRef dst, Operand src) {
 
 namespace {
 
-enum class BinaryOp { add, sub, mul };
+enum class BinaryOp { add, sub, mul, bitAnd, bitOr, shl, lshr, ashr };
 
 } // namespace
 
-// Picks the SALU form for an sgpr dst and the VALU form otherwise.
+static bool isShift(BinaryOp op) {
+  return op == BinaryOp::shl || op == BinaryOp::lshr || op == BinaryOp::ashr;
+}
+
+static bool isCommutative(BinaryOp op) {
+  return op == BinaryOp::add || op == BinaryOp::mul || op == BinaryOp::bitAnd ||
+         op == BinaryOp::bitOr;
+}
+
+// Picks the SALU form for an sgpr dst and the VALU form otherwise. rocisa's
+// shift classes take the amount first, so the shifts pass (dst, b, a).
 static void createBinaryI32(IRBuilder &builder, BinaryOp op, RegisterRef dst,
                             Operand a, Operand b) {
-  bool scalar = dst.kind == RegisterKind::sgpr;
   switch (op) {
   case BinaryOp::add:
-    if (scalar)
-      builder.create<rocisa::SAddU32>(dst.container(), a, b);
-    else
-      builder.create<rocisa::VAddU32>(dst.container(), a, b);
-    return;
+    return createForKind<rocisa::SAddU32, rocisa::VAddU32>(builder, dst, a, b);
   case BinaryOp::sub:
-    if (scalar)
-      builder.create<rocisa::SSubU32>(dst.container(), a, b);
-    else
-      builder.create<rocisa::VSubU32>(dst.container(), a, b);
-    return;
+    return createForKind<rocisa::SSubU32, rocisa::VSubU32>(builder, dst, a, b);
   case BinaryOp::mul:
-    if (scalar)
-      builder.create<rocisa::SMulI32>(dst.container(), a, b);
-    else
-      builder.create<rocisa::VMulLOU32>(dst.container(), a, b);
-    return;
+    return createForKind<rocisa::SMulI32, rocisa::VMulLOU32>(builder, dst, a,
+                                                             b);
+  case BinaryOp::bitAnd:
+    return createForKind<rocisa::SAndB32, rocisa::VAndB32>(builder, dst, a, b);
+  case BinaryOp::bitOr:
+    return createForKind<rocisa::SOrB32, rocisa::VOrB32>(builder, dst, a, b);
+  case BinaryOp::shl:
+    return createForKind<rocisa::SLShiftLeftB32, rocisa::VLShiftLeftB32>(
+        builder, dst, b, a);
+  case BinaryOp::lshr:
+    return createForKind<rocisa::SLShiftRightB32, rocisa::VLShiftRightB32>(
+        builder, dst, b, a);
+  case BinaryOp::ashr:
+    return createForKind<rocisa::SAShiftRightI32, rocisa::VAShiftRightI32>(
+        builder, dst, b, a, std::string());
   }
 }
 
@@ -499,14 +583,19 @@ static void emitBinaryI32(IRBuilder &builder, BinaryOp op, RegisterRef dst,
       b = Operand(
           static_cast<int32_t>(0u - static_cast<uint32_t>(b.immediate())));
     }
+    // The VALU shifts are the *rev forms, whose src0 is the amount b.
+    bool reversed = isShift(op);
+    Operand &src0 = reversed ? b : a;
+    Operand &src1 = reversed ? a : b;
     // A VGPR in src1 gives VOP2, whose src0 accepts anything.
-    if (op == BinaryOp::add && !b.isRegister(RegisterKind::vgpr) &&
-        a.isRegister(RegisterKind::vgpr))
-      std::swap(a, b);
-    if (!isLegalVop2(a, b) && !isLegalVop3(a, b))
+    if (isCommutative(op) && !src1.isRegister(RegisterKind::vgpr) &&
+        src0.isRegister(RegisterKind::vgpr))
+      std::swap(src0, src1);
+    if (!isLegalVop2(src0, src1) && !isLegalVop3(src0, src1))
       // A VGPR in src1 makes any src0 legal.
-      b = copyToTemporary(builder, RegisterKind::vgpr, 1, b, temps);
-    assert((isLegalVop2(a, b) || isLegalVop3(a, b)) && "illegal valu operands");
+      src1 = copyToTemporary(builder, RegisterKind::vgpr, 1, src1, temps);
+    assert((isLegalVop2(src0, src1) || isLegalVop3(src0, src1)) &&
+           "illegal valu operands");
   }
   createBinaryI32(builder, op, dst, a, b);
 }
@@ -688,6 +777,127 @@ void IRBuilder::muli64(RegisterRef dst, Operand a, Operand b) {
   emitBinaryI64(*this, BinaryOp::mul, dst, a, b);
 }
 
+// Bitwise and shifts.
+
+void IRBuilder::andi32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("andi32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::bitAnd, dst, a, b);
+}
+
+void IRBuilder::ori32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("ori32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::bitOr, dst, a, b);
+}
+
+void IRBuilder::shli32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("shli32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::shl, dst, a, b);
+}
+
+void IRBuilder::shrui32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("shrui32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::lshr, dst, a, b);
+}
+
+void IRBuilder::shrsi32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("shrsi32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::ashr, dst, a, b);
+}
+
+static void emitBitwiseI64(IRBuilder &builder, BinaryOp op, RegisterRef dst,
+                           Operand a, Operand b) {
+  // A single instruction reads its sources before writing dst, so aliasing is
+  // safe.
+  if (dst.kind == RegisterKind::sgpr && dst.start % 2 == 0 &&
+      isLegalSalu64Source(a) && isLegalSalu64Source(b) && isLegalSop2(a, b)) {
+    if (op == BinaryOp::bitAnd)
+      builder.create<rocisa::SAndB64>(dst.container(), a, b);
+    else
+      builder.create<rocisa::SOrB64>(dst.container(), a, b);
+    return;
+  }
+  // gfx9 has no VALU 64-bit and/or, and halves avoid copying odd pairs and
+  // negative literals; emitBinaryI32 legalizes each half.
+  Words words = wordSources(2, a, b);
+  Temporaries temps;
+  bool highFirst = orderHalves(builder, dst, words, temps);
+  emitWords(dst, words, highFirst, [&](RegisterRef part, WordSources word) {
+    emitBinaryI32(builder, op, part, word.a, word.b);
+  });
+}
+
+static void requireShiftI64(std::string_view opName, RegisterRef dst,
+                            Operand value, Operand amount) {
+  requireRegister(opName, dst, 2);
+  if (value.isRegister())
+    requireRegister(opName, value.reg(), 2);
+  if (amount.isRegister())
+    requireRegister(opName, amount.reg(), 1);
+  requireScalarSources(opName, dst, value, amount);
+}
+
+// A single shift reads its sources before writing, and the staged path reads
+// everything before the final moves, so dst may alias value or amount.
+static void emitShiftI64(IRBuilder &builder, BinaryOp op, RegisterRef dst,
+                         Operand value, Operand amount) {
+  Temporaries temps;
+  RegisterKind kind = dst.kind;
+  if (kind == RegisterKind::sgpr) {
+    if (!isLegalSalu64Source(value))
+      value = copyToTemporary(builder, RegisterKind::sgpr, 2, value, temps);
+    if (!isLegalSop2(value, amount))
+      amount = copyToTemporary(builder, RegisterKind::sgpr, 1, amount, temps);
+  } else {
+    // The VALU 64-bit shifts are VOP3 only.
+    if (!isLegalVop3Source64(value))
+      value = copyToTemporary(builder, RegisterKind::vgpr, 2, value, temps);
+    legalizeVop3Sources(builder, value, amount, temps);
+  }
+  // 64-bit destinations must be even-aligned too.
+  RegisterRef target = dst;
+  if (dst.start % 2 != 0) {
+    temps.push_back(allocate(builder, kind, 2));
+    target = temps.back().ref();
+  }
+  // rocisa's shift classes take the amount first.
+  if (op == BinaryOp::shl)
+    createForKind<rocisa::SLShiftLeftB64, rocisa::VLShiftLeftB64>(
+        builder, target, amount, value);
+  else if (op == BinaryOp::lshr)
+    createForKind<rocisa::SLShiftRightB64, rocisa::VLShiftRightB64>(
+        builder, target, amount, value);
+  else
+    createForKind<rocisa::SAShiftRightI64, rocisa::VAShiftRightI64>(
+        builder, target, amount, value);
+  if (target != dst)
+    builder.movb64(dst, target);
+}
+
+void IRBuilder::andi64(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("andi64", dst, a, b, 2);
+  emitBitwiseI64(*this, BinaryOp::bitAnd, dst, a, b);
+}
+
+void IRBuilder::ori64(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("ori64", dst, a, b, 2);
+  emitBitwiseI64(*this, BinaryOp::bitOr, dst, a, b);
+}
+
+void IRBuilder::shli64(RegisterRef dst, Operand a, Operand b) {
+  requireShiftI64("shli64", dst, a, b);
+  emitShiftI64(*this, BinaryOp::shl, dst, a, b);
+}
+
+void IRBuilder::shrui64(RegisterRef dst, Operand a, Operand b) {
+  requireShiftI64("shrui64", dst, a, b);
+  emitShiftI64(*this, BinaryOp::lshr, dst, a, b);
+}
+
+void IRBuilder::shrsi64(RegisterRef dst, Operand a, Operand b) {
+  requireShiftI64("shrsi64", dst, a, b);
+  emitShiftI64(*this, BinaryOp::ashr, dst, a, b);
+}
+
 // Division.
 
 // Signed 32-bit division as LLVM's AMDGPU expansions. The exact path is LLVM's
@@ -701,32 +911,6 @@ void IRBuilder::muli64(RegisterRef dst, Operand a, Operand b) {
 // reciprocal accurate to 1 ulp, which the Newton step and the corrections rely
 // on.
 static const InstructionInput reciprocalScale = std::string("0x4f7ffffe");
-
-// The helpers below pick the SALU or VALU instruction from the kind of dst.
-
-static void createXor(IRBuilder &builder, RegisterRef dst, Operand a,
-                      Operand b) {
-  if (dst.kind == RegisterKind::sgpr)
-    builder.create<rocisa::SXorB32>(dst.container(), a, b);
-  else
-    builder.create<rocisa::VXorB32>(dst.container(), a, b);
-}
-
-static void createAShr(IRBuilder &builder, RegisterRef dst, Operand src,
-                       int32_t shift) {
-  if (dst.kind == RegisterKind::sgpr)
-    builder.create<rocisa::SAShiftRightI32>(dst.container(), shift, src);
-  else
-    builder.create<rocisa::VAShiftRightI32>(dst.container(), shift, src, "");
-}
-
-static void createMulHi(IRBuilder &builder, RegisterRef dst, Operand a,
-                        Operand b) {
-  if (dst.kind == RegisterKind::sgpr)
-    builder.create<rocisa::SMulHIU32>(dst.container(), a, b);
-  else
-    builder.create<rocisa::VMulHIU32>(dst.container(), a, b);
-}
 
 // Readfirstlane is undefined with exec == 0, hence the documented precondition
 // of the SALU form. The caller covers the VALU-write hazard on src.
@@ -774,7 +958,7 @@ static RegisterRange reciprocalEstimate(IRBuilder &builder, RegisterKind kind,
   }
   RegisterRange t = allocate(builder, kind);
   builder.muli32(t.ref(), negDivisor, x);
-  createMulHi(builder, t.ref(), x, t);
+  createForKind<rocisa::SMulHIU32, rocisa::VMulHIU32>(builder, t.ref(), x, t);
   builder.addi32(x.ref(), x, t);
   return x;
 }
@@ -824,11 +1008,12 @@ static void emitExact(IRBuilder &builder, RegisterRef dst, Operand a,
   RegisterRange dividend = absoluteValue(builder, kind, a);
   // 0 when the signs agree and -1 when they differ.
   RegisterRange sign = allocate(builder, kind);
-  createXor(builder, sign.ref(), a, b);
-  createAShr(builder, sign.ref(), sign, 31);
+  createForKind<rocisa::SXorB32, rocisa::VXorB32>(builder, sign.ref(), a, b);
+  builder.shrsi32(sign.ref(), sign, 31);
   RegisterRange x = reciprocalEstimate(builder, kind, divisor.ref());
   RegisterRange q = allocate(builder, kind);
-  createMulHi(builder, q.ref(), dividend, x);
+  createForKind<rocisa::SMulHIU32, rocisa::VMulHIU32>(builder, q.ref(),
+                                                      dividend, x);
   RegisterRange r = allocate(builder, kind);
   builder.muli32(r.ref(), q, divisor);
   builder.subi32(r.ref(), dividend, r);
@@ -836,7 +1021,7 @@ static void emitExact(IRBuilder &builder, RegisterRef dst, Operand a,
   // LLVM's second step updates only the quotient.
   correctQuotient(builder, q.ref(), r.ref(), divisor.ref(), false);
   // (q ^ sign) - sign negates q when the signs differ.
-  createXor(builder, q.ref(), q, sign);
+  createForKind<rocisa::SXorB32, rocisa::VXorB32>(builder, q.ref(), q, sign);
   builder.subi32(dst, q, sign);
 }
 
@@ -899,13 +1084,9 @@ static void emitFast(IRBuilder &builder, RegisterRef dst, Operand a,
   // a and b are read only here, before dst is written, so dst may alias them.
   // LLVM computes ashr (a ^ b), bitWidth - 2 and then ors 1, giving +1 or -1.
   RegisterRange sign = allocate(builder, kind);
-  createXor(builder, sign.ref(), a, b);
-  createAShr(builder, sign.ref(), sign, 30);
-  // The inline constant in src0 keeps the VOP2 form legal.
-  if (kind == RegisterKind::sgpr)
-    builder.create<rocisa::SOrB32>(sign.container(), Operand(sign), 1);
-  else
-    builder.create<rocisa::VOrB32>(sign.container(), 1, Operand(sign));
+  createForKind<rocisa::SXorB32, rocisa::VXorB32>(builder, sign.ref(), a, b);
+  builder.shrsi32(sign.ref(), sign, 30);
+  builder.ori32(sign.ref(), sign, 1);
   FastEstimate estimate = estimateQuotient(builder, a, b);
   if (kind == RegisterKind::sgpr) {
     // Three VALU instructions separate the conversion from this read, more
@@ -1179,20 +1360,6 @@ void IRBuilder::cmpi64(Predicate pred, RegisterRef dst, Operand a, Operand b) {
 
 // Select.
 
-namespace {
-
-// The sources of one 32-bit word of the result: a is chosen when the condition
-// holds, b otherwise.
-struct WordSources {
-  Operand a;
-  Operand b;
-};
-
-// The low word, then the high word of a pair; one word for a single register.
-using Words = std::vector<WordSources>;
-
-} // namespace
-
 static void requireSelect(std::string_view opName, int32_t width,
                           RegisterRef dst, RegisterRef cond, Operand a,
                           Operand b) {
@@ -1212,53 +1379,6 @@ static void requireSelect(std::string_view opName, int32_t width,
         std::string(opName) + " sgpr destination " + registerText(dst) +
         " needs a uniform bool condition, got " + registerText(cond));
   requireScalarSources(opName, dst, a, b);
-}
-
-static Words wordSources(int32_t width, Operand a, Operand b) {
-  if (width == 1)
-    return Words{WordSources{a, b}};
-  return Words{WordSources{operandHalf(a, 0), operandHalf(b, 0)},
-               WordSources{operandHalf(a, 1), operandHalf(b, 1)}};
-}
-
-// Writing a half of dst first clobbers that register, which the step that
-// writes the other half must not read.
-static bool isSafeOrder(RegisterRef dst, const Words &words, bool highFirst) {
-  int32_t first = highFirst ? 1 : 0;
-  const WordSources &other = words[1 - first];
-  for (Operand source : {other.a, other.b})
-    if (source.isRegister() && source.reg() == dst.slice(first))
-      return false;
-  return true;
-}
-
-// Returns whether the high half is written first. When neither order is safe,
-// the high step's copy of dst's low register moves to a temporary of dst's kind
-// so that low-first works. Callers emit this before reading the condition into
-// SCC, since the copy is a plain move.
-static bool orderHalves(IRBuilder &builder, RegisterRef dst, Words &words,
-                        Temporaries &temps) {
-  if (words.size() == 1 || isSafeOrder(dst, words, false))
-    return false;
-  if (isSafeOrder(dst, words, true))
-    return true;
-  RegisterRef clobbered = dst.slice(0);
-  for (Operand *word : {&words[1].a, &words[1].b})
-    if (word->isRegister() && word->reg() == clobbered)
-      *word = copyToTemporary(builder, dst.kind, 1, *word, temps);
-  assert(isSafeOrder(dst, words, false) && "unsafe half order");
-  return false;
-}
-
-// Visits the words in write order, passing each with its destination register.
-template <typename Emit>
-static void emitWords(RegisterRef dst, const Words &words, bool highFirst,
-                      Emit emit) {
-  int32_t count = static_cast<int32_t>(words.size());
-  for (int32_t i = 0; i < count; ++i) {
-    int32_t index = highFirst ? count - 1 - i : i;
-    emit(dst.slice(index), words[index]);
-  }
 }
 
 // Sets SCC to whether the uniform bool is nonzero.

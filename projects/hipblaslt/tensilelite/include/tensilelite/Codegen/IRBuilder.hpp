@@ -248,6 +248,57 @@ public:
   /// Emits dst = the low 64 bits of a * b.
   void muli64(RegisterRef dst, Operand a, Operand b);
 
+  // The bitwise and shift ops below share these rules.
+  //
+  // The 32-bit forms take single registers, and an immediate is a 32-bit
+  // pattern. The 64-bit forms take register pairs for dst and a, and for b of
+  // andi64 and ori64; a pair immediate is an int32_t sign-extended to 64 bits.
+  //
+  // For the shifts, a is the value and b the shift amount, which is always one
+  // register or an int32_t immediate, also in the 64-bit forms. Only the low 5
+  // bits (32-bit) or 6 bits (64-bit) of b are used, as the hardware does, so
+  // shli32(dst, a, 33) shifts by 1.
+  //
+  // The op is a SALU instruction iff dst and every register operand are SGPRs:
+  // s_and_b32/b64, s_or_b32/b64, s_lshl_b32/b64, s_lshr_b32/b64 and
+  // s_ashr_i32/i64; they write SCC. A VGPR dst gives v_and_b32, v_or_b32,
+  // v_lshlrev_b32/b64, v_lshrrev_b32/b64 or v_ashrrev_i32/i64; the builder
+  // hides the reversed operand order. gfx9 has no 64-bit VALU and/or, so
+  // andi64 and ori64 into VGPRs are one 32-bit op per half, and so is the SALU
+  // form when a pair is at an odd index or an immediate is a negative literal.
+  // The 64-bit shifts need even-aligned pairs: a misaligned value is copied
+  // into a temporary pair and a misaligned dst is written through one. Other
+  // operands gfx9 cannot encode are legalized as for the arithmetic ops, by
+  // swapping and/or operands or copying into temporaries, which are released
+  // after the op.
+  //
+  // dst may alias or overlap an operand.
+  //
+  // Throws std::invalid_argument, before emitting anything, if dst or a
+  // register operand is an AGPR or has the wrong number of registers, or if
+  // dst is an SGPR and an operand is a VGPR.
+
+  /// Emits dst = a & b.
+  void andi32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = a | b.
+  void ori32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = a << (b & 31).
+  void shli32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = a >> (b & 31), shifting in zeros.
+  void shrui32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = a >> (b & 31), shifting in copies of the sign bit.
+  void shrsi32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = a & b for register pairs.
+  void andi64(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = a | b for register pairs.
+  void ori64(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = a << (b & 63).
+  void shli64(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = a >> (b & 63), shifting in zeros.
+  void shrui64(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = a >> (b & 63), shifting in copies of the sign bit.
+  void shrsi64(RegisterRef dst, Operand a, Operand b);
+
   // Division.
   //
   /// Emits dst = a / b for signed 32-bit values, with the quotient truncated

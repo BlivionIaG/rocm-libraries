@@ -25,11 +25,13 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -1064,9 +1066,9 @@ static std::vector<uint32_t> applyImmediate(const OpCase32 &op,
   return out;
 }
 
-TEST_F(ArithDevice, ValuLaneOperands) {
-  WordPairs pairs = makeArithPairs(4096);
-  for (const OpCase32 &op : opCases32) {
+static void expectValuLaneOperands(std::span<const OpCase32> ops,
+                                   const WordPairs &pairs) {
+  for (const OpCase32 &op : ops) {
     SCOPED_TRACE(op.name);
     std::vector<uint32_t> expected;
     for (int64_t i = 0; i < std::ssize(pairs.a); ++i)
@@ -1077,9 +1079,9 @@ TEST_F(ArithDevice, ValuLaneOperands) {
   }
 }
 
-TEST_F(ArithDevice, SaluUniformOperands) {
-  WordPairs pairs = makeArithPairs(256);
-  for (const OpCase32 &op : opCases32) {
+static void expectSaluUniformOperands(std::span<const OpCase32> ops,
+                                      const WordPairs &pairs) {
+  for (const OpCase32 &op : ops) {
     SCOPED_TRACE(op.name);
     std::vector<uint32_t> expected;
     for (int64_t i = 0; i < std::ssize(pairs.a); ++i)
@@ -1091,9 +1093,9 @@ TEST_F(ArithDevice, SaluUniformOperands) {
   }
 }
 
-TEST_F(ArithDevice, ScalarsIntoVgpr) {
-  WordPairs pairs = makeArithPairs(256);
-  for (const OpCase32 &op : opCases32) {
+static void expectScalarsIntoVgpr(std::span<const OpCase32> ops,
+                                  const WordPairs &pairs) {
+  for (const OpCase32 &op : ops) {
     SCOPED_TRACE(op.name);
     std::vector<uint32_t> perGroup;
     for (int64_t i = 0; i < std::ssize(pairs.a); ++i)
@@ -1105,14 +1107,14 @@ TEST_F(ArithDevice, ScalarsIntoVgpr) {
   }
 }
 
-TEST_F(ArithDevice, MixedScalarAndVector) {
-  WordPairs pairs = makeArithPairs(4096);
+static void expectMixedScalarAndVector(std::span<const OpCase32> ops,
+                                       const WordPairs &pairs) {
   int32_t groups = laneGroupCount(pairs.a);
   std::vector<uint32_t> edges = arithEdgeValues();
   std::vector<uint32_t> uniformWords;
   for (int32_t g = 0; g < groups; ++g)
     uniformWords.push_back(edges[g % edges.size()]);
-  for (const OpCase32 &op : opCases32) {
+  for (const OpCase32 &op : ops) {
     SCOPED_TRACE(op.name);
     std::vector<uint32_t> uniformFirst;
     std::vector<uint32_t> uniformSecond;
@@ -1130,12 +1132,13 @@ TEST_F(ArithDevice, MixedScalarAndVector) {
   }
 }
 
-TEST_F(ArithDevice, ImmediateOperands) {
-  WordPairs pairs = makeArithPairs(0);
+static void expectImmediateOperands(std::span<const OpCase32> ops,
+                                    const WordPairs &pairs,
+                                    std::span<const int32_t> immediates) {
   int32_t groups = laneGroupCount(pairs.a);
   int32_t scalarGroups = static_cast<int32_t>(pairs.a.size());
-  for (const OpCase32 &op : opCases32) {
-    for (int32_t immediate : arithImmediates) {
+  for (const OpCase32 &op : ops) {
+    for (int32_t immediate : immediates) {
       SCOPED_TRACE(std::string(op.name) + " immediate " +
                    std::to_string(immediate));
       expectArithResults(immediateSpec(op.op, InputKind::lane,
@@ -1157,6 +1160,26 @@ TEST_F(ArithDevice, ImmediateOperands) {
           perLane(applyImmediate(op, pairs.a, immediate, false)));
     }
   }
+}
+
+TEST_F(ArithDevice, ValuLaneOperands) {
+  expectValuLaneOperands(opCases32, makeArithPairs(4096));
+}
+
+TEST_F(ArithDevice, SaluUniformOperands) {
+  expectSaluUniformOperands(opCases32, makeArithPairs(256));
+}
+
+TEST_F(ArithDevice, ScalarsIntoVgpr) {
+  expectScalarsIntoVgpr(opCases32, makeArithPairs(256));
+}
+
+TEST_F(ArithDevice, MixedScalarAndVector) {
+  expectMixedScalarAndVector(opCases32, makeArithPairs(4096));
+}
+
+TEST_F(ArithDevice, ImmediateOperands) {
+  expectImmediateOperands(opCases32, makeArithPairs(0), arithImmediates);
 }
 
 // Each emitter writes into an input register and then moves it to dst.
@@ -1360,6 +1383,8 @@ struct OpCase64 {
   const char *name;
   BuilderOp op;
   uint64_t (*host)(uint64_t, uint64_t);
+  // b is a single-register shift amount rather than a pair.
+  bool amountOperand = false;
 };
 
 class Arith64Test : public BuilderTest {
@@ -1391,6 +1416,8 @@ enum class Arith64Placement {
   highIsALow,
   // a and b are the same register pair.
   sameOperand,
+  // The destination's low register holds the shift amount.
+  amountInDestination,
 };
 
 struct Case64 {
@@ -1866,6 +1893,15 @@ static Operand makeSource(IRBuilder &builder, const Case64 &spec,
   return pair.pair;
 }
 
+// Reads b: a shift amount is one input register, anything else as makeSource.
+static Operand makeB(IRBuilder &builder, const Case64 &spec,
+                     const std::vector<RegisterRef> &in, int64_t &next,
+                     std::vector<RegisterRange> &owners) {
+  if (spec.op.amountOperand && !spec.b)
+    return in[next++];
+  return makeSource(builder, spec, spec.b, in, next, owners);
+}
+
 static Emitted emitArith64Separate(IRBuilder &builder, const Case64 &spec,
                                    const std::vector<RegisterRef> &in) {
   Emitted emitted{{}, RegisterRef{}};
@@ -1873,7 +1909,7 @@ static Emitted emitArith64Separate(IRBuilder &builder, const Case64 &spec,
   Operand a = makeSource(builder, spec, spec.a, in, next, emitted.owners);
   Operand b = spec.placement == Arith64Placement::sameOperand
                   ? a
-                  : makeSource(builder, spec, spec.b, in, next, emitted.owners);
+                  : makeB(builder, spec, in, next, emitted.owners);
   int32_t count = spec.dstMisaligned ? 3 : 2;
   RegisterRange range = allocateKind(builder, spec.dstKind, count);
   RegisterRef dst = range.ref(count - 2, 2);
@@ -1888,7 +1924,7 @@ static Emitted emitArith64InPlace(IRBuilder &builder, const Case64 &spec,
   Emitted emitted{{}, RegisterRef{}};
   int64_t next = 0;
   Operand a = makeSource(builder, spec, spec.a, in, next, emitted.owners);
-  Operand b = makeSource(builder, spec, spec.b, in, next, emitted.owners);
+  Operand b = makeB(builder, spec, in, next, emitted.owners);
   RegisterRef dst =
       spec.placement == Arith64Placement::destinationIsA ? a.reg() : b.reg();
   (builder.*spec.op.op)(dst, a, b);
@@ -1908,8 +1944,25 @@ static Emitted emitArith64Overlapping(IRBuilder &builder, const Case64 &spec,
   builder.movb32(a.slice(0), in[0]);
   builder.movb32(a.slice(1), in[1]);
   int64_t next = 2;
-  Operand b = makeSource(builder, spec, spec.b, in, next, emitted.owners);
+  Operand b = makeB(builder, spec, in, next, emitted.owners);
   (builder.*spec.op.op)(dst, a, b);
+  emitted.owners.push_back(std::move(range));
+  emitted.value = dst;
+  return emitted;
+}
+
+// The amount is copied into the destination's low register first.
+static Emitted
+emitArith64AmountInDestination(IRBuilder &builder, const Case64 &spec,
+                               const std::vector<RegisterRef> &in) {
+  Emitted emitted{{}, RegisterRef{}};
+  int64_t next = 0;
+  Operand a = makeSource(builder, spec, spec.a, in, next, emitted.owners);
+  int32_t count = spec.dstMisaligned ? 3 : 2;
+  RegisterRange range = allocateKind(builder, spec.dstKind, count);
+  RegisterRef dst = range.ref(count - 2, 2);
+  builder.movb32(dst.slice(0), in[next]);
+  (builder.*spec.op.op)(dst, a, dst.slice(0));
   emitted.owners.push_back(std::move(range));
   emitted.value = dst;
   return emitted;
@@ -1927,6 +1980,8 @@ static Emitted emitArith64Case(IRBuilder &builder, const Case64 &spec,
   case Arith64Placement::lowIsAHigh:
   case Arith64Placement::highIsALow:
     return emitArith64Overlapping(builder, spec, in);
+  case Arith64Placement::amountInDestination:
+    return emitArith64AmountInDestination(builder, spec, in);
   }
   return emitArith64Separate(builder, spec, in);
 }
@@ -1951,6 +2006,8 @@ static Values arith64ExpectedValues(const Case64 &spec, const Data64 &data,
   Values expected;
   for (int64_t i = 0; i < results; ++i) {
     uint64_t a = arith64OperandValue(spec, spec.a, spec.aKind, data.a, i);
+    // The host masks a shift amount, so its low word or sign-extended
+    // immediate is as good as the full value.
     bool same = spec.placement == Arith64Placement::sameOperand;
     uint64_t b =
         same ? a : arith64OperandValue(spec, spec.b, spec.bKind, data.b, i);
@@ -1972,7 +2029,11 @@ static KernelInputs makeArith64Inputs(const Case64 &spec, const Data64 &data,
   KernelInputs inputs;
   if (!spec.a)
     addPairInputs(inputs, spec.aKind, data.a, laneCount, groupCount);
-  if (!spec.b && spec.placement != Arith64Placement::sameOperand)
+  if (spec.b || spec.placement == Arith64Placement::sameOperand)
+    return inputs;
+  if (spec.op.amountOperand)
+    addInput(inputs, spec.bKind, lowWords(data.b), laneCount, groupCount);
+  else
     addPairInputs(inputs, spec.bKind, data.b, laneCount, groupCount);
   return inputs;
 }
@@ -2005,35 +2066,35 @@ static Case64 makeArith64Case(const OpCase64 &op, RegisterKind dstKind,
   return {op, dstKind, aKind, bKind};
 }
 
-TEST_F(Arith64Device, ValuLaneOperands) {
-  Data64 data = makeData(4096);
-  for (const OpCase64 &op : opCases64)
+static void expectValuLaneOperands64(std::span<const OpCase64> ops,
+                                     const Data64 &data) {
+  for (const OpCase64 &op : ops)
     expectCase(makeArith64Case(op, vgpr, lane, lane), data);
 }
 
-TEST_F(Arith64Device, SaluUniformOperands) {
-  Data64 data = makeData(256);
-  for (const OpCase64 &op : opCases64)
+static void expectSaluUniformOperands64(std::span<const OpCase64> ops,
+                                        const Data64 &data) {
+  for (const OpCase64 &op : ops)
     expectCase(makeArith64Case(op, sgpr, uniform, uniform), data);
 }
 
-TEST_F(Arith64Device, ScalarsIntoVgpr) {
-  Data64 data = makeData(256);
-  for (const OpCase64 &op : opCases64)
+static void expectScalarsIntoVgpr64(std::span<const OpCase64> ops,
+                                    const Data64 &data) {
+  for (const OpCase64 &op : ops)
     expectCase(makeArith64Case(op, vgpr, uniform, uniform), data);
 }
 
-TEST_F(Arith64Device, MixedScalarAndVector) {
-  Data64 data = makeData(4096);
-  for (const OpCase64 &op : opCases64) {
+static void expectMixedScalarAndVector64(std::span<const OpCase64> ops,
+                                         const Data64 &data) {
+  for (const OpCase64 &op : ops) {
     expectCase(makeArith64Case(op, vgpr, uniform, lane), data);
     expectCase(makeArith64Case(op, vgpr, lane, uniform), data);
   }
 }
 
-TEST_F(Arith64Device, MisalignedPairs) {
-  Data64 data = makeData(1024);
-  for (const OpCase64 &op : opCases64) {
+static void expectMisalignedPairs64(std::span<const OpCase64> ops,
+                                    const Data64 &data) {
+  for (const OpCase64 &op : ops) {
     for (bool dstMisaligned : {false, true}) {
       for (bool operandsMisaligned : {false, true}) {
         SCOPED_TRACE(
@@ -2050,43 +2111,88 @@ TEST_F(Arith64Device, MisalignedPairs) {
   }
 }
 
-TEST_F(Arith64Device, ImmediateOperands) {
-  Data64 data = makeData(0);
-  for (const OpCase64 &op : opCases64) {
-    for (int32_t immediate : arith64Immediates) {
-      SCOPED_TRACE(std::string(op.name) + " immediate " +
+// aImmediates replace a and bImmediates replace b, each against a register
+// operand.
+static void expectImmediateOperands64(std::span<const OpCase64> ops,
+                                      const Data64 &data,
+                                      std::span<const int32_t> aImmediates,
+                                      std::span<const int32_t> bImmediates) {
+  for (const OpCase64 &op : ops) {
+    for (int32_t immediate : aImmediates) {
+      SCOPED_TRACE(std::string(op.name) + " a immediate " +
                    std::to_string(immediate));
       for (Case64 spec : {makeArith64Case(op, vgpr, lane, lane),
                           makeArith64Case(op, sgpr, uniform, uniform)}) {
-        Case64 immediateFirst = spec;
-        immediateFirst.a = immediate;
-        expectCase(immediateFirst, data);
+        spec.a = immediate;
+        expectCase(spec, data);
+      }
+    }
+    for (int32_t immediate : bImmediates) {
+      SCOPED_TRACE(std::string(op.name) + " b immediate " +
+                   std::to_string(immediate));
+      for (Case64 spec : {makeArith64Case(op, vgpr, lane, lane),
+                          makeArith64Case(op, sgpr, uniform, uniform),
+                          makeArith64Case(op, vgpr, uniform, uniform)}) {
         spec.b = immediate;
         expectCase(spec, data);
       }
-      Case64 scalarsIntoVgpr = makeArith64Case(op, vgpr, uniform, uniform);
-      scalarsIntoVgpr.b = immediate;
-      expectCase(scalarsIntoVgpr, data);
     }
   }
 }
 
-TEST_F(Arith64Device, DestinationAliasing) {
-  Data64 data = makeData(256);
-  for (const OpCase64 &op : opCases64) {
-    for (Arith64Placement placement :
-         {Arith64Placement::destinationIsA, Arith64Placement::destinationIsB,
-          Arith64Placement::lowIsAHigh, Arith64Placement::highIsALow,
-          Arith64Placement::sameOperand}) {
+static void
+expectDestinationAliasing64(std::span<const OpCase64> ops, const Data64 &data,
+                            std::span<const Arith64Placement> placements) {
+  for (const OpCase64 &op : ops) {
+    for (Arith64Placement placement : placements) {
       SCOPED_TRACE(std::string(op.name) + " placement " +
                    std::to_string(static_cast<int32_t>(placement)));
       for (Case64 spec : {makeArith64Case(op, vgpr, lane, lane),
                           makeArith64Case(op, sgpr, uniform, uniform)}) {
         spec.placement = placement;
         expectCase(spec, data);
+        if (placement != Arith64Placement::amountInDestination)
+          continue;
+        // The staged shift into an odd destination reads the amount in it.
+        spec.dstMisaligned = true;
+        expectCase(spec, data);
       }
     }
   }
+}
+
+static constexpr Arith64Placement arithPlacements[] = {
+    Arith64Placement::destinationIsA, Arith64Placement::destinationIsB,
+    Arith64Placement::lowIsAHigh, Arith64Placement::highIsALow,
+    Arith64Placement::sameOperand};
+
+TEST_F(Arith64Device, ValuLaneOperands) {
+  expectValuLaneOperands64(opCases64, makeData(4096));
+}
+
+TEST_F(Arith64Device, SaluUniformOperands) {
+  expectSaluUniformOperands64(opCases64, makeData(256));
+}
+
+TEST_F(Arith64Device, ScalarsIntoVgpr) {
+  expectScalarsIntoVgpr64(opCases64, makeData(256));
+}
+
+TEST_F(Arith64Device, MixedScalarAndVector) {
+  expectMixedScalarAndVector64(opCases64, makeData(4096));
+}
+
+TEST_F(Arith64Device, MisalignedPairs) {
+  expectMisalignedPairs64(opCases64, makeData(1024));
+}
+
+TEST_F(Arith64Device, ImmediateOperands) {
+  expectImmediateOperands64(opCases64, makeData(0), arith64Immediates,
+                            arith64Immediates);
+}
+
+TEST_F(Arith64Device, DestinationAliasing) {
+  expectDestinationAliasing64(opCases64, makeData(256), arithPlacements);
 }
 
 static Arith64PlacementRegisters
@@ -2140,6 +2246,735 @@ TEST(Arith64Assembly, AllOperandPlacementsAssemble) {
   for (const OpCase64 &op : opCases64) {
     expectPlacementsAssemble(op, vgpr);
     expectPlacementsAssemble(op, sgpr);
+  }
+}
+
+// 32-bit bitwise and shift ops.
+
+static constexpr OpCase32 bitCases32[] = {
+    {"andi32", &IRBuilder::andi32, "v_and_b32", "s_and_b32",
+     [](uint32_t a, uint32_t b) { return a & b; }},
+    {"ori32", &IRBuilder::ori32, "v_or_b32", "s_or_b32",
+     [](uint32_t a, uint32_t b) { return a | b; }},
+    {"shli32", &IRBuilder::shli32, "v_lshlrev_b32", "s_lshl_b32",
+     [](uint32_t a, uint32_t b) { return a << (b & 31); }},
+    {"shrui32", &IRBuilder::shrui32, "v_lshrrev_b32", "s_lshr_b32",
+     [](uint32_t a, uint32_t b) { return a >> (b & 31); }},
+    {"shrsi32", &IRBuilder::shrsi32, "v_ashrrev_i32", "s_ashr_i32",
+     [](uint32_t a, uint32_t b) {
+       return static_cast<uint32_t>(static_cast<int32_t>(a) >> (b & 31));
+     }},
+};
+
+// The first two cases are and and or, the rest are the shifts.
+static constexpr std::span<const OpCase32> andOrCases32{bitCases32, 2};
+static constexpr std::span<const OpCase32> shiftCases32{bitCases32 + 2, 3};
+
+static constexpr int32_t bitwiseImmediates[] = {
+    0,          1,
+    31,         32,
+    33,         63,
+    65,         -1,
+    -16,        -17,
+    INT32_MIN,  INT32_MAX,
+    0x12345678, static_cast<int32_t>(0xAAAAAAAA),
+    0x55555555};
+
+// Values are the edge values and the alternating bit patterns. Amounts add the
+// shift counts around the 32-bit and 64-bit widths.
+static WordPairs makeBitwisePairs(int32_t randomCount) {
+  Words values = arithEdgeValues();
+  values.insert(values.end(), {0xAAAAAAAAu, 0x55555555u});
+  Words amounts = values;
+  amounts.insert(amounts.end(), {3, 31, 32, 33, 63, 64, 65});
+  WordPairs pairs;
+  for (uint32_t a : values)
+    for (uint32_t b : amounts) {
+      pairs.a.push_back(a);
+      pairs.b.push_back(b);
+    }
+  std::mt19937 engine(0x5EED1234);
+  int32_t count = static_cast<int32_t>(pairs.a.size()) + randomCount;
+  count = (count + arithWorkgroupSize - 1) / arithWorkgroupSize *
+          arithWorkgroupSize;
+  while (std::ssize(pairs.a) < count) {
+    pairs.a.push_back(static_cast<uint32_t>(engine()));
+    pairs.b.push_back(static_cast<uint32_t>(engine()));
+  }
+  return pairs;
+}
+
+using Bitwise32Test = BuilderTest;
+
+TEST_F(Bitwise32Test, SaluForScalarOperands) {
+  RegisterRange dst = builder.allocateSgpr(1);
+  RegisterRange a = builder.allocateSgpr(1);
+  RegisterRange b = builder.allocateSgpr(1);
+  for (const OpCase32 &current : bitCases32) {
+    SCOPED_TRACE(current.saluMnemonic);
+    std::string out = emitOp(current.op, dst.ref(), a, b);
+    expectLinesInOrder(
+        out, {line(current.saluMnemonic, text(dst), text(a), text(b))});
+    EXPECT_EQ(countLinesContaining(out, "v_"), 0);
+  }
+}
+
+TEST_F(Bitwise32Test, ValuForVectorDestination) {
+  RegisterRange dst = builder.allocateVgpr(1);
+  RegisterRange a = builder.allocateVgpr(1);
+  RegisterRange b = builder.allocateVgpr(1);
+  for (const OpCase32 &current : andOrCases32) {
+    SCOPED_TRACE(current.valuMnemonic);
+    std::string out = emitOp(current.op, dst.ref(), a, b);
+    expectLinesInOrder(
+        out, {line(current.valuMnemonic, text(dst), text(a), text(b))});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 0);
+  }
+  // The VALU shifts are the *rev forms, which take the amount first.
+  for (const OpCase32 &current : shiftCases32) {
+    SCOPED_TRACE(current.valuMnemonic);
+    std::string out = emitOp(current.op, dst.ref(), a, b);
+    expectLinesInOrder(
+        out, {line(current.valuMnemonic, text(dst), text(b), text(a))});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 0);
+  }
+}
+
+TEST_F(Bitwise32Test, AndOrSwapVgprIntoSrc1) {
+  RegisterRange dst = builder.allocateVgpr(1);
+  RegisterRange v1 = builder.allocateVgpr(1);
+  RegisterRange s0 = builder.allocateSgpr(1);
+  for (const OpCase32 &current : andOrCases32) {
+    SCOPED_TRACE(current.valuMnemonic);
+    std::string out = emitOp(current.op, dst.ref(), v1, s0);
+    expectLinesInOrder(
+        out, {line(current.valuMnemonic, text(dst), text(s0), text(v1))});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 0);
+
+    out = emitOp(current.op, dst.ref(), v1, literalA);
+    expectLinesInOrder(
+        out, {line(current.valuMnemonic, text(dst), literalAText, text(v1))});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 0);
+  }
+}
+
+TEST_F(Bitwise32Test, ShiftOperandsAreLegalized) {
+  RegisterRange dst = builder.allocateVgpr(1);
+  RegisterRange v1 = builder.allocateVgpr(1);
+  RegisterRange s0 = builder.allocateSgpr(1);
+  RegisterRange s1 = builder.allocateSgpr(1);
+  for (const OpCase32 &current : shiftCases32) {
+    SCOPED_TRACE(current.valuMnemonic);
+    std::string_view mnemonic = current.valuMnemonic;
+    BuilderOp op = current.op;
+    // A literal amount goes in src0 of VOP2, next to the VGPR value.
+    std::string out = emitOp(op, dst.ref(), v1, literalA);
+    expectLinesInOrder(out,
+                       {line(mnemonic, text(dst), literalAText, text(v1))});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 0);
+
+    // A literal value is src1, which takes only a VGPR.
+    out = emitOp(op, dst.ref(), literalA, v1);
+    expectLinesInOrder(out, {line("v_mov_b32", "v2", literalAText),
+                             line(mnemonic, text(dst), text(v1), "v2")});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 1);
+
+    // Two distinct SGPRs: the value is copied.
+    out = emitOp(op, dst.ref(), s0, s1);
+    expectLinesInOrder(out, {line("v_mov_b32", "v2", text(s0)),
+                             line(mnemonic, text(dst), text(s1), "v2")});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 1);
+
+    // VOP3 takes an SGPR or an inline constant as the value.
+    out = emitOp(op, dst.ref(), s0, v1);
+    expectLinesInOrder(out, {line(mnemonic, text(dst), text(v1), text(s0))});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 0);
+    out = emitOp(op, dst.ref(), 5, v1);
+    expectLinesInOrder(out, {line(mnemonic, text(dst), text(v1), "5")});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 0);
+
+    out = emitOp(op, dst.ref(), s0, s0);
+    expectLinesInOrder(out, {line(mnemonic, text(dst), text(s0), text(s0))});
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 0);
+  }
+}
+
+TEST_F(Bitwise32Test, SaluTwoLiteralsCopyOne) {
+  RegisterRange dst = builder.allocateSgpr(1);
+  for (const OpCase32 &current : bitCases32) {
+    SCOPED_TRACE(current.saluMnemonic);
+    std::string out = emitOp(current.op, dst.ref(), literalA, literalB);
+    expectLinesInOrder(
+        out, {line("s_mov_b32", "s1", literalBText),
+              line(current.saluMnemonic, text(dst), literalAText, "s1")});
+    EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 1);
+
+    out = emitOp(current.op, dst.ref(), literalA, literalA);
+    EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 0);
+  }
+}
+
+TEST_F(Bitwise32Test, DestinationMayAliasOperand) {
+  RegisterRange v1 = builder.allocateVgpr(1);
+  RegisterRange v2 = builder.allocateVgpr(1);
+  RegisterRange s0 = builder.allocateSgpr(1);
+  RegisterRange s1 = builder.allocateSgpr(1);
+  for (const OpCase32 &current : shiftCases32) {
+    SCOPED_TRACE(current.valuMnemonic);
+    expectInstructions(
+        emitOp(current.op, v1.ref(), v1, v2),
+        {inst(current.valuMnemonic, {text(v1), text(v2), text(v1)})});
+    expectInstructions(
+        emitOp(current.op, v2.ref(), v1, v2),
+        {inst(current.valuMnemonic, {text(v2), text(v2), text(v1)})});
+  }
+  for (const OpCase32 &current : bitCases32) {
+    SCOPED_TRACE(current.saluMnemonic);
+    expectInstructions(
+        emitOp(current.op, s0.ref(), s0, s1),
+        {inst(current.saluMnemonic, {text(s0), text(s0), text(s1)})});
+    expectInstructions(
+        emitOp(current.op, s1.ref(), s0, s1),
+        {inst(current.saluMnemonic, {text(s1), text(s0), text(s1)})});
+  }
+}
+
+TEST_F(Bitwise32Test, InvalidOperandsThrowWithoutEmitting) {
+  RegisterRange sdst = builder.allocateSgpr(1);
+  RegisterRange vdst = builder.allocateVgpr(1);
+  RegisterRange v1 = builder.allocateVgpr(1);
+  RegisterRange s1 = builder.allocateSgpr(1);
+  RegisterRange acc = builder.allocateAgpr(1);
+  RegisterRange pair = builder.allocateVgpr(2);
+  for (const OpCase32 &current : bitCases32) {
+    SCOPED_TRACE(current.name);
+    BuilderOp op = current.op;
+    EXPECT_THROW((builder.*op)(sdst.ref(), v1, s1), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(sdst.ref(), s1, v1), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(acc.ref(), s1, s1), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(vdst.ref(), acc, s1), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(vdst.ref(), s1, acc), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(pair.ref(), v1, s1), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(vdst.ref(), pair, s1), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(vdst.ref(), s1, pair), std::invalid_argument);
+  }
+  EXPECT_EQ(body.toString(), "");
+  EXPECT_EQ(allocator.highWaterMark(RegisterKind::vgpr), 4);
+}
+
+using Bitwise32Device = DeviceTest;
+
+TEST_F(Bitwise32Device, ValuLaneOperands) {
+  expectValuLaneOperands(bitCases32, makeBitwisePairs(4096));
+}
+
+TEST_F(Bitwise32Device, SaluUniformOperands) {
+  expectSaluUniformOperands(bitCases32, makeBitwisePairs(256));
+}
+
+TEST_F(Bitwise32Device, ScalarsIntoVgpr) {
+  expectScalarsIntoVgpr(bitCases32, makeBitwisePairs(256));
+}
+
+TEST_F(Bitwise32Device, MixedScalarAndVector) {
+  expectMixedScalarAndVector(bitCases32, makeBitwisePairs(4096));
+}
+
+TEST_F(Bitwise32Device, ImmediateOperands) {
+  expectImmediateOperands(bitCases32, makeBitwisePairs(0), bitwiseImmediates);
+}
+
+// Writes op(inputs[0], inputs[1]) into input target, then moves it to dst.
+static void expectAliasing32(const OpCase32 &op, RegisterKind result,
+                             InputKind kind, int32_t target,
+                             const WordPairs &pairs) {
+  SCOPED_TRACE(std::string(op.name) + " into input " + std::to_string(target));
+  std::vector<uint32_t> expected;
+  for (int64_t i = 0; i < std::ssize(pairs.a); ++i)
+    expected.push_back(op.host(pairs.a[i], pairs.b[i]));
+  int32_t groups = kind == InputKind::lane
+                       ? laneGroupCount(pairs.a)
+                       : static_cast<int32_t>(pairs.a.size());
+  BuilderOp emit = op.op;
+  expectArithResults({{kind, kind},
+                      result,
+                      [emit, target](IRBuilder &builder, RegisterRef dst,
+                                     const std::vector<RegisterRef> &inputs) {
+                        (builder.*emit)(inputs[target], inputs[0], inputs[1]);
+                        builder.movb32(dst, inputs[target]);
+                      }},
+                     groups, {pairs.a, pairs.b}, expected);
+}
+
+TEST_F(Bitwise32Device, DestinationAliasesOperand) {
+  WordPairs pairs = makeBitwisePairs(256);
+  expectAliasing32(bitCases32[2], vgpr, lane, 0, pairs);
+  expectAliasing32(bitCases32[3], vgpr, lane, 1, pairs);
+  expectAliasing32(bitCases32[0], sgpr, uniform, 0, pairs);
+  expectAliasing32(bitCases32[4], sgpr, uniform, 1, pairs);
+}
+
+TEST(Bitwise32Assembly, AllOperandPlacementsAssemble) {
+  for (const OpCase32 &op : bitCases32)
+    expectAllPlacementsAssemble(
+        op.name, [&op](IRBuilder &builder, RegisterRef dst, Operand a,
+                       Operand b) { (builder.*op.op)(dst, a, b); });
+}
+
+// 64-bit bitwise and shift ops.
+
+// The shifts take a single-register amount, and the host masks it to 6 bits.
+static constexpr OpCase64 bitCases64[] = {
+    {"andi64", &IRBuilder::andi64,
+     [](uint64_t a, uint64_t b) { return a & b; }},
+    {"ori64", &IRBuilder::ori64, [](uint64_t a, uint64_t b) { return a | b; }},
+    {"shli64", &IRBuilder::shli64,
+     [](uint64_t a, uint64_t b) { return a << (b & 63); }, true},
+    {"shrui64", &IRBuilder::shrui64,
+     [](uint64_t a, uint64_t b) { return a >> (b & 63); }, true},
+    {"shrsi64", &IRBuilder::shrsi64,
+     [](uint64_t a, uint64_t b) {
+       return static_cast<uint64_t>(static_cast<int64_t>(a) >> (b & 63));
+     },
+     true},
+};
+
+// The first two cases are and and or, the rest are the shifts.
+static constexpr std::span<const OpCase64> andOrCases64{bitCases64, 2};
+static constexpr std::span<const OpCase64> shiftCases64{bitCases64 + 2, 3};
+
+static constexpr const char *andOrSalu64[] = {"s_and_b64", "s_or_b64"};
+static constexpr const char *andOrSalu32[] = {"s_and_b32", "s_or_b32"};
+static constexpr const char *andOrValu32[] = {"v_and_b32", "v_or_b32"};
+static constexpr const char *shiftSalu64[] = {"s_lshl_b64", "s_lshr_b64",
+                                              "s_ashr_i64"};
+static constexpr const char *shiftValu64[] = {"v_lshlrev_b64", "v_lshrrev_b64",
+                                              "v_ashrrev_i64"};
+
+// Amounts around the 32-bit and 64-bit widths, with the sign bit set, and the
+// immediates that cover them.
+static constexpr int32_t shiftAmountImmediates[] = {
+    0, 1, 31, 32, 33, 63, 64, 65, -1, INT32_MIN, 0x12345678};
+
+// Values are the 64-bit edge values and the alternating bit patterns, against
+// the amounts, then random pairs, padded to whole workgroups.
+static Data64 makeShiftData64(int32_t randomCount) {
+  Values values = makeData(0).a;
+  std::sort(values.begin(), values.end());
+  values.erase(std::unique(values.begin(), values.end()), values.end());
+  values.insert(values.end(), {0xAAAAAAAAAAAAAAAAull, 0x5555555555555555ull});
+  Values amounts = {0,
+                    1,
+                    3,
+                    31,
+                    32,
+                    33,
+                    63,
+                    64,
+                    65,
+                    UINT64_MAX,
+                    static_cast<uint64_t>(int64_t{INT32_MIN}),
+                    0x12345678};
+  Data64 data;
+  for (uint64_t a : values)
+    for (uint64_t b : amounts) {
+      data.a.push_back(a);
+      data.b.push_back(b);
+    }
+  std::mt19937 engine(0x5EED1234);
+  int64_t count = std::ssize(data.a) + randomCount;
+  count = (count + arithWorkgroupSize - 1) / arithWorkgroupSize *
+          arithWorkgroupSize;
+  while (std::ssize(data.a) < count) {
+    uint64_t low = engine();
+    data.a.push_back(low | uint64_t{engine()} << 32);
+    data.b.push_back(engine());
+  }
+  return data;
+}
+
+using Bitwise64Test = Arith64Test;
+
+TEST_F(Bitwise64Test, SaluAlignedAndOrUseOneInstruction) {
+  RegisterRange d = sgprPair();
+  RegisterRange a = sgprPair();
+  RegisterRange b = sgprPair();
+  for (int32_t i = 0; i < 2; ++i) {
+    SCOPED_TRACE(andOrCases64[i].name);
+    BuilderOp op = andOrCases64[i].op;
+    std::string mnemonic = andOrSalu64[i];
+    expectInstructions(emitOp(op, d.ref(), a, b),
+                       {inst(mnemonic, {text(d), text(a), text(b)})});
+    expectInstructions(emitOp(op, d.ref(), a, -5),
+                       {inst(mnemonic, {text(d), text(a), "-5"})});
+    expectInstructions(emitOp(op, d.ref(), a, literal32),
+                       {inst(mnemonic, {text(d), text(a), literal32Text})});
+  }
+}
+
+TEST_F(Bitwise64Test, SaluAndOrSplitsMisalignedAndNegativeLiterals) {
+  RegisterRange dstOwner = builder.allocateSgpr(3, 2);
+  RegisterRange aOwner = builder.allocateSgpr(3, 2);
+  RegisterRange d = sgprPair();
+  RegisterRange a = sgprPair();
+  RegisterRange b = sgprPair();
+  RegisterRef oddDst = dstOwner.ref(1, 2);
+  RegisterRef oddA = aOwner.ref(1, 2);
+  for (int32_t i = 0; i < 2; ++i) {
+    SCOPED_TRACE(andOrCases64[i].name);
+    BuilderOp op = andOrCases64[i].op;
+    std::string mnemonic = andOrSalu32[i];
+    expectInstructions(
+        emitOp(op, oddDst, a, b),
+        {inst(mnemonic, {half(oddDst, 0), half(a.ref(), 0), half(b.ref(), 0)}),
+         inst(mnemonic,
+              {half(oddDst, 1), half(a.ref(), 1), half(b.ref(), 1)})});
+    expectInstructions(
+        emitOp(op, d.ref(), oddA, b),
+        {inst(mnemonic, {half(d.ref(), 0), half(oddA, 0), half(b.ref(), 0)}),
+         inst(mnemonic, {half(d.ref(), 1), half(oddA, 1), half(b.ref(), 1)})});
+    // The low half of -100 is a literal, which the 64-bit form would
+    // zero-extend.
+    expectInstructions(
+        emitOp(op, d.ref(), a, -100),
+        {inst(mnemonic, {half(d.ref(), 0), half(a.ref(), 0), "-100"}),
+         inst(mnemonic, {half(d.ref(), 1), half(a.ref(), 1), "-1"})});
+  }
+}
+
+TEST_F(Bitwise64Test, ValuAndOrSplitIntoHalves) {
+  RegisterRange d = vgprPair();
+  RegisterRange va = vgprPair();
+  RegisterRange vb = vgprPair();
+  RegisterRange sa = sgprPair();
+  RegisterRange sb = sgprPair();
+  RegisterRef dst = d.ref();
+  for (int32_t i = 0; i < 2; ++i) {
+    SCOPED_TRACE(andOrCases64[i].name);
+    BuilderOp op = andOrCases64[i].op;
+    std::string mnemonic = andOrValu32[i];
+    std::string out = emitOp(op, dst, va, vb);
+    expectInstructions(
+        out,
+        {inst(mnemonic, {half(dst, 0), half(va.ref(), 0), half(vb.ref(), 0)}),
+         inst(mnemonic, {half(dst, 1), half(va.ref(), 1), half(vb.ref(), 1)})});
+
+    // A VGPR belongs in src1, so an SGPR pair on either side needs no copy.
+    expectInstructions(
+        emitOp(op, dst, sa, vb),
+        {inst(mnemonic, {half(dst, 0), half(sa.ref(), 0), half(vb.ref(), 0)}),
+         inst(mnemonic, {half(dst, 1), half(sa.ref(), 1), half(vb.ref(), 1)})});
+    expectInstructions(
+        emitOp(op, dst, va, sb),
+        {inst(mnemonic, {half(dst, 0), half(sb.ref(), 0), half(va.ref(), 0)}),
+         inst(mnemonic, {half(dst, 1), half(sb.ref(), 1), half(va.ref(), 1)})});
+
+    // Two distinct SGPR pairs exceed the constant bus in each half.
+    out = emitOp(op, dst, sa, sb);
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 2) << out;
+
+    out = emitOp(op, dst, va, literal32);
+    expectInstructions(
+        out, {inst(mnemonic, {half(dst, 0), literal32Text, half(va.ref(), 0)}),
+              inst(mnemonic, {half(dst, 1), "0", half(va.ref(), 1)})});
+  }
+}
+
+TEST_F(Bitwise64Test, AndOrOverlapOrdersHalves) {
+  RegisterRange sr = builder.allocateSgpr(4);
+  RegisterRange vr = builder.allocateVgpr(4);
+  RegisterRange so = sgprPair();
+  RegisterRange vo = vgprPair();
+  for (int32_t i = 0; i < 2; ++i) {
+    SCOPED_TRACE(andOrCases64[i].name);
+    BuilderOp op = andOrCases64[i].op;
+    // dst.lo is a.hi, so the high half is written first and nothing is copied.
+    for (const auto &[range, other, mnemonic] :
+         {std::tuple{&sr, &so, andOrSalu32[i]},
+          std::tuple{&vr, &vo, andOrValu32[i]}}) {
+      RegisterRef a = range->ref(0, 2);
+      RegisterRef d = range->ref(1, 2);
+      RegisterRef b = other->ref();
+      expectInstructions(
+          emitOp(op, d, a, b),
+          {inst(mnemonic, {half(d, 1), half(a, 1), half(b, 1)}),
+           inst(mnemonic, {half(d, 0), half(a, 0), half(b, 0)})});
+    }
+    // dst.lo is a.hi and dst.hi is b.lo: neither order works, so a.hi is
+    // copied.
+    for (const auto &[range, mnemonic] :
+         {std::tuple{&sr, andOrSalu32[i]}, std::tuple{&vr, andOrValu32[i]}}) {
+      RegisterRef a = range->ref(0, 2);
+      RegisterRef d = range->ref(1, 2);
+      RegisterRef b = range->ref(2, 2);
+      std::string out = emitOp(op, d, a, b);
+      EXPECT_EQ(instructionCount(out), 3) << out;
+      EXPECT_EQ(countLinesContaining(out, "mov"), 1) << out;
+      EXPECT_EQ(countLinesContaining(out, mnemonic), 2) << out;
+    }
+  }
+}
+
+TEST_F(Bitwise64Test, SaluShifts) {
+  RegisterRange dstOwner = builder.allocateSgpr(3, 2);
+  RegisterRange d = sgprPair();
+  RegisterRange a = sgprPair();
+  RegisterRange oddOwner = builder.allocateSgpr(3, 2);
+  RegisterRange amount = builder.allocateSgpr(1);
+  RegisterRef oddDst = dstOwner.ref(1, 2);
+  RegisterRef oddA = oddOwner.ref(1, 2);
+  for (int32_t i = 0; i < 3; ++i) {
+    SCOPED_TRACE(shiftCases64[i].name);
+    BuilderOp op = shiftCases64[i].op;
+    std::string mnemonic = shiftSalu64[i];
+    // The SALU form takes the value first.
+    expectInstructions(emitOp(op, d.ref(), a, amount),
+                       {inst(mnemonic, {text(d), text(a), text(amount)})});
+    expectInstructions(emitOp(op, d.ref(), a, literalA),
+                       {inst(mnemonic, {text(d), text(a), literalAText})});
+
+    // A misaligned value moves to an aligned pair first.
+    std::string out = emitOp(op, d.ref(), oddA, amount);
+    EXPECT_EQ(instructionCount(out), 3) << out;
+    EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 2) << out;
+    EXPECT_EQ(countLinesContaining(out, text(oddA) + ","), 0) << out;
+    EXPECT_EQ(countLinesContaining(out, mnemonic + " " + text(d) + ", s["), 1)
+        << out;
+
+    // A negative literal cannot be zero-extended by the 64-bit form.
+    out = emitOp(op, d.ref(), -100, amount);
+    EXPECT_EQ(instructionCount(out), 3) << out;
+    EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 2) << out;
+    EXPECT_EQ(countLinesContaining(out, ", -100"), 1) << out;
+
+    // Distinct literals cannot share an instruction, so the amount is copied
+    // to the lowest free SGPR.
+    expectInstructions(emitOp(op, d.ref(), literal32, literalA),
+                       {inst("s_mov_b32", {"s11", literalAText}),
+                        inst(mnemonic, {text(d), literal32Text, "s11"})});
+
+    // A misaligned destination is written through an aligned pair.
+    out = emitOp(op, oddDst, a, amount);
+    EXPECT_EQ(instructionCount(out), 3) << out;
+    EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 2) << out;
+    EXPECT_EQ(countLinesContaining(out, mnemonic + " s["), 1) << out;
+  }
+}
+
+TEST_F(Bitwise64Test, ValuShifts) {
+  RegisterRange dstOwner = builder.allocateVgpr(3, 2);
+  RegisterRange oddOwner = builder.allocateVgpr(3, 2);
+  RegisterRange d = vgprPair();
+  RegisterRange a = vgprPair();
+  RegisterRange amount = builder.allocateVgpr(1);
+  RegisterRange sa = sgprPair();
+  RegisterRange sAmount = builder.allocateSgpr(1);
+  RegisterRef oddDst = dstOwner.ref(1, 2);
+  RegisterRef oddA = oddOwner.ref(1, 2);
+  for (int32_t i = 0; i < 3; ++i) {
+    SCOPED_TRACE(shiftCases64[i].name);
+    BuilderOp op = shiftCases64[i].op;
+    std::string mnemonic = shiftValu64[i];
+    // The VALU forms are the *rev ones, which take the amount first.
+    expectInstructions(emitOp(op, d.ref(), a, amount),
+                       {inst(mnemonic, {text(d), text(amount), text(a)})});
+
+    // VOP3 takes no literal, so the amount is copied.
+    std::string out = emitOp(op, d.ref(), a, literalA);
+    EXPECT_EQ(instructionCount(out), 2) << out;
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 1) << out;
+    EXPECT_EQ(countLinesContaining(out, literalAText), 1) << out;
+
+    expectInstructions(emitOp(op, d.ref(), sa, amount),
+                       {inst(mnemonic, {text(d), text(amount), text(sa)})});
+
+    // An SGPR pair and an SGPR amount exceed the constant bus.
+    out = emitOp(op, d.ref(), sa, sAmount);
+    EXPECT_EQ(instructionCount(out), 2) << out;
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32 v"), 1) << out;
+    EXPECT_EQ(countLinesContaining(out, text(sAmount)), 1) << out;
+
+    // A literal value moves to an aligned VGPR pair.
+    out = emitOp(op, d.ref(), literal32, amount);
+    EXPECT_EQ(instructionCount(out), 2) << out;
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b64"), 1) << out;
+    EXPECT_EQ(countLinesContaining(out, literal32Text), 1) << out;
+
+    out = emitOp(op, d.ref(), oddA, amount);
+    EXPECT_EQ(instructionCount(out), 3) << out;
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 2) << out;
+    EXPECT_EQ(countLinesContaining(out, mnemonic + " " + text(d)), 1) << out;
+
+    // A misaligned destination is written through an aligned pair.
+    out = emitOp(op, oddDst, a, amount);
+    EXPECT_EQ(instructionCount(out), 3) << out;
+    EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), 2) << out;
+    EXPECT_EQ(countLinesContaining(out, mnemonic + " v["), 1) << out;
+  }
+}
+
+TEST_F(Bitwise64Test, ShiftAliasing) {
+  RegisterRange vd = vgprPair();
+  RegisterRange va = vgprPair();
+  RegisterRange vAmount = builder.allocateVgpr(1);
+  RegisterRange sd = sgprPair();
+  RegisterRange sa = sgprPair();
+  RegisterRange sAmount = builder.allocateSgpr(1);
+  for (int32_t i = 0; i < 3; ++i) {
+    SCOPED_TRACE(shiftCases64[i].name);
+    BuilderOp op = shiftCases64[i].op;
+    RegisterRef v = vd.ref();
+    RegisterRef s = sd.ref();
+    expectInstructions(
+        emitOp(op, v, v, vAmount),
+        {inst(shiftValu64[i], {text(v), text(vAmount), text(v)})});
+    expectInstructions(
+        emitOp(op, v, va, v.slice(0)),
+        {inst(shiftValu64[i], {text(v), text(v.slice(0)), text(va)})});
+    expectInstructions(
+        emitOp(op, s, s, sAmount),
+        {inst(shiftSalu64[i], {text(s), text(s), text(sAmount)})});
+    expectInstructions(
+        emitOp(op, s, sa, s.slice(0)),
+        {inst(shiftSalu64[i], {text(s), text(sa), text(s.slice(0))})});
+  }
+}
+
+TEST_F(Bitwise64Test, InvalidOperandsThrowWithoutEmitting) {
+  RegisterRange sdst = sgprPair();
+  RegisterRange vdst = vgprPair();
+  RegisterRange spair = sgprPair();
+  RegisterRange vpair = vgprPair();
+  RegisterRange accPair = builder.allocateAgpr(2, 2);
+  RegisterRange accSingle = builder.allocateAgpr(1);
+  RegisterRange sSingle = builder.allocateSgpr(1);
+  RegisterRange vSingle = builder.allocateVgpr(1);
+  RegisterRange triple = builder.allocateVgpr(3);
+  for (const OpCase64 &current : bitCases64) {
+    SCOPED_TRACE(current.name);
+    BuilderOp op = current.op;
+    // b is a single register for the shifts and a pair otherwise.
+    bool amount = current.amountOperand;
+    Operand sB = amount ? Operand(sSingle) : Operand(spair);
+    Operand vB = amount ? Operand(vSingle) : Operand(vpair);
+    Operand accB = amount ? Operand(accSingle) : Operand(accPair);
+    Operand wrongWidthB = amount ? Operand(vpair) : Operand(vSingle);
+    EXPECT_THROW((builder.*op)(sdst.ref(), vpair, sB), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(sdst.ref(), spair, vB), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(accPair.ref(), spair, sB),
+                 std::invalid_argument);
+    EXPECT_THROW((builder.*op)(vdst.ref(), accPair, sB), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(vdst.ref(), spair, accB), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(vSingle.ref(), vpair, sB),
+                 std::invalid_argument);
+    EXPECT_THROW((builder.*op)(triple.ref(), vpair, sB), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(vdst.ref(), vSingle, sB), std::invalid_argument);
+    EXPECT_THROW((builder.*op)(vdst.ref(), spair, wrongWidthB),
+                 std::invalid_argument);
+  }
+  EXPECT_EQ(body.toString(), "");
+}
+
+TEST_F(Bitwise64Test, TemporariesAreReleased) {
+  RegisterRange dst = vgprPair();
+  RegisterRange a = sgprPair();
+  RegisterRange amount = builder.allocateSgpr(1);
+  // The SGPR pair and the SGPR amount exceed the constant bus: one copy.
+  emitOp(&IRBuilder::shli64, dst.ref(), a, amount);
+  EXPECT_EQ(allocator.highWaterMark(RegisterKind::vgpr), 3);
+  RegisterRange next = builder.allocateVgpr(1);
+  EXPECT_EQ(next.start(), 2);
+}
+
+using Bitwise64Device = DeviceTest;
+
+TEST_F(Bitwise64Device, ValuLaneOperands) {
+  expectValuLaneOperands64(andOrCases64, makeData(4096));
+  expectValuLaneOperands64(shiftCases64, makeShiftData64(4096));
+}
+
+TEST_F(Bitwise64Device, SaluUniformOperands) {
+  expectSaluUniformOperands64(andOrCases64, makeData(256));
+  expectSaluUniformOperands64(shiftCases64, makeShiftData64(256));
+}
+
+TEST_F(Bitwise64Device, ScalarsIntoVgpr) {
+  expectScalarsIntoVgpr64(andOrCases64, makeData(256));
+  expectScalarsIntoVgpr64(shiftCases64, makeShiftData64(256));
+}
+
+TEST_F(Bitwise64Device, MixedScalarAndVector) {
+  expectMixedScalarAndVector64(andOrCases64, makeData(4096));
+  expectMixedScalarAndVector64(shiftCases64, makeShiftData64(4096));
+}
+
+TEST_F(Bitwise64Device, MisalignedPairs) {
+  expectMisalignedPairs64(andOrCases64, makeData(1024));
+  expectMisalignedPairs64(shiftCases64, makeShiftData64(1024));
+}
+
+TEST_F(Bitwise64Device, ImmediateOperands) {
+  expectImmediateOperands64(andOrCases64, makeData(0), arith64Immediates,
+                            arith64Immediates);
+  expectImmediateOperands64(shiftCases64, makeShiftData64(0), arith64Immediates,
+                            shiftAmountImmediates);
+}
+
+TEST_F(Bitwise64Device, DestinationAliasing) {
+  expectDestinationAliasing64(andOrCases64, makeData(256), arithPlacements);
+  static constexpr Arith64Placement shiftPlacements[] = {
+      Arith64Placement::destinationIsA, Arith64Placement::lowIsAHigh,
+      Arith64Placement::highIsALow, Arith64Placement::amountInDestination};
+  expectDestinationAliasing64(shiftCases64, makeShiftData64(256),
+                              shiftPlacements);
+}
+
+// Emits every placement of a shift into a single kernel, with the destination
+// aligned and misaligned.
+static void expectShiftPlacementsAssemble(const OpCase64 &op,
+                                          RegisterKind dstKind) {
+  Target target = Target::get("gfx950");
+  Kernel kernel(target, "codegen_placement", arithWorkgroupSize);
+  IRBuilder &builder = kernel.builder();
+  Arith64PlacementRegisters aRegs = allocatePlacementRegisters(builder);
+  RegisterRange vector = builder.allocateVgpr(1);
+  RegisterRange scalar = builder.allocateSgpr(1);
+  RegisterRange dst =
+      dstKind == vgpr ? builder.allocateVgpr(3, 2) : builder.allocateSgpr(3, 2);
+  std::vector<NamedOperand> amounts = {{"vgpr", vector},
+                                       {"sgpr", scalar},
+                                       {"inline 5", 5},
+                                       {"literal 100", 100},
+                                       {"literal 0x12345678", 0x12345678},
+                                       {"INT32_MIN", INT32_MIN},
+                                       {"-1", -1}};
+  for (const NamedOperand &a : placementsOf(aRegs)) {
+    for (const NamedOperand &amount : amounts) {
+      // A scalar destination cannot take a vector operand.
+      if (dstKind == sgpr &&
+          (a.operand.isRegister(vgpr) || amount.operand.isRegister(vgpr)))
+        continue;
+      for (int32_t offset : {0, 1})
+        (builder.*op.op)(dst.ref(offset, 2), a.operand, amount.operand);
+    }
+  }
+  builder.createEndProgram();
+
+  std::string assembly = kernel.toAssembly();
+  SCOPED_TRACE(std::string(op.name) +
+               (dstKind == vgpr ? " to vgpr pair" : " to sgpr pair") + "\n" +
+               assembly);
+  EXPECT_NO_THROW(assembleToHSACO(assembly, target.isaName()));
+}
+
+TEST(Bitwise64Assembly, AllOperandPlacementsAssemble) {
+  for (const OpCase64 &op : andOrCases64) {
+    expectPlacementsAssemble(op, vgpr);
+    expectPlacementsAssemble(op, sgpr);
+  }
+  for (const OpCase64 &op : shiftCases64) {
+    expectShiftPlacementsAssemble(op, vgpr);
+    expectShiftPlacementsAssemble(op, sgpr);
   }
 }
 
