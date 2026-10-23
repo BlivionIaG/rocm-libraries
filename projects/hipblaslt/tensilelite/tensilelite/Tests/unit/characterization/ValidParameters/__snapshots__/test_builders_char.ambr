@@ -1371,6 +1371,10 @@
     'AssertBetaZero',
     'AssertFree0ElementMultiple',
     'AssertFree1ElementMultiple',
+    'AssertNoActivation',
+    'AssertNoBias',
+    'AssertNoScaleAB',
+    'AssertNoScaleAlphaVec',
     'AssertSizeEqual',
     'AssertSizeGreaterThan',
     'AssertSizeLessThan',
@@ -1654,6 +1658,38 @@
         4,
       ]),
       'len': 9,
+      'type': 'list',
+    }),
+    'AssertNoActivation': dict({
+      'head': list([
+        False,
+        True,
+      ]),
+      'len': 2,
+      'type': 'list',
+    }),
+    'AssertNoBias': dict({
+      'head': list([
+        False,
+        True,
+      ]),
+      'len': 2,
+      'type': 'list',
+    }),
+    'AssertNoScaleAB': dict({
+      'head': list([
+        False,
+        True,
+      ]),
+      'len': 2,
+      'type': 'list',
+    }),
+    'AssertNoScaleAlphaVec': dict({
+      'head': list([
+        False,
+        True,
+      ]),
+      'len': 2,
       'type': 'list',
     }),
     'AssertSizeEqual': dict({

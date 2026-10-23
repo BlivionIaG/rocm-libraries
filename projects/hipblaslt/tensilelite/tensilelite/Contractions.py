@@ -567,6 +567,14 @@ class ProblemPredicate(Properties.Predicate):
             return cls("AlphaValue", value="1") if value else None
         if key == "AssertBetaZero":
             return cls("BetaZero") if value else None
+        if key == "AssertNoBias":
+            return cls("UseBias", value=0) if value else None
+        if key == "AssertNoActivation":
+            return cls("Activation", value=ActivationType('none')) if value else None
+        if key == "AssertNoScaleAB":
+            return cls("UseScaleAB", value="") if value else None
+        if key == "AssertNoScaleAlphaVec":
+            return cls("UseScaleAlphaVec", value=0) if value else None
         if key in ASSERT_DIM_MAP_PREDICATES:
             if not isinstance(value, dict):
                 raise RuntimeError(

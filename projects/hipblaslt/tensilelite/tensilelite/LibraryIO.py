@@ -23,6 +23,7 @@
 ################################################################################
 
 from .CustomKernels import getCustomKernelConfig
+from .KernelGenerators import getGeneratorKernelConfig, isGeneratorKernel
 from .ExecutionPolicy import normalize_execution_policy_with_defaults
 from rocisa.enum import DataTypeEnum
 from . import SolutionLibrary
@@ -740,7 +741,10 @@ def parseLibraryLogicData(
         solutionState["AssignedDerivedParameters"] = False
         customKernelName = None
         ck = solutionState.get("CustomKernel")
-        if isinstance(ck, dict) and ck.get("name") and not ck.get("generated", False):
+        if isGeneratorKernel(ck):
+            generatorConfig = getGeneratorKernelConfig(ck, solutionState.get("InternalSupportParams", {}))
+            solutionState = normalize_execution_policy_with_defaults(generatorConfig, solutionState)
+        elif isinstance(ck, dict) and ck.get("name") and not ck.get("generated", False):
             customKernelName = ck["name"]
         elif solutionState.get("CustomKernelName", ""):
             customKernelName = solutionState["CustomKernelName"]

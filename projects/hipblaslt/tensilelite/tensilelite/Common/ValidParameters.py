@@ -712,6 +712,12 @@ validParameters = { # we need to make sure this matches develop
     # only serves alpha == 1 (resp. beta == 0).
     "AssertAlphaOne": [False, True],
     "AssertBetaZero": [False, True],
+    # A kernel without that epilogue feature declares that it only serves
+    # problems that do not use it.
+    "AssertNoBias": [False, True],
+    "AssertNoActivation": [False, True],
+    "AssertNoScaleAB": [False, True],
+    "AssertNoScaleAlphaVec": [False, True],
     # Assertions that require arithmetic intensity to be specified value.
     # Arithmetic intensity measures the ratio of computation to memory bandwidth required for a problem.
     # These predicates can be used to adjust solution selection compute-bound or memory-bound problems.
@@ -1151,6 +1157,10 @@ validParameters = { # we need to make sure this matches develop
     #
     # Custom kernels can be included in a BenchmarkProblemSizeGroup by having their name (without file extension) listed under the "CustomKernels"
     # category alongside InitialSolutionParameters, BenchmarkCommonParameters, etc...
+    #
+    # In a library logic file the block can instead name a generator,
+    # CustomKernel: {generator: <name>, generatorParams: {...}}, which TensileCreateLibrary
+    # expands through KernelGenerators into a complete custom kernel and emits the assembly of.
     "CustomKernel": -1,
     # Will allow a kernel to be accepted even when checks determine it's not viable.
     # Intended for use with custom kernels which have confirmed to be correct
