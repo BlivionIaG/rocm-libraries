@@ -801,6 +801,8 @@ enum class BPlacement {
   sameLiteral,
   negativeLiteral,
   minInt32,
+  one,
+  eight,
 };
 
 struct PlacementRegisters {
@@ -811,6 +813,31 @@ struct PlacementRegisters {
 };
 
 } // namespace
+
+// Builds "mnemonic op0, op1, ...".
+static std::string inst(std::string_view mnemonic,
+                        const std::vector<std::string> &operands) {
+  std::string result(mnemonic);
+  for (int64_t i = 0; i < std::ssize(operands); ++i)
+    result += (i == 0 ? " " : ", ") + operands[i];
+  return result;
+}
+
+// Checks that text holds exactly the expected instructions, so adjacency is
+// checked too. A line may carry a trailing comment after its operands.
+static void expectInstructions(const std::string &text,
+                               const std::vector<std::string> &expected) {
+  std::vector<std::string> lines = instructionsOf(text);
+  ASSERT_EQ(lines.size(), expected.size()) << text;
+  for (int64_t i = 0; i < std::ssize(expected); ++i) {
+    const std::string &actual = lines[i];
+    bool matches = actual.rfind(expected[i], 0) == 0 &&
+                   (actual.size() == expected[i].size() ||
+                    actual[expected[i].size()] == ' ');
+    EXPECT_TRUE(matches) << "line " << i << ": expected '" << expected[i]
+                         << "', got '" << actual << "'";
+  }
+}
 
 static constexpr OpCase32 opCases32[] = {
     {"addi32", &IRBuilder::addi32, "v_add_u32", "s_add_u32",
@@ -908,13 +935,55 @@ TEST_F(ArithTest, InlineConstantsNeedNoCopy) {
     int32_t copies;
   };
   for (const Case &current :
-       {Case{64, "64", 0}, Case{-16, "-16", 0}, Case{-1, "-1", 0},
+       {Case{63, "63", 0}, Case{-16, "-16", 0}, Case{-1, "-1", 0},
         Case{65, "65", 1}, Case{-17, "-17", 1}}) {
     SCOPED_TRACE(current.printed);
     std::string out = emitMul(dst.ref(), v1, current.value);
     EXPECT_EQ(countLinesContaining(out, "v_mov_b32"), current.copies);
     // The value is printed once, in the mul or in its copy.
     EXPECT_EQ(countLinesContaining(out, ", " + current.printed), 1);
+  }
+}
+
+TEST_F(ArithTest, MulByPowerOfTwoUsesShift) {
+  RegisterRange sd = builder.allocateSgpr(1);
+  RegisterRange sa = builder.allocateSgpr(1);
+  RegisterRange vd = builder.allocateVgpr(1);
+  RegisterRange va = builder.allocateVgpr(1);
+  expectInstructions(emitMul(sd.ref(), sa, 8),
+                     {inst("s_lshl_b32", {text(sd), text(sa), "3"})});
+  expectInstructions(emitMul(vd.ref(), va, 8),
+                     {inst("v_lshlrev_b32", {text(vd), "3", text(va)})});
+  // The power of two may be the first operand.
+  expectInstructions(emitMul(sd.ref(), 8, sa),
+                     {inst("s_lshl_b32", {text(sd), text(sa), "3"})});
+  expectInstructions(emitMul(vd.ref(), 8, va),
+                     {inst("v_lshlrev_b32", {text(vd), "3", text(va)})});
+  // A scalar a into a vector dst needs no copy.
+  expectInstructions(emitMul(vd.ref(), sa, 8),
+                     {inst("v_lshlrev_b32", {text(vd), "3", text(sa)})});
+  expectInstructions(emitMul(sd.ref(), sa, 1),
+                     {inst("s_mov_b32", {text(sd), text(sa)})});
+  expectInstructions(emitMul(vd.ref(), va, 1),
+                     {inst("v_mov_b32", {text(vd), text(va)})});
+  // INT32_MIN is 2^31 modulo 2^32.
+  expectInstructions(emitMul(sd.ref(), sa, INT32_MIN),
+                     {inst("s_lshl_b32", {text(sd), text(sa), "31"})});
+  expectInstructions(emitMul(vd.ref(), va, INT32_MIN),
+                     {inst("v_lshlrev_b32", {text(vd), "31", text(va)})});
+}
+
+TEST_F(ArithTest, MulByNonPowerOfTwoKeepsMultiply) {
+  RegisterRange sd = builder.allocateSgpr(1);
+  RegisterRange sa = builder.allocateSgpr(1);
+  RegisterRange vd = builder.allocateVgpr(1);
+  RegisterRange va = builder.allocateVgpr(1);
+  for (int32_t value : {3, -4, 0, 0x12345678}) {
+    SCOPED_TRACE(value);
+    EXPECT_EQ(countLinesContaining(emitMul(sd.ref(), sa, value), "s_mul_i32"),
+              1);
+    EXPECT_EQ(
+        countLinesContaining(emitMul(vd.ref(), va, value), "v_mul_lo_u32"), 1);
   }
 }
 
@@ -1182,6 +1251,15 @@ TEST_F(ArithDevice, ImmediateOperands) {
   expectImmediateOperands(opCases32, makeArithPairs(0), arithImmediates);
 }
 
+TEST_F(ArithDevice, MulByPowerOfTwo) {
+  std::span<const OpCase32> mul(&opCases32[2], 1);
+  ASSERT_STREQ(mul[0].name, "muli32");
+  std::vector<int32_t> powers;
+  for (int32_t exponent = 0; exponent <= 31; ++exponent)
+    powers.push_back(static_cast<int32_t>(1u << exponent));
+  expectImmediateOperands(mul, makeArithPairs(256), powers);
+}
+
 // Each emitter writes into an input register and then moves it to dst.
 TEST_F(ArithDevice, DestinationAliasesOperand) {
   WordPairs pairs = makeArithPairs(256);
@@ -1278,6 +1356,10 @@ static const char *placementName(BPlacement placement) {
     return "literal -100";
   case BPlacement::minInt32:
     return "INT32_MIN";
+  case BPlacement::one:
+    return "2^0";
+  case BPlacement::eight:
+    return "2^3";
   }
   return "";
 }
@@ -1314,6 +1396,10 @@ static Operand pickB(BPlacement placement, const PlacementRegisters &regs) {
     return negativeLiteralB;
   case BPlacement::minInt32:
     return INT32_MIN;
+  case BPlacement::one:
+    return 1;
+  case BPlacement::eight:
+    return 8;
   }
   return 0;
 }
@@ -1354,10 +1440,11 @@ static void expectAllPlacementsAssemble(const std::string &label,
                                         const PlacementEmitter &emit) {
   for (APlacement a : {APlacement::vgpr, APlacement::sgpr,
                        APlacement::inlineConstant, APlacement::literal})
-    for (BPlacement b : {BPlacement::vgpr, BPlacement::otherSgpr,
-                         BPlacement::sameSgpr, BPlacement::inlineConstant,
-                         BPlacement::literal, BPlacement::sameLiteral,
-                         BPlacement::negativeLiteral, BPlacement::minInt32}) {
+    for (BPlacement b :
+         {BPlacement::vgpr, BPlacement::otherSgpr, BPlacement::sameSgpr,
+          BPlacement::inlineConstant, BPlacement::literal,
+          BPlacement::sameLiteral, BPlacement::negativeLiteral,
+          BPlacement::minInt32, BPlacement::one, BPlacement::eight}) {
       if (!isCompatible(a, b))
         continue;
       expectPlacementAssembles(label, emit, a, b, RegisterKind::vgpr);
@@ -1471,31 +1558,6 @@ static constexpr OpCase64 opCases64[] = {
 
 static constexpr int32_t otherLiteral = 0x0FEDCBA9;
 
-// Builds "mnemonic op0, op1, ...".
-static std::string inst(std::string_view mnemonic,
-                        const std::vector<std::string> &operands) {
-  std::string result(mnemonic);
-  for (int64_t i = 0; i < std::ssize(operands); ++i)
-    result += (i == 0 ? " " : ", ") + operands[i];
-  return result;
-}
-
-// Checks that text holds exactly the expected instructions, so adjacency is
-// checked too. A line may carry a trailing comment after its operands.
-static void expectInstructions(const std::string &text,
-                               const std::vector<std::string> &expected) {
-  std::vector<std::string> lines = instructionsOf(text);
-  ASSERT_EQ(lines.size(), expected.size()) << text;
-  for (int64_t i = 0; i < std::ssize(expected); ++i) {
-    const std::string &actual = lines[i];
-    bool matches = actual.rfind(expected[i], 0) == 0 &&
-                   (actual.size() == expected[i].size() ||
-                    actual[expected[i].size()] == ' ');
-    EXPECT_TRUE(matches) << "line " << i << ": expected '" << expected[i]
-                         << "', got '" << actual << "'";
-  }
-}
-
 static int32_t instructionCount(const std::string &text) {
   return static_cast<int32_t>(instructionsOf(text).size());
 }
@@ -1589,6 +1651,65 @@ TEST_F(Arith64Test, ValuMulSequence) {
        inst("v_mul_lo_u32", {crossB, half(a, 1), half(b, 0)}),
        inst("v_mul_lo_u32", {half(d, 0), half(a, 0), half(b, 0)}),
        inst("v_add3_u32", {half(d, 1), high, crossA, crossB})});
+}
+
+TEST_F(Arith64Test, MulByPowerOfTwoUsesShift) {
+  RegisterRange sd = sgprPair();
+  RegisterRange sa = sgprPair();
+  RegisterRange vd = vgprPair();
+  RegisterRange va = vgprPair();
+  expectInstructions(emitMul(sd.ref(), sa, 8),
+                     {inst("s_lshl_b64", {text(sd), text(sa), "3"})});
+  expectInstructions(emitMul(vd.ref(), va, 8),
+                     {inst("v_lshlrev_b64", {text(vd), "3", text(va)})});
+  // The power of two may be the first operand.
+  expectInstructions(emitMul(sd.ref(), 8, sa),
+                     {inst("s_lshl_b64", {text(sd), text(sa), "3"})});
+  expectInstructions(emitMul(vd.ref(), 8, va),
+                     {inst("v_lshlrev_b64", {text(vd), "3", text(va)})});
+  expectInstructions(emitMul(vd.ref(), va, 1 << 30),
+                     {inst("v_lshlrev_b64", {text(vd), "30", text(va)})});
+  expectInstructions(emitMul(sd.ref(), sa, 1),
+                     {inst("s_mov_b64", {text(sd), text(sa)})});
+  expectInstructions(emitMul(vd.ref(), va, 1),
+                     {inst("v_mov_b64", {text(vd), text(va)})});
+}
+
+TEST_F(Arith64Test, MulByPowerOfTwoWithMisalignedPairsStillShifts) {
+  RegisterRange sdOwner = builder.allocateSgpr(3, 2);
+  RegisterRange saOwner = builder.allocateSgpr(3, 2);
+  RegisterRange vdOwner = builder.allocateVgpr(3, 2);
+  RegisterRange vaOwner = builder.allocateVgpr(3, 2);
+  RegisterRange sAligned = sgprPair();
+  RegisterRange vAligned = vgprPair();
+  for (int32_t power : {8, 1 << 30}) {
+    std::vector<std::string> outputs = {
+        emitMul(sdOwner.ref(1, 2), sAligned, power),
+        emitMul(sAligned.ref(), saOwner.ref(1, 2), power),
+        emitMul(vdOwner.ref(1, 2), vAligned, power),
+        emitMul(vAligned.ref(), vaOwner.ref(1, 2), power)};
+    for (const std::string &out : outputs) {
+      SCOPED_TRACE(out);
+      EXPECT_EQ(countLinesContaining(out, "_mul"), 0);
+      EXPECT_GT(countLinesContaining(out, "lshl"), 0);
+    }
+  }
+}
+
+TEST_F(Arith64Test, MulByNonPowerOfTwoKeepsMultiply) {
+  RegisterRange sd = sgprPair();
+  RegisterRange sa = sgprPair();
+  RegisterRange vd = vgprPair();
+  RegisterRange va = vgprPair();
+  // The immediate sign-extends, so INT32_MIN and negative powers are not
+  // powers of two.
+  for (int32_t value : {INT32_MIN, -4, 3, 0}) {
+    SCOPED_TRACE(value);
+    EXPECT_GT(
+        countLinesContaining(emitMul(sd.ref(), sa, value), "s_mul_hi_u32"), 0);
+    EXPECT_GT(
+        countLinesContaining(emitMul(vd.ref(), va, value), "v_mul_hi_u32"), 0);
+  }
 }
 
 TEST_F(Arith64Test, ScalarOperandsIntoVgprAreLegalized) {
@@ -2195,6 +2316,34 @@ TEST_F(Arith64Device, DestinationAliasing) {
   expectDestinationAliasing64(opCases64, makeData(256), arithPlacements);
 }
 
+TEST_F(Arith64Device, MulByPowerOfTwo) {
+  std::span<const OpCase64> mul(&opCases64[2], 1);
+  ASSERT_STREQ(mul[0].name, "muli64");
+  std::vector<int32_t> powers;
+  for (int32_t exponent = 0; exponent <= 30; ++exponent)
+    powers.push_back(1 << exponent);
+  Data64 data = makeData(256);
+  expectImmediateOperands64(mul, data, powers, powers);
+  for (int32_t power : {1, 8, 1 << 30})
+    for (bool dstMisaligned : {false, true})
+      for (bool operandsMisaligned : {false, true}) {
+        SCOPED_TRACE("power " + std::to_string(power) +
+                     (dstMisaligned ? ", misaligned dst" : ", aligned dst") +
+                     (operandsMisaligned ? ", misaligned operands"
+                                         : ", aligned operands"));
+        for (Case64 spec : {makeArith64Case(mul[0], vgpr, lane, lane),
+                            makeArith64Case(mul[0], sgpr, uniform, uniform)}) {
+          spec.dstMisaligned = dstMisaligned;
+          spec.operandsMisaligned = operandsMisaligned;
+          spec.b = power;
+          expectCase(spec, data);
+          spec.b.reset();
+          spec.a = power;
+          expectCase(spec, data);
+        }
+      }
+}
+
 static Arith64PlacementRegisters
 allocatePlacementRegisters(IRBuilder &builder) {
   return {builder.allocateVgpr(2, 2), builder.allocateVgpr(3, 2),
@@ -2210,7 +2359,10 @@ placementsOf(const Arith64PlacementRegisters &regs) {
           {"inline -5", -5},
           {"literal -100", -100},
           {"literal 0x12345678", 0x12345678},
-          {"INT32_MIN", INT32_MIN}};
+          {"INT32_MIN", INT32_MIN},
+          {"2^0", 1},
+          {"2^3", 8},
+          {"2^30", 1 << 30}};
 }
 
 // Emits every placement combination of one op into a single kernel.
@@ -2980,6 +3132,41 @@ TEST(Bitwise64Assembly, AllOperandPlacementsAssemble) {
 
 // Division.
 
+// The quotient truncates toward zero and INT32_MIN / -1 wraps.
+static uint32_t hostDiv(uint32_t a, uint32_t b) {
+  int32_t x = static_cast<int32_t>(a);
+  int32_t y = static_cast<int32_t>(b);
+  if (x == INT32_MIN && y == -1)
+    return a;
+  return static_cast<uint32_t>(x / y);
+}
+
+// The remainder has the sign of the dividend. INT32_MIN % -1 is 0, which C
+// leaves undefined, so it is special-cased.
+static uint32_t hostMod(uint32_t a, uint32_t b) {
+  int32_t x = static_cast<int32_t>(a);
+  int32_t y = static_cast<int32_t>(b);
+  if (y == -1)
+    return 0;
+  return static_cast<uint32_t>(x % y);
+}
+
+namespace {
+
+using DivisionOp = void (IRBuilder::*)(RegisterRef, Operand, Operand, bool);
+
+struct DivisionCase {
+  const char *name;
+  DivisionOp op;
+  uint32_t (*host)(uint32_t, uint32_t);
+};
+
+} // namespace
+
+static constexpr DivisionCase divisionCases[] = {
+    {"divsi32", &IRBuilder::divsi32, hostDiv},
+    {"modsi32", &IRBuilder::modsi32, hostMod}};
+
 namespace {
 
 enum class Form { scalar, vector, mixed };
@@ -2990,11 +3177,31 @@ struct DivRegisters {
   RegisterRange b;
 };
 
+static constexpr Form allForms[] = {Form::scalar, Form::vector, Form::mixed};
+
+static const char *formName(Form form) {
+  switch (form) {
+  case Form::scalar:
+    return "sgpr dst with sgpr operands";
+  case Form::vector:
+    return "vgpr dst with vgpr operands";
+  case Form::mixed:
+    return "vgpr dst with sgpr operands";
+  }
+  return "";
+}
+
 class DivTest : public BuilderTest {
 protected:
+  std::string emitDivision(const DivisionCase &divisionCase, RegisterRef dst,
+                           Operand a, Operand b, bool useIEEE) {
+    return emitted([&](IRBuilder &local) {
+      (local.*divisionCase.op)(dst, a, b, useIEEE);
+    });
+  }
+
   std::string emitDiv(RegisterRef dst, Operand a, Operand b, bool useIEEE) {
-    return emitted(
-        [&](IRBuilder &local) { local.divsi32(dst, a, b, useIEEE); });
+    return emitDivision(divisionCases[0], dst, a, b, useIEEE);
   }
 
   RegisterRange allocate(RegisterKind kind) {
@@ -3010,12 +3217,80 @@ protected:
     return {allocate(dstKind), allocate(sourceKind), allocate(sourceKind)};
   }
 
-  std::string emitForm(Form form, bool useIEEE) {
+  std::string emitForm(const DivisionCase &divisionCase, Form form,
+                       bool useIEEE) {
     DivRegisters regs = makeRegisters(form);
-    return emitDiv(regs.dst.ref(), regs.a, regs.b, useIEEE);
+    return emitDivision(divisionCase, regs.dst.ref(), regs.a, regs.b, useIEEE);
+  }
+
+  std::string emitForm(Form form, bool useIEEE) {
+    return emitForm(divisionCases[0], form, useIEEE);
   }
 
   int32_t nextFreeIndex(RegisterKind kind) { return allocate(kind).start(); }
+
+  // The instructions of a / 2^exponent or a % 2^exponent, whose temporary is
+  // the next free register of the destination's kind.
+  std::vector<std::string> powerOfTwoInstructions(bool scalar, bool quotient,
+                                                  const std::string &dst,
+                                                  const std::string &a,
+                                                  const std::string &temp,
+                                                  int32_t exponent) {
+    // The VALU shifts are the reversed forms, with the amount first.
+    auto shift = [&](std::string_view scalarName, std::string_view vectorName,
+                     const std::string &to, const std::string &from,
+                     int32_t amount) {
+      std::string amountText = std::to_string(amount);
+      return scalar ? inst(scalarName, {to, from, amountText})
+                    : inst(vectorName, {to, amountText, from});
+    };
+    if (exponent == 0)
+      return {
+          inst(scalar ? "s_mov_b32" : "v_mov_b32", {dst, quotient ? a : "0"})};
+    std::vector<std::string> expected;
+    if (exponent == 1) {
+      expected.push_back(shift("s_lshr_b32", "v_lshrrev_b32", temp, a, 31));
+    } else {
+      expected.push_back(shift("s_ashr_i32", "v_ashrrev_i32", temp, a, 31));
+      expected.push_back(
+          shift("s_lshr_b32", "v_lshrrev_b32", temp, temp, 32 - exponent));
+    }
+    expected.push_back(
+        inst(scalar ? "s_add_u32" : "v_add_u32", {temp, a, temp}));
+    if (quotient) {
+      expected.push_back(
+          shift("s_ashr_i32", "v_ashrrev_i32", dst, temp, exponent));
+      return expected;
+    }
+    std::string mask = std::to_string(-(1 << exponent));
+    expected.push_back(scalar ? inst("s_and_b32", {temp, temp, mask})
+                              : inst("v_and_b32", {temp, mask, temp}));
+    expected.push_back(
+        inst(scalar ? "s_sub_u32" : "v_sub_u32", {dst, a, temp}));
+    return expected;
+  }
+
+  // Checks the shift expansion of every form, for both useIEEE values.
+  void expectPowerOfTwoForms(const DivisionCase &divisionCase, bool quotient) {
+    for (Form form : allForms)
+      for (int32_t exponent : {0, 1, 2, 5, 30}) {
+        SCOPED_TRACE(std::string(formName(form)) + " divisor 2^" +
+                     std::to_string(exponent));
+        DivRegisters regs = makeRegisters(form);
+        RegisterKind dstKind = regs.dst.ref().kind;
+        std::string temp =
+            std::string(dstKind == RegisterKind::sgpr ? "s" : "v") +
+            std::to_string(nextFreeIndex(dstKind));
+        std::string exact = emitDivision(divisionCase, regs.dst.ref(), regs.a,
+                                         1 << exponent, true);
+        expectInstructions(
+            exact, powerOfTwoInstructions(form == Form::scalar, quotient,
+                                          text(regs.dst), text(regs.a), temp,
+                                          exponent));
+        EXPECT_EQ(exact, emitDivision(divisionCase, regs.dst.ref(), regs.a,
+                                      1 << exponent, false));
+      }
+  }
 };
 
 } // namespace
@@ -3080,20 +3355,6 @@ static int32_t indexOfMnemonic(const std::vector<std::string> &instructions,
     if (mnemonicOf(instructions[i]) == mnemonic)
       return i;
   return -1;
-}
-
-static constexpr Form allForms[] = {Form::scalar, Form::vector, Form::mixed};
-
-static const char *formName(Form form) {
-  switch (form) {
-  case Form::scalar:
-    return "sgpr dst with sgpr operands";
-  case Form::vector:
-    return "vgpr dst with vgpr operands";
-  case Form::mixed:
-    return "vgpr dst with sgpr operands";
-  }
-  return "";
 }
 
 TEST_F(DivTest, ExactSaluForScalarOperands) {
@@ -3186,21 +3447,147 @@ TEST_F(DivTest, FastValuForVectorDestination) {
   }
 }
 
-TEST_F(DivTest, NeverWritesExecOrVcc) {
-  for (bool useIEEE : {true, false})
-    for (Form form : allForms) {
-      SCOPED_TRACE(std::string(formName(form)) +
-                   (useIEEE ? " exact" : " fast"));
-      std::string out = emitForm(form, useIEEE);
-      for (const std::string &instruction : instructionsOf(out)) {
-        std::string dst = destinationOf(instruction);
-        EXPECT_NE(dst, "exec") << instruction;
-        EXPECT_NE(dst, "exec_lo") << instruction;
-        EXPECT_NE(dst, "vcc") << instruction;
+TEST_F(DivTest, ExactRemainderSaluForScalarOperands) {
+  DivRegisters regs = makeRegisters(Form::scalar);
+  std::string out =
+      emitDivision(divisionCases[1], regs.dst.ref(), regs.a, regs.b, true);
+  expectLinesInOrder(out,
+                     {"s_abs_i32",           "s_abs_i32",       "s_ashr_i32",
+                      "v_cvt_f32_u32",       "v_rcp_iflag_f32", "s_sub_u32",
+                      "v_mul_f32",           "v_cvt_u32_f32",   "s_nop 0",
+                      "v_readfirstlane_b32", "s_mul_i32",       "s_mul_hi_u32",
+                      "s_add_u32",           "s_mul_hi_u32",    "s_mul_i32",
+                      "s_sub_u32",           "s_sub_u32",       "s_cmp_ge_u32",
+                      "s_cselect_b32",       "s_sub_u32",       "s_cmp_ge_u32",
+                      "s_cselect_b32",       "s_xor_b32",       "s_sub_u32"});
+  EXPECT_EQ(instructionCount(out), 24);
+  // The sign is the dividend's alone, and the corrections never touch q, so
+  // the Newton step is the only add.
+  EXPECT_EQ(countLinesContaining(out, "s_xor_b32"), 1);
+  EXPECT_EQ(countLinesContaining(out, ", 31"), 1);
+  EXPECT_EQ(countLinesContaining(out, "s_add_u32"), 1);
+  EXPECT_EQ(countLinesContaining(out, "s_cselect_b32"), 2);
+  std::vector<std::string> instructions = instructionsOf(out);
+  EXPECT_EQ(mnemonicOf(instructions.back()), "s_sub_u32");
+  EXPECT_EQ(destinationOf(instructions.back()), text(regs.dst));
+}
+
+TEST_F(DivTest, ExactRemainderValuForVectorDestination) {
+  for (Form form : {Form::vector, Form::mixed}) {
+    SCOPED_TRACE(formName(form));
+    DivRegisters regs = makeRegisters(form);
+    std::string out =
+        emitDivision(divisionCases[1], regs.dst.ref(), regs.a, regs.b, true);
+    expectLinesInOrder(
+        out,
+        {"v_sub_u32",     "v_max_i32",     "v_sub_u32",       "v_max_i32",
+         "v_ashrrev_i32", "v_cvt_f32_u32", "v_rcp_iflag_f32", "v_sub_u32",
+         "v_mul_f32",     "v_cvt_u32_f32", "v_mul_lo_u32",    "v_mul_hi_u32",
+         "v_add_u32",     "v_mul_hi_u32",  "v_mul_lo_u32",    "v_sub_u32",
+         "v_sub_u32",     "v_cmp_ge_u32",  "s_nop 1",         "v_cndmask_b32",
+         "v_sub_u32",     "v_cmp_ge_u32",  "s_nop 1",         "v_cndmask_b32",
+         "v_xor_b32",     "v_sub_u32"});
+    EXPECT_EQ(countLinesContaining(out, "v_xor_b32"), 1);
+    EXPECT_EQ(countLinesContaining(out, ", 31"), 1);
+    EXPECT_EQ(countLinesContaining(out, "v_add_u32"), 1);
+    EXPECT_EQ(countLinesContaining(out, "v_cndmask_b32"), 2);
+    EXPECT_EQ(countLinesContaining(out, "v_readfirstlane"), 0);
+    std::vector<std::string> instructions = instructionsOf(out);
+    EXPECT_EQ(mnemonicOf(instructions.back()), "v_sub_u32");
+    EXPECT_EQ(destinationOf(instructions.back()), text(regs.dst));
+  }
+}
+
+TEST_F(DivTest, FastRemainderSaluForScalarOperands) {
+  DivRegisters regs = makeRegisters(Form::scalar);
+  std::string out =
+      emitDivision(divisionCases[1], regs.dst.ref(), regs.a, regs.b, false);
+  expectLinesInOrder(out,
+                     {"s_xor_b32", "s_ashr_i32", "s_or_b32", "v_cvt_f32_i32",
+                      "v_rcp_iflag_f32", "v_cvt_f32_i32", "v_mul_f32",
+                      "v_cvt_i32_f32", "v_cvt_f32_i32", "v_fma_f32",
+                      "v_cmp_ge_f32", "v_readfirstlane_b32", "s_and_b64",
+                      "s_cselect_b32", "s_add_u32", "s_mul_i32", "s_sub_u32"});
+  std::vector<std::string> instructions = instructionsOf(out);
+  EXPECT_EQ(mnemonicOf(instructions.back()), "s_sub_u32");
+  EXPECT_EQ(destinationOf(instructions.back()), text(regs.dst));
+}
+
+TEST_F(DivTest, FastRemainderValuForVectorDestination) {
+  for (Form form : {Form::vector, Form::mixed}) {
+    SCOPED_TRACE(formName(form));
+    DivRegisters regs = makeRegisters(form);
+    std::string out =
+        emitDivision(divisionCases[1], regs.dst.ref(), regs.a, regs.b, false);
+    expectLinesInOrder(
+        out, {"v_xor_b32", "v_ashrrev_i32", "v_or_b32", "v_cvt_f32_i32",
+              "v_rcp_iflag_f32", "v_cvt_f32_i32", "v_mul_f32", "v_cvt_i32_f32",
+              "v_cvt_f32_i32", "v_fma_f32", "v_cmp_ge_f32", "s_nop 1",
+              "v_cndmask_b32", "v_add_u32", "v_mul_lo_u32", "v_sub_u32"});
+    std::vector<std::string> instructions = instructionsOf(out);
+    EXPECT_EQ(mnemonicOf(instructions.back()), "v_sub_u32");
+    EXPECT_EQ(destinationOf(instructions.back()), text(regs.dst));
+  }
+}
+
+TEST_F(DivTest, PowerOfTwoDivisorUsesShifts) {
+  expectPowerOfTwoForms(divisionCases[0], true);
+}
+
+TEST_F(DivTest, PowerOfTwoRemainderUsesMask) {
+  expectPowerOfTwoForms(divisionCases[1], false);
+}
+
+TEST_F(DivTest, PowerOfTwoDestinationIsWrittenLast) {
+  for (const DivisionCase &c : divisionCases)
+    for (Form form : {Form::scalar, Form::vector})
+      for (int32_t exponent : {0, 1, 2, 30}) {
+        SCOPED_TRACE(std::string(c.name) + " " + formName(form) +
+                     " divisor 2^" + std::to_string(exponent));
+        DivRegisters regs = makeRegisters(form);
+        std::vector<std::string> instructions = instructionsOf(
+            emitDivision(c, regs.a.ref(), regs.a, 1 << exponent, true));
+        ASSERT_FALSE(instructions.empty());
+        EXPECT_EQ(destinationOf(instructions.back()), text(regs.a));
+        for (int64_t i = 0; i + 1 < std::ssize(instructions); ++i)
+          EXPECT_NE(destinationOf(instructions[i]), text(regs.a))
+              << instructions[i];
       }
-      EXPECT_EQ(countLinesContaining(out, "v_cmpx"), 0);
-      EXPECT_EQ(countLinesContaining(out, "vcc"), 0);
-    }
+}
+
+// Negative powers of two and INT32_MIN are not shifts, and a zero or other
+// divisor keeps its expansion too.
+TEST_F(DivTest, NonPositivePowersOfTwoKeepGeneralExpansion) {
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false})
+      for (Form form : {Form::scalar, Form::vector})
+        for (int32_t divisor : {-4, -(1 << 30), INT32_MIN, 3, 6, 0}) {
+          SCOPED_TRACE(std::string(c.name) + " " + formName(form) +
+                       (useIEEE ? " exact" : " fast") + " divisor " +
+                       std::to_string(divisor));
+          DivRegisters regs = makeRegisters(form);
+          std::string out =
+              emitDivision(c, regs.dst.ref(), regs.a, divisor, useIEEE);
+          EXPECT_EQ(countLinesContaining(out, "v_rcp_iflag_f32"), 1);
+        }
+}
+
+TEST_F(DivTest, NeverWritesExecOrVcc) {
+  for (const DivisionCase &divisionCase : divisionCases)
+    for (bool useIEEE : {true, false})
+      for (Form form : allForms) {
+        SCOPED_TRACE(std::string(divisionCase.name) + " " + formName(form) +
+                     (useIEEE ? " exact" : " fast"));
+        std::string out = emitForm(divisionCase, form, useIEEE);
+        for (const std::string &instruction : instructionsOf(out)) {
+          std::string dst = destinationOf(instruction);
+          EXPECT_NE(dst, "exec") << instruction;
+          EXPECT_NE(dst, "exec_lo") << instruction;
+          EXPECT_NE(dst, "vcc") << instruction;
+        }
+        EXPECT_EQ(countLinesContaining(out, "v_cmpx"), 0);
+        EXPECT_EQ(countLinesContaining(out, "vcc"), 0);
+      }
 }
 
 // The reciprocal's reader must not be the next instruction, since a trans
@@ -3232,29 +3619,30 @@ expectMaskNopBeforeCndmask(const std::vector<std::string> &instructions) {
 }
 
 TEST_F(DivTest, HazardWaitStates) {
-  for (bool useIEEE : {true, false})
-    for (Form form : allForms) {
-      SCOPED_TRACE(std::string(formName(form)) +
-                   (useIEEE ? " exact" : " fast"));
-      std::vector<std::string> instructions =
-          instructionsOf(emitForm(form, useIEEE));
-      expectReciprocalHazardCovered(instructions);
-      if (form != Form::scalar) {
-        expectMaskNopBeforeCndmask(instructions);
-        continue;
+  for (const DivisionCase &divisionCase : divisionCases)
+    for (bool useIEEE : {true, false})
+      for (Form form : allForms) {
+        SCOPED_TRACE(std::string(divisionCase.name) + " " + formName(form) +
+                     (useIEEE ? " exact" : " fast"));
+        std::vector<std::string> instructions =
+            instructionsOf(emitForm(divisionCase, form, useIEEE));
+        expectReciprocalHazardCovered(instructions);
+        if (form != Form::scalar) {
+          expectMaskNopBeforeCndmask(instructions);
+          continue;
+        }
+        int32_t readLane = indexOfMnemonic(instructions, "v_readfirstlane_b32");
+        ASSERT_GT(readLane, 0);
+        if (useIEEE) {
+          EXPECT_EQ(instructions[readLane - 1].rfind("s_nop 0", 0), 0u);
+          continue;
+        }
+        int32_t convert = indexOfMnemonic(instructions, "v_cvt_i32_f32");
+        ASSERT_GE(convert, 0);
+        EXPECT_GT(readLane - convert, 1);
+        EXPECT_EQ(sourcesOf(instructions[readLane]).front(),
+                  destinationOf(instructions[convert]));
       }
-      int32_t readLane = indexOfMnemonic(instructions, "v_readfirstlane_b32");
-      ASSERT_GT(readLane, 0);
-      if (useIEEE) {
-        EXPECT_EQ(instructions[readLane - 1].rfind("s_nop 0", 0), 0u);
-        continue;
-      }
-      int32_t convert = indexOfMnemonic(instructions, "v_cvt_i32_f32");
-      ASSERT_GE(convert, 0);
-      EXPECT_GT(readLane - convert, 1);
-      EXPECT_EQ(sourcesOf(instructions[readLane]).front(),
-                destinationOf(instructions[convert]));
-    }
 }
 
 // Every VOP3-only or VOP3-promoted line must be free of the literal.
@@ -3271,79 +3659,90 @@ static void expectLiteralOnlyInMoves(const std::string &out,
 TEST_F(DivTest, ImmediateOperandsInVectorForm) {
   RegisterRange dst = builder.allocateVgpr(1);
   RegisterRange value = builder.allocateVgpr(1);
-  for (bool useIEEE : {true, false}) {
-    SCOPED_TRACE(useIEEE ? "exact" : "fast");
-    std::string divisor = emitDiv(dst.ref(), value, literalA, useIEEE);
-    EXPECT_EQ(countLinesContaining(divisor, "v_mov_b32"), 1);
-    expectLiteralOnlyInMoves(divisor, literalAText);
-    std::string dividend = emitDiv(dst.ref(), literalB, value, useIEEE);
-    EXPECT_EQ(countLinesContaining(dividend, "v_mov_b32"), 1);
-    expectLiteralOnlyInMoves(dividend, literalBText);
-    for (int32_t inlineValue : {7, -5})
-      EXPECT_EQ(countLinesContaining(
-                    emitDiv(dst.ref(), value, inlineValue, useIEEE), "v_mov"),
-                0)
-          << inlineValue;
-  }
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false}) {
+      SCOPED_TRACE(std::string(c.name) + (useIEEE ? " exact" : " fast"));
+      std::string divisor =
+          emitDivision(c, dst.ref(), value, literalA, useIEEE);
+      EXPECT_EQ(countLinesContaining(divisor, "v_mov_b32"), 1);
+      expectLiteralOnlyInMoves(divisor, literalAText);
+      std::string dividend =
+          emitDivision(c, dst.ref(), literalB, value, useIEEE);
+      EXPECT_EQ(countLinesContaining(dividend, "v_mov_b32"), 1);
+      expectLiteralOnlyInMoves(dividend, literalBText);
+      for (int32_t inlineValue : {7, -5})
+        EXPECT_EQ(countLinesContaining(
+                      emitDivision(c, dst.ref(), value, inlineValue, useIEEE),
+                      "v_mov"),
+                  0)
+            << inlineValue;
+    }
 }
 
 TEST_F(DivTest, ImmediateOperandsInExactScalarForm) {
   RegisterRange dst = builder.allocateSgpr(1);
   RegisterRange value = builder.allocateSgpr(1);
-  std::string out = emitDiv(dst.ref(), value, 7, true);
-  expectLinesInOrder(out, {"s_mov_b32", "s_abs_i32"});
-  EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 1);
-  out = emitDiv(dst.ref(), 7, value, true);
-  expectLinesInOrder(out, {"s_mov_b32", "s_abs_i32"});
-  EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 1);
-  EXPECT_EQ(
-      countLinesContaining(emitDiv(dst.ref(), literalA, -5, true), "s_mov_b32"),
-      2);
+  for (const DivisionCase &c : divisionCases) {
+    SCOPED_TRACE(c.name);
+    std::string out = emitDivision(c, dst.ref(), value, 7, true);
+    expectLinesInOrder(out, {"s_mov_b32", "s_abs_i32"});
+    EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 1);
+    out = emitDivision(c, dst.ref(), 7, value, true);
+    expectLinesInOrder(out, {"s_mov_b32", "s_abs_i32"});
+    EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 1);
+    EXPECT_EQ(countLinesContaining(
+                  emitDivision(c, dst.ref(), literalA, -5, true), "s_mov_b32"),
+              2);
+  }
 }
 
 TEST_F(DivTest, ImmediateOperandsInFastScalarForm) {
   RegisterRange dst = builder.allocateSgpr(1);
   RegisterRange value = builder.allocateSgpr(1);
-  std::string out = emitDiv(dst.ref(), value, literalA, false);
-  EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 0);
-  int32_t convertsWithLiteral = 0;
-  int32_t xorsWithLiteral = 0;
-  for (const std::string &instruction : instructionsOf(out)) {
-    bool hasLiteral = instruction.find(literalAText) != std::string::npos;
-    if (mnemonicOf(instruction) == "v_cvt_f32_i32" && hasLiteral)
-      ++convertsWithLiteral;
-    if (mnemonicOf(instruction) == "s_xor_b32" && hasLiteral)
-      ++xorsWithLiteral;
+  for (const DivisionCase &c : divisionCases) {
+    SCOPED_TRACE(c.name);
+    std::string out = emitDivision(c, dst.ref(), value, literalA, false);
+    EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 0);
+    int32_t convertsWithLiteral = 0;
+    int32_t xorsWithLiteral = 0;
+    for (const std::string &instruction : instructionsOf(out)) {
+      bool hasLiteral = instruction.find(literalAText) != std::string::npos;
+      if (mnemonicOf(instruction) == "v_cvt_f32_i32" && hasLiteral)
+        ++convertsWithLiteral;
+      if (mnemonicOf(instruction) == "s_xor_b32" && hasLiteral)
+        ++xorsWithLiteral;
+    }
+    EXPECT_EQ(convertsWithLiteral, 1);
+    EXPECT_EQ(xorsWithLiteral, 1);
+    // Two distinct literals cannot share s_xor, so b is copied.
+    out = emitDivision(c, dst.ref(), literalA, literalB, false);
+    EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 1);
+    std::vector<std::string> instructions = instructionsOf(out);
+    int32_t copy = indexOfMnemonic(instructions, "s_mov_b32");
+    ASSERT_GE(copy, 0);
+    EXPECT_NE(instructions[copy].find(literalBText), std::string::npos);
   }
-  EXPECT_EQ(convertsWithLiteral, 1);
-  EXPECT_EQ(xorsWithLiteral, 1);
-  // Two distinct literals cannot share s_xor, so b is copied.
-  out = emitDiv(dst.ref(), literalA, literalB, false);
-  EXPECT_EQ(countLinesContaining(out, "s_mov_b32"), 1);
-  std::vector<std::string> instructions = instructionsOf(out);
-  int32_t copy = indexOfMnemonic(instructions, "s_mov_b32");
-  ASSERT_GE(copy, 0);
-  EXPECT_NE(instructions[copy].find(literalBText), std::string::npos);
 }
 
 TEST_F(DivTest, DestinationAliasesOperand) {
-  for (bool useIEEE : {true, false})
-    for (Form form : {Form::scalar, Form::vector}) {
-      for (bool aliasFirst : {true, false}) {
-        SCOPED_TRACE(std::string(formName(form)) +
-                     (useIEEE ? " exact" : " fast") +
-                     (aliasFirst ? " dst is a" : " dst is b"));
-        DivRegisters regs = makeRegisters(form);
-        RegisterRef dst = aliasFirst ? regs.a.ref() : regs.b.ref();
-        std::vector<std::string> instructions =
-            instructionsOf(emitDiv(dst, regs.a, regs.b, useIEEE));
-        ASSERT_FALSE(instructions.empty());
-        EXPECT_EQ(destinationOf(instructions.back()), text(dst));
-        for (int64_t i = 0; i + 1 < std::ssize(instructions); ++i)
-          EXPECT_NE(destinationOf(instructions[i]), text(dst))
-              << instructions[i];
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false})
+      for (Form form : {Form::scalar, Form::vector}) {
+        for (bool aliasFirst : {true, false}) {
+          SCOPED_TRACE(std::string(c.name) + " " + formName(form) +
+                       (useIEEE ? " exact" : " fast") +
+                       (aliasFirst ? " dst is a" : " dst is b"));
+          DivRegisters regs = makeRegisters(form);
+          RegisterRef dst = aliasFirst ? regs.a.ref() : regs.b.ref();
+          std::vector<std::string> instructions =
+              instructionsOf(emitDivision(c, dst, regs.a, regs.b, useIEEE));
+          ASSERT_FALSE(instructions.empty());
+          EXPECT_EQ(destinationOf(instructions.back()), text(dst));
+          for (int64_t i = 0; i + 1 < std::ssize(instructions); ++i)
+            EXPECT_NE(destinationOf(instructions[i]), text(dst))
+                << instructions[i];
+        }
       }
-    }
 }
 
 TEST_F(DivTest, InvalidOperandsThrowWithoutEmitting) {
@@ -3354,49 +3753,58 @@ TEST_F(DivTest, InvalidOperandsThrowWithoutEmitting) {
   RegisterRange vb = builder.allocateVgpr(1);
   RegisterRange acc = builder.allocateAgpr(1);
   RegisterRange pair = builder.allocateVgpr(2, 2);
-  for (bool useIEEE : {true, false}) {
-    SCOPED_TRACE(useIEEE ? "exact" : "fast");
-    expectRejected([&] { builder.divsi32(acc.ref(), va, vb, useIEEE); });
-    expectRejected([&] { builder.divsi32(vdst.ref(), acc, vb, useIEEE); });
-    expectRejected([&] { builder.divsi32(vdst.ref(), va, acc, useIEEE); });
-    expectRejected([&] { builder.divsi32(pair.ref(), va, vb, useIEEE); });
-    expectRejected([&] { builder.divsi32(vdst.ref(), pair, vb, useIEEE); });
-    expectRejected([&] { builder.divsi32(vdst.ref(), va, pair, useIEEE); });
-    expectRejected([&] { builder.divsi32(sdst.ref(), va, sa, useIEEE); });
-    expectRejected([&] { builder.divsi32(sdst.ref(), sa, vb, useIEEE); });
-  }
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false}) {
+      SCOPED_TRACE(std::string(c.name) + (useIEEE ? " exact" : " fast"));
+      auto expectRejectedDivision = [&](RegisterRef dst, Operand a, Operand b) {
+        expectRejected([&] { (builder.*c.op)(dst, a, b, useIEEE); });
+      };
+      expectRejectedDivision(acc.ref(), va, vb);
+      expectRejectedDivision(vdst.ref(), acc, vb);
+      expectRejectedDivision(vdst.ref(), va, acc);
+      expectRejectedDivision(pair.ref(), va, vb);
+      expectRejectedDivision(vdst.ref(), pair, vb);
+      expectRejectedDivision(vdst.ref(), va, pair);
+      expectRejectedDivision(sdst.ref(), va, sa);
+      expectRejectedDivision(sdst.ref(), sa, vb);
+    }
 }
 
 TEST_F(DivTest, ScalarDestinationFromVectorOperandMessage) {
   RegisterRange sdst = builder.allocateSgpr(1);
   RegisterRange sa = builder.allocateSgpr(1);
   RegisterRange vb = builder.allocateVgpr(1);
-  std::string expected = "divsi32 cannot write sgpr destination " + text(sdst) +
-                         " from vgpr operand " + text(vb);
-  try {
-    builder.divsi32(sdst.ref(), sa, vb, true);
-    FAIL() << "expected std::invalid_argument";
-  } catch (const std::invalid_argument &error) {
-    EXPECT_EQ(std::string(error.what()), expected);
+  for (const DivisionCase &c : divisionCases) {
+    SCOPED_TRACE(c.name);
+    std::string expected = std::string(c.name) +
+                           " cannot write sgpr destination " + text(sdst) +
+                           " from vgpr operand " + text(vb);
+    try {
+      (builder.*c.op)(sdst.ref(), sa, vb, true);
+      FAIL() << "expected std::invalid_argument";
+    } catch (const std::invalid_argument &error) {
+      EXPECT_EQ(std::string(error.what()), expected);
+    }
   }
 }
 
 TEST_F(DivTest, ReleasesTemporaries) {
-  for (bool useIEEE : {true, false})
-    for (Form form : allForms) {
-      SCOPED_TRACE(std::string(formName(form)) +
-                   (useIEEE ? " exact" : " fast"));
-      DivRegisters regs = makeRegisters(form);
-      int32_t vgprsBefore = nextFreeIndex(RegisterKind::vgpr);
-      int32_t sgprsBefore = nextFreeIndex(RegisterKind::sgpr);
-      emitDiv(regs.dst.ref(), regs.a, regs.b, useIEEE);
-      EXPECT_EQ(nextFreeIndex(RegisterKind::vgpr), vgprsBefore);
-      EXPECT_EQ(nextFreeIndex(RegisterKind::sgpr), sgprsBefore);
-      // Literals take temporaries too.
-      emitDiv(regs.dst.ref(), literalA, literalB, useIEEE);
-      EXPECT_EQ(nextFreeIndex(RegisterKind::vgpr), vgprsBefore);
-      EXPECT_EQ(nextFreeIndex(RegisterKind::sgpr), sgprsBefore);
-    }
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false})
+      for (Form form : allForms) {
+        SCOPED_TRACE(std::string(c.name) + " " + formName(form) +
+                     (useIEEE ? " exact" : " fast"));
+        DivRegisters regs = makeRegisters(form);
+        int32_t vgprsBefore = nextFreeIndex(RegisterKind::vgpr);
+        int32_t sgprsBefore = nextFreeIndex(RegisterKind::sgpr);
+        emitDivision(c, regs.dst.ref(), regs.a, regs.b, useIEEE);
+        EXPECT_EQ(nextFreeIndex(RegisterKind::vgpr), vgprsBefore);
+        EXPECT_EQ(nextFreeIndex(RegisterKind::sgpr), sgprsBefore);
+        // Literals take temporaries too.
+        emitDivision(c, regs.dst.ref(), literalA, literalB, useIEEE);
+        EXPECT_EQ(nextFreeIndex(RegisterKind::vgpr), vgprsBefore);
+        EXPECT_EQ(nextFreeIndex(RegisterKind::sgpr), sgprsBefore);
+      }
 }
 
 static constexpr uint32_t divRandomSeed = 20240607;
@@ -3408,15 +3816,6 @@ static constexpr int32_t fastBoundaryCount = 262144;
 static constexpr int32_t fastRandomCount = 1048576;
 
 using DivDevice = DeviceTest;
-
-// The quotient truncates toward zero and INT32_MIN / -1 wraps.
-static uint32_t hostDiv(uint32_t a, uint32_t b) {
-  int32_t x = static_cast<int32_t>(a);
-  int32_t y = static_cast<int32_t>(b);
-  if (x == INT32_MIN && y == -1)
-    return a;
-  return static_cast<uint32_t>(x / y);
-}
 
 // A zero divisor is replaced by 1.
 static void addPair(WordPairs &pairs, int64_t a, int64_t b) {
@@ -3607,53 +4006,60 @@ static WordPairs sample(const WordPairs &pairs, int64_t count) {
   return result;
 }
 
-static std::vector<uint32_t> quotients(const WordPairs &pairs) {
+static std::vector<uint32_t> expectedResults(const DivisionCase &c,
+                                             const WordPairs &pairs) {
   std::vector<uint32_t> expected;
   for (int64_t i = 0; i < std::ssize(pairs.a); ++i)
-    expected.push_back(hostDiv(pairs.a[i], pairs.b[i]));
+    expected.push_back(c.host(pairs.a[i], pairs.b[i]));
   return expected;
 }
 
-static ArithKernelSpec divSpec(InputKind aKind, InputKind bKind,
-                               RegisterKind result, bool useIEEE) {
+static ArithKernelSpec divSpec(const DivisionCase &c, InputKind aKind,
+                               InputKind bKind, RegisterKind result,
+                               bool useIEEE) {
   return {{aKind, bKind},
           result,
-          [useIEEE](IRBuilder &builder, RegisterRef dst,
-                    const std::vector<RegisterRef> &inputs) {
-            builder.divsi32(dst, inputs[0], inputs[1], useIEEE);
+          [op = c.op, useIEEE](IRBuilder &builder, RegisterRef dst,
+                               const std::vector<RegisterRef> &inputs) {
+            (builder.*op)(dst, inputs[0], inputs[1], useIEEE);
           }};
 }
 
 TEST_F(DivDevice, ValuLaneOperands) {
-  for (bool useIEEE : {true, false}) {
-    SCOPED_TRACE(pathName(useIEEE));
-    const WordPairs &pairs = pairsFor(useIEEE);
-    expectArithResults(
-        divSpec(InputKind::lane, InputKind::lane, RegisterKind::vgpr, useIEEE),
-        laneGroupCount(pairs.a), {pairs.a, pairs.b}, quotients(pairs));
-  }
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false}) {
+      SCOPED_TRACE(std::string(c.name) + " " + pathName(useIEEE));
+      const WordPairs &pairs = pairsFor(useIEEE);
+      expectArithResults(divSpec(c, InputKind::lane, InputKind::lane,
+                                 RegisterKind::vgpr, useIEEE),
+                         laneGroupCount(pairs.a), {pairs.a, pairs.b},
+                         expectedResults(c, pairs));
+    }
 }
 
 TEST_F(DivDevice, SaluUniformOperands) {
-  for (bool useIEEE : {true, false}) {
-    SCOPED_TRACE(pathName(useIEEE));
-    WordPairs pairs = sample(pairsFor(useIEEE), 32768);
-    expectArithResults(divSpec(InputKind::uniform, InputKind::uniform,
-                               RegisterKind::sgpr, useIEEE),
-                       static_cast<int32_t>(pairs.a.size()), {pairs.a, pairs.b},
-                       quotients(pairs));
-  }
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false}) {
+      SCOPED_TRACE(std::string(c.name) + " " + pathName(useIEEE));
+      WordPairs pairs = sample(pairsFor(useIEEE), 32768);
+      expectArithResults(divSpec(c, InputKind::uniform, InputKind::uniform,
+                                 RegisterKind::sgpr, useIEEE),
+                         static_cast<int32_t>(pairs.a.size()),
+                         {pairs.a, pairs.b}, expectedResults(c, pairs));
+    }
 }
 
 TEST_F(DivDevice, ScalarsIntoVgpr) {
-  for (bool useIEEE : {true, false}) {
-    SCOPED_TRACE(pathName(useIEEE));
-    WordPairs pairs = sample(pairsFor(useIEEE), 16384);
-    expectArithResults(divSpec(InputKind::uniform, InputKind::uniform,
-                               RegisterKind::vgpr, useIEEE),
-                       static_cast<int32_t>(pairs.a.size()), {pairs.a, pairs.b},
-                       perLane(quotients(pairs)));
-  }
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false}) {
+      SCOPED_TRACE(std::string(c.name) + " " + pathName(useIEEE));
+      WordPairs pairs = sample(pairsFor(useIEEE), 16384);
+      expectArithResults(divSpec(c, InputKind::uniform, InputKind::uniform,
+                                 RegisterKind::vgpr, useIEEE),
+                         static_cast<int32_t>(pairs.a.size()),
+                         {pairs.a, pairs.b},
+                         perLane(expectedResults(c, pairs)));
+    }
 }
 
 // The first lane of each workgroup supplies the uniform operand.
@@ -3666,26 +4072,27 @@ firstLanes(const std::vector<uint32_t> &laneWords) {
 }
 
 TEST_F(DivDevice, MixedScalarAndVector) {
-  for (bool useIEEE : {true, false}) {
-    SCOPED_TRACE(pathName(useIEEE));
-    WordPairs pairs = sample(pairsFor(useIEEE), 65536);
-    int32_t groups = laneGroupCount(pairs.a);
-    std::vector<uint32_t> uniformA = firstLanes(pairs.a);
-    std::vector<uint32_t> uniformB = firstLanes(pairs.b);
-    std::vector<uint32_t> uniformFirst;
-    std::vector<uint32_t> uniformSecond;
-    for (int64_t i = 0; i < std::ssize(pairs.a); ++i) {
-      int64_t group = i / arithWorkgroupSize;
-      uniformFirst.push_back(hostDiv(uniformA[group], pairs.b[i]));
-      uniformSecond.push_back(hostDiv(pairs.a[i], uniformB[group]));
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false}) {
+      SCOPED_TRACE(std::string(c.name) + " " + pathName(useIEEE));
+      WordPairs pairs = sample(pairsFor(useIEEE), 65536);
+      int32_t groups = laneGroupCount(pairs.a);
+      std::vector<uint32_t> uniformA = firstLanes(pairs.a);
+      std::vector<uint32_t> uniformB = firstLanes(pairs.b);
+      std::vector<uint32_t> uniformFirst;
+      std::vector<uint32_t> uniformSecond;
+      for (int64_t i = 0; i < std::ssize(pairs.a); ++i) {
+        int64_t group = i / arithWorkgroupSize;
+        uniformFirst.push_back(c.host(uniformA[group], pairs.b[i]));
+        uniformSecond.push_back(c.host(pairs.a[i], uniformB[group]));
+      }
+      expectArithResults(divSpec(c, InputKind::uniform, InputKind::lane,
+                                 RegisterKind::vgpr, useIEEE),
+                         groups, {uniformA, pairs.b}, uniformFirst);
+      expectArithResults(divSpec(c, InputKind::lane, InputKind::uniform,
+                                 RegisterKind::vgpr, useIEEE),
+                         groups, {pairs.a, uniformB}, uniformSecond);
     }
-    expectArithResults(divSpec(InputKind::uniform, InputKind::lane,
-                               RegisterKind::vgpr, useIEEE),
-                       groups, {uniformA, pairs.b}, uniformFirst);
-    expectArithResults(divSpec(InputKind::lane, InputKind::uniform,
-                               RegisterKind::vgpr, useIEEE),
-                       groups, {pairs.a, uniformB}, uniformSecond);
-  }
 }
 
 static std::vector<int32_t> immediatesFor(bool useIEEE) {
@@ -3701,115 +4108,121 @@ static std::vector<int32_t> immediatesFor(bool useIEEE) {
   return immediates;
 }
 
-// Computes dst = input / immediate, or immediate / input.
-static ArithKernelSpec divImmediateSpec(InputKind kind, RegisterKind result,
-                                        int32_t immediate,
+// Computes dst = input op immediate, or immediate op input.
+static ArithKernelSpec divImmediateSpec(const DivisionCase &c, InputKind kind,
+                                        RegisterKind result, int32_t immediate,
                                         bool immediateIsDividend,
                                         bool useIEEE) {
   return {{kind},
           result,
-          [=](IRBuilder &builder, RegisterRef dst,
-              const std::vector<RegisterRef> &inputs) {
+          [=, op = c.op](IRBuilder &builder, RegisterRef dst,
+                         const std::vector<RegisterRef> &inputs) {
             if (immediateIsDividend)
-              builder.divsi32(dst, immediate, inputs[0], useIEEE);
+              (builder.*op)(dst, immediate, inputs[0], useIEEE);
             else
-              builder.divsi32(dst, inputs[0], immediate, useIEEE);
+              (builder.*op)(dst, inputs[0], immediate, useIEEE);
           }};
 }
 
 static std::vector<uint32_t>
-divideByImmediate(const std::vector<uint32_t> &words, int32_t immediate,
-                  bool immediateIsDividend) {
+divideByImmediate(const DivisionCase &c, const std::vector<uint32_t> &words,
+                  int32_t immediate, bool immediateIsDividend) {
   uint32_t value = static_cast<uint32_t>(immediate);
   std::vector<uint32_t> out;
   for (uint32_t word : words)
-    out.push_back(immediateIsDividend ? hostDiv(value, word)
-                                      : hostDiv(word, value));
+    out.push_back(immediateIsDividend ? c.host(value, word)
+                                      : c.host(word, value));
   return out;
 }
 
 // Runs the lane, uniform-into-sgpr and uniform-into-vgpr forms.
-static void expectImmediateForms(const std::vector<uint32_t> &words,
+static void expectImmediateForms(const DivisionCase &c,
+                                 const std::vector<uint32_t> &words,
                                  int32_t immediate, bool immediateIsDividend,
                                  bool useIEEE) {
   std::vector<uint32_t> expected =
-      divideByImmediate(words, immediate, immediateIsDividend);
-  expectArithResults(divImmediateSpec(InputKind::lane, RegisterKind::vgpr,
+      divideByImmediate(c, words, immediate, immediateIsDividend);
+  expectArithResults(divImmediateSpec(c, InputKind::lane, RegisterKind::vgpr,
                                       immediate, immediateIsDividend, useIEEE),
                      laneGroupCount(words), {words}, expected);
-  expectArithResults(divImmediateSpec(InputKind::uniform, RegisterKind::sgpr,
+  expectArithResults(divImmediateSpec(c, InputKind::uniform, RegisterKind::sgpr,
                                       immediate, immediateIsDividend, useIEEE),
                      static_cast<int32_t>(words.size()), {words}, expected);
-  expectArithResults(divImmediateSpec(InputKind::uniform, RegisterKind::vgpr,
+  expectArithResults(divImmediateSpec(c, InputKind::uniform, RegisterKind::vgpr,
                                       immediate, immediateIsDividend, useIEEE),
                      static_cast<int32_t>(words.size()), {words},
                      perLane(expected));
 }
 
 TEST_F(DivDevice, ImmediateOperands) {
-  for (bool useIEEE : {true, false}) {
-    WordPairs pairs = sample(pairsFor(useIEEE), 1024);
-    for (int32_t immediate : immediatesFor(useIEEE)) {
-      SCOPED_TRACE(std::string(pathName(useIEEE)) + " immediate " +
-                   std::to_string(immediate));
-      // The other operand comes from the set, so it is never zero.
-      expectImmediateForms(pairs.a, immediate, false, useIEEE);
-      expectImmediateForms(pairs.b, immediate, true, useIEEE);
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false}) {
+      WordPairs pairs = sample(pairsFor(useIEEE), 1024);
+      for (int32_t immediate : immediatesFor(useIEEE)) {
+        SCOPED_TRACE(std::string(c.name) + " " + pathName(useIEEE) +
+                     " immediate " + std::to_string(immediate));
+        // The other operand comes from the set, so it is never zero.
+        expectImmediateForms(c, pairs.a, immediate, false, useIEEE);
+        expectImmediateForms(c, pairs.b, immediate, true, useIEEE);
+      }
     }
-  }
 }
 
 // Each emitter writes into an input register and then moves it to dst.
 TEST_F(DivDevice, DestinationAliasesOperand) {
-  for (bool useIEEE : {true, false}) {
-    SCOPED_TRACE(pathName(useIEEE));
-    WordPairs pairs = sample(pairsFor(useIEEE), 4096);
-    std::vector<uint32_t> expected = quotients(pairs);
-    for (int32_t aliased : {0, 1}) {
-      SCOPED_TRACE("alias input " + std::to_string(aliased));
-      auto emit = [=](IRBuilder &builder, RegisterRef dst,
-                      const std::vector<RegisterRef> &inputs) {
-        builder.divsi32(inputs[aliased], inputs[0], inputs[1], useIEEE);
-        builder.movb32(dst, inputs[aliased]);
-      };
-      expectArithResults(
-          {{InputKind::lane, InputKind::lane}, RegisterKind::vgpr, emit},
-          laneGroupCount(pairs.a), {pairs.a, pairs.b}, expected);
-      expectArithResults(
-          {{InputKind::uniform, InputKind::uniform}, RegisterKind::sgpr, emit},
-          static_cast<int32_t>(pairs.a.size()), {pairs.a, pairs.b}, expected);
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false}) {
+      SCOPED_TRACE(std::string(c.name) + " " + pathName(useIEEE));
+      WordPairs pairs = sample(pairsFor(useIEEE), 4096);
+      std::vector<uint32_t> expected = expectedResults(c, pairs);
+      for (int32_t aliased : {0, 1}) {
+        SCOPED_TRACE("alias input " + std::to_string(aliased));
+        auto emit = [=, op = c.op](IRBuilder &builder, RegisterRef dst,
+                                   const std::vector<RegisterRef> &inputs) {
+          (builder.*op)(inputs[aliased], inputs[0], inputs[1], useIEEE);
+          builder.movb32(dst, inputs[aliased]);
+        };
+        expectArithResults(
+            {{InputKind::lane, InputKind::lane}, RegisterKind::vgpr, emit},
+            laneGroupCount(pairs.a), {pairs.a, pairs.b}, expected);
+        expectArithResults({{InputKind::uniform, InputKind::uniform},
+                            RegisterKind::sgpr,
+                            emit},
+                           static_cast<int32_t>(pairs.a.size()),
+                           {pairs.a, pairs.b}, expected);
+      }
     }
-  }
 }
 
-// The quotient of a division by zero is unspecified, so the result is zeroed
+// The result of a division by zero is unspecified, so the result is zeroed
 // and only the completion of the kernel, without a fault or a hang, is checked.
 TEST_F(DivDevice, DivisionByZeroCompletes) {
-  for (bool useIEEE : {true, false}) {
-    SCOPED_TRACE(pathName(useIEEE));
-    WordPairs pairs = sample(pairsFor(useIEEE), 4096);
-    std::vector<uint32_t> zeros(pairs.a.size(), 0);
-    expectArithResults({{InputKind::lane, InputKind::lane},
-                        RegisterKind::vgpr,
-                        [useIEEE](IRBuilder &builder, RegisterRef dst,
-                                  const std::vector<RegisterRef> &inputs) {
-                          RegisterRange tmp = builder.allocateVgpr(1);
-                          builder.divsi32(tmp.ref(), inputs[0], inputs[1],
-                                          useIEEE);
-                          builder.muli32(dst, tmp, 0);
-                        }},
-                       laneGroupCount(pairs.a), {pairs.a, zeros}, zeros);
-    expectArithResults(
-        {{InputKind::uniform, InputKind::uniform},
-         RegisterKind::sgpr,
-         [useIEEE](IRBuilder &builder, RegisterRef dst,
-                   const std::vector<RegisterRef> &inputs) {
-           RegisterRange tmp = builder.allocateSgpr(1);
-           builder.divsi32(tmp.ref(), inputs[0], inputs[1], useIEEE);
-           builder.muli32(dst, tmp, 0);
-         }},
-        static_cast<int32_t>(pairs.a.size()), {pairs.a, zeros}, zeros);
-  }
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false}) {
+      SCOPED_TRACE(std::string(c.name) + " " + pathName(useIEEE));
+      WordPairs pairs = sample(pairsFor(useIEEE), 4096);
+      std::vector<uint32_t> zeros(pairs.a.size(), 0);
+      expectArithResults(
+          {{InputKind::lane, InputKind::lane},
+           RegisterKind::vgpr,
+           [=, op = c.op](IRBuilder &builder, RegisterRef dst,
+                          const std::vector<RegisterRef> &inputs) {
+             RegisterRange tmp = builder.allocateVgpr(1);
+             (builder.*op)(tmp.ref(), inputs[0], inputs[1], useIEEE);
+             builder.muli32(dst, tmp, 0);
+           }},
+          laneGroupCount(pairs.a), {pairs.a, zeros}, zeros);
+      expectArithResults(
+          {{InputKind::uniform, InputKind::uniform},
+           RegisterKind::sgpr,
+           [=, op = c.op](IRBuilder &builder, RegisterRef dst,
+                          const std::vector<RegisterRef> &inputs) {
+             RegisterRange tmp = builder.allocateSgpr(1);
+             (builder.*op)(tmp.ref(), inputs[0], inputs[1], useIEEE);
+             builder.muli32(dst, tmp, 0);
+           }},
+          static_cast<int32_t>(pairs.a.size()), {pairs.a, zeros}, zeros);
+    }
 }
 
 // These pairs are outside the fast-path precondition, where fa * rcp(fb) can
@@ -3830,23 +4243,155 @@ TEST_F(DivDevice, ExactPathHandlesPairsAboveFastBound) {
     addPair(pairs, withRandomSign(engine, fastBound + engine() % fastBound),
             withRandomSign(engine, 1 + randomMagnitude(engine, 24)));
   padToWorkgroups(pairs, engine, 24);
-  expectArithResults(
-      divSpec(InputKind::lane, InputKind::lane, RegisterKind::vgpr, true),
-      laneGroupCount(pairs.a), {pairs.a, pairs.b}, quotients(pairs));
   WordPairs scalar = sample(pairs, 1024);
-  expectArithResults(
-      divSpec(InputKind::uniform, InputKind::uniform, RegisterKind::sgpr, true),
-      static_cast<int32_t>(scalar.a.size()), {scalar.a, scalar.b},
-      quotients(scalar));
+  for (const DivisionCase &c : divisionCases) {
+    SCOPED_TRACE(c.name);
+    expectArithResults(
+        divSpec(c, InputKind::lane, InputKind::lane, RegisterKind::vgpr, true),
+        laneGroupCount(pairs.a), {pairs.a, pairs.b}, expectedResults(c, pairs));
+    expectArithResults(divSpec(c, InputKind::uniform, InputKind::uniform,
+                               RegisterKind::sgpr, true),
+                       static_cast<int32_t>(scalar.a.size()),
+                       {scalar.a, scalar.b}, expectedResults(c, scalar));
+  }
+}
+
+// The dividends around every power of two, the extremes and random values.
+static std::vector<uint32_t> powerOfTwoDividends() {
+  std::vector<int64_t> values = {0, 1, -1, INT32_MIN, INT32_MAX, INT32_MIN + 1};
+  for (int32_t exponent = 0; exponent <= 30; ++exponent)
+    for (int64_t power : {int64_t{1} << exponent, -(int64_t{1} << exponent)})
+      for (int64_t delta : {-1, 0, 1})
+        if (power + delta >= INT32_MIN && power + delta <= INT32_MAX)
+          values.push_back(power + delta);
+  std::mt19937 engine(divRandomSeed + 3);
+  for (int32_t i = 0; i < 4096; ++i)
+    values.push_back(static_cast<int32_t>(engine()));
+  while (values.size() % arithWorkgroupSize != 0)
+    values.push_back(static_cast<int32_t>(engine()));
+  std::vector<uint32_t> words;
+  for (int64_t value : values)
+    words.push_back(static_cast<uint32_t>(value));
+  return words;
+}
+
+// Every stride-th word, so that a small sample still spans the whole set.
+static std::vector<uint32_t> sampleWords(const std::vector<uint32_t> &words,
+                                         int64_t count) {
+  std::vector<uint32_t> result;
+  int64_t stride = std::max<int64_t>(1, std::ssize(words) / count);
+  for (int64_t i = 0; i < std::ssize(words) && std::ssize(result) < count;
+       i += stride)
+    result.push_back(words[i]);
+  return result;
+}
+
+static ArithKernelSpec powerOfTwoSpec(const DivisionCase &c, InputKind kind,
+                                      RegisterKind result, int32_t exponent) {
+  return {{kind},
+          result,
+          [=, op = c.op](IRBuilder &builder, RegisterRef dst,
+                         const std::vector<RegisterRef> &inputs) {
+            // The host test shows that useIEEE does not matter here.
+            (builder.*op)(dst, inputs[0], 1 << exponent, true);
+          }};
+}
+
+TEST_F(DivDevice, PowerOfTwoDivisors) {
+  std::vector<uint32_t> words = powerOfTwoDividends();
+  std::vector<uint32_t> uniformWords = sampleWords(words, 256);
+  int32_t uniformCount = static_cast<int32_t>(uniformWords.size());
+  for (const DivisionCase &c : divisionCases)
+    for (int32_t exponent = 0; exponent <= 30; ++exponent) {
+      SCOPED_TRACE(std::string(c.name) + " divisor 2^" +
+                   std::to_string(exponent));
+      uint32_t divisor = 1u << exponent;
+      std::vector<uint32_t> expected;
+      for (uint32_t word : words)
+        expected.push_back(c.host(word, divisor));
+      std::vector<uint32_t> uniformExpected;
+      for (uint32_t word : uniformWords)
+        uniformExpected.push_back(c.host(word, divisor));
+      expectArithResults(
+          powerOfTwoSpec(c, InputKind::lane, RegisterKind::vgpr, exponent),
+          laneGroupCount(words), {words}, expected);
+      expectArithResults(
+          powerOfTwoSpec(c, InputKind::uniform, RegisterKind::sgpr, exponent),
+          uniformCount, {uniformWords}, uniformExpected);
+      expectArithResults(
+          powerOfTwoSpec(c, InputKind::uniform, RegisterKind::vgpr, exponent),
+          uniformCount, {uniformWords}, perLane(uniformExpected));
+    }
+}
+
+// Each emitter writes into the input register and then moves it to dst.
+TEST_F(DivDevice, PowerOfTwoDestinationAliasesDividend) {
+  std::vector<uint32_t> words = powerOfTwoDividends();
+  std::vector<uint32_t> uniformWords = sampleWords(words, 256);
+  for (const DivisionCase &c : divisionCases)
+    for (int32_t exponent : {0, 1, 5, 30}) {
+      SCOPED_TRACE(std::string(c.name) + " divisor 2^" +
+                   std::to_string(exponent));
+      auto emit = [=, op = c.op](IRBuilder &builder, RegisterRef dst,
+                                 const std::vector<RegisterRef> &inputs) {
+        (builder.*op)(inputs[0], inputs[0], 1 << exponent, true);
+        builder.movb32(dst, inputs[0]);
+      };
+      std::vector<uint32_t> expected;
+      for (uint32_t word : words)
+        expected.push_back(c.host(word, 1u << exponent));
+      std::vector<uint32_t> uniformExpected;
+      for (uint32_t word : uniformWords)
+        uniformExpected.push_back(c.host(word, 1u << exponent));
+      expectArithResults({{InputKind::lane}, RegisterKind::vgpr, emit},
+                         laneGroupCount(words), {words}, expected);
+      expectArithResults({{InputKind::uniform}, RegisterKind::sgpr, emit},
+                         static_cast<int32_t>(uniformWords.size()),
+                         {uniformWords}, uniformExpected);
+    }
 }
 
 TEST(DivAssembly, AllOperandPlacementsAssemble) {
-  for (bool useIEEE : {true, false})
-    expectAllPlacementsAssemble(
-        pathName(useIEEE),
-        [useIEEE](IRBuilder &builder, RegisterRef dst, Operand a, Operand b) {
-          builder.divsi32(dst, a, b, useIEEE);
-        });
+  for (const DivisionCase &c : divisionCases)
+    for (bool useIEEE : {true, false})
+      expectAllPlacementsAssemble(std::string(c.name) + " " + pathName(useIEEE),
+                                  [op = c.op, useIEEE](IRBuilder &builder,
+                                                       RegisterRef dst,
+                                                       Operand a, Operand b) {
+                                    (builder.*op)(dst, a, b, useIEEE);
+                                  });
+}
+
+// Emits the op for every dividend placement and several powers of two into one
+// kernel per destination kind.
+static void expectPowerOfTwoPlacementsAssemble(const DivisionCase &c,
+                                               RegisterKind dstKind) {
+  Target target = Target::get("gfx950");
+  Kernel kernel(target, "codegen_power_of_two", arithWorkgroupSize);
+  IRBuilder &builder = kernel.builder();
+  RegisterRange vector = builder.allocateVgpr(1);
+  RegisterRange scalar = builder.allocateSgpr(1);
+  RegisterRange dst =
+      dstKind == vgpr ? builder.allocateVgpr(1) : builder.allocateSgpr(1);
+  std::vector<Operand> dividends = {scalar, 7, 0x12345};
+  // A scalar destination cannot take a vector operand.
+  if (dstKind == vgpr)
+    dividends.push_back(vector);
+  for (const Operand &a : dividends)
+    for (int32_t b : {1, 2, 16, 1 << 20, 1 << 30})
+      (builder.*c.op)(dst.ref(), a, b, true);
+  builder.createEndProgram();
+
+  std::string assembly = kernel.toAssembly();
+  SCOPED_TRACE(std::string(c.name) + "\n" + assembly);
+  EXPECT_NO_THROW(assembleToHSACO(assembly, target.isaName()));
+}
+
+TEST(DivAssembly, PowerOfTwoPlacementsAssemble) {
+  for (const DivisionCase &c : divisionCases) {
+    expectPowerOfTwoPlacementsAssemble(c, vgpr);
+    expectPowerOfTwoPlacementsAssemble(c, sgpr);
+  }
 }
 
 // Compare.

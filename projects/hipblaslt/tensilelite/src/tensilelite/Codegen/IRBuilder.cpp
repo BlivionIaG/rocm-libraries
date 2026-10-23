@@ -12,6 +12,7 @@
 #include "instruction/instruction.hpp"
 
 #include <array>
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <memory>
@@ -258,6 +259,26 @@ static Operand operandHalf(Operand src, int32_t index) {
   return Operand(index == 0 ? value : (value < 0 ? -1 : 0));
 }
 
+// 2^30 is the largest power of two that is a positive int32_t.
+static constexpr int32_t largestPositiveExponent = 30;
+// A 32-bit product wraps modulo 2^32, so INT32_MIN works as 2^31.
+static constexpr int32_t largestExponent32 = 31;
+
+// Returns k if operand is the immediate 2^k with k <= maxExponent. The
+// immediate is read as a 32-bit pattern, so INT32_MIN is 2^31.
+static std::optional<int32_t> powerOfTwoExponent(Operand operand,
+                                                 int32_t maxExponent) {
+  if (!operand.isImmediate())
+    return std::nullopt;
+  uint32_t pattern = static_cast<uint32_t>(operand.immediate());
+  if (!std::has_single_bit(pattern))
+    return std::nullopt;
+  int32_t exponent = std::countr_zero(pattern);
+  if (exponent > maxExponent)
+    return std::nullopt;
+  return exponent;
+}
+
 static RegisterRange allocate(IRBuilder &builder, RegisterKind kind,
                               int32_t count = 1) {
   return kind == RegisterKind::sgpr ? builder.allocateSgpr(count, count)
@@ -325,8 +346,7 @@ static void createForKind(IRBuilder &builder, RegisterRef dst, Operand src0,
 
 namespace {
 
-// The sources of one 32-bit word of a result of two operands; select picks a
-// when the condition holds.
+// The words of a and b at one 32-bit index of a result of two operands.
 struct WordSources {
   Operand a;
   Operand b;
@@ -600,6 +620,31 @@ static void emitBinaryI32(IRBuilder &builder, BinaryOp op, RegisterRef dst,
   createBinaryI32(builder, op, dst, a, b);
 }
 
+// Emits a * b as a copy (k == 0) or a << k when a or b is the immediate 2^k
+// with k <= maxExponent, for single registers (width 1) or pairs (width 2).
+// Returns false, emitting nothing, when neither operand is such an immediate.
+static bool emitMulByPowerOfTwo(IRBuilder &builder, int32_t width,
+                                RegisterRef dst, Operand a, Operand b,
+                                int32_t maxExponent) {
+  std::optional<int32_t> exponent = powerOfTwoExponent(b, maxExponent);
+  if (!exponent) {
+    // The product commutes, so the power of two may be a.
+    exponent = powerOfTwoExponent(a, maxExponent);
+    std::swap(a, b);
+  }
+  if (!exponent)
+    return false;
+  if (*exponent == 0 && width == 1)
+    builder.movb32(dst, a);
+  else if (*exponent == 0)
+    builder.movb64(dst, a);
+  else if (width == 1)
+    builder.shli32(dst, a, *exponent);
+  else
+    builder.shli64(dst, a, *exponent);
+  return true;
+}
+
 void IRBuilder::addi32(RegisterRef dst, Operand a, Operand b) {
   requireArithmetic("addi32", dst, a, b, 1);
   emitBinaryI32(*this, BinaryOp::add, dst, a, b);
@@ -612,6 +657,8 @@ void IRBuilder::subi32(RegisterRef dst, Operand a, Operand b) {
 
 void IRBuilder::muli32(RegisterRef dst, Operand a, Operand b) {
   requireArithmetic("muli32", dst, a, b, 1);
+  if (emitMulByPowerOfTwo(*this, 1, dst, a, b, largestExponent32))
+    return;
   emitBinaryI32(*this, BinaryOp::mul, dst, a, b);
 }
 
@@ -774,6 +821,9 @@ void IRBuilder::subi64(RegisterRef dst, Operand a, Operand b) {
 
 void IRBuilder::muli64(RegisterRef dst, Operand a, Operand b) {
   requireArithmetic("muli64", dst, a, b, 2);
+  // The immediate sign-extends to 64 bits, so 2^31 is not a power of two here.
+  if (emitMulByPowerOfTwo(*this, 2, dst, a, b, largestPositiveExponent))
+    return;
   emitBinaryI64(*this, BinaryOp::mul, dst, a, b);
 }
 
@@ -900,12 +950,20 @@ void IRBuilder::shrsi64(RegisterRef dst, Operand a, Operand b) {
 
 // Division.
 
-// Signed 32-bit division as LLVM's AMDGPU expansions. The exact path is LLVM's
-// 32-bit expansion (AMDGPUCodeGenPrepare::expandDivRem32 and
+// Signed 32-bit division and remainder as LLVM's AMDGPU expansions. The exact
+// path is LLVM's 32-bit expansion (AMDGPUCodeGenPrepare::expandDivRem32 and
 // AMDGPUTargetLowering::LowerUDIVREM): an f32 reciprocal scaled by 2^32 - 512,
-// one Newton step and two corrections, with abs and a sign fix-up for sdiv. The
-// fast path is AMDGPUCodeGenPrepare::expandDivRem24Impl and
-// AMDGPUTargetLowering::LowerDIVREM24.
+// one Newton step and two corrections, with abs and a sign fix-up for sdiv and
+// srem. The fast path is AMDGPUCodeGenPrepare::expandDivRem24Impl and
+// AMDGPUTargetLowering::LowerDIVREM24, whose remainder is a - q * b. A divisor
+// 2^k takes LLVM's shift expansions.
+
+namespace {
+
+// Which result of a signed division an expansion produces.
+enum class DivisionResult { quotient, remainder };
+
+} // namespace
 
 // 2^32 - 512 as an f32. It keeps the estimate below 2^32 / divisor for a
 // reciprocal accurate to 1 ulp, which the Newton step and the corrections rely
@@ -963,12 +1021,17 @@ static RegisterRange reciprocalEstimate(IRBuilder &builder, RegisterKind kind,
   return x;
 }
 
-// One LLVM correction step: if r >= divisor then q += 1 and r -= divisor.
-static void correctQuotient(IRBuilder &builder, RegisterRef q, RegisterRef r,
-                            RegisterRef divisor, bool updateRemainder) {
+// One LLVM correction step: if r >= divisor then q += 1 and r -= divisor, each
+// only when requested.
+static void correctStep(IRBuilder &builder, RegisterRef q, RegisterRef r,
+                        RegisterRef divisor, bool updateQuotient,
+                        bool updateRemainder) {
   // The scalar add and sub write SCC, so they precede the compare.
-  RegisterRange next = allocate(builder, q.kind);
-  builder.addi32(next.ref(), q, 1);
+  std::optional<RegisterRange> next;
+  if (updateQuotient) {
+    next.emplace(allocate(builder, q.kind));
+    builder.addi32(next->ref(), q, 1);
+  }
   std::optional<RegisterRange> reduced;
   if (updateRemainder) {
     reduced.emplace(allocate(builder, q.kind));
@@ -976,8 +1039,9 @@ static void correctQuotient(IRBuilder &builder, RegisterRef q, RegisterRef r,
   }
   if (q.kind == RegisterKind::sgpr) {
     builder.create<rocisa::SCmpGeU32>(r.container(), divisor.container());
-    builder.create<rocisa::SCSelectB32>(q.container(), next.container(),
-                                        q.container());
+    if (updateQuotient)
+      builder.create<rocisa::SCSelectB32>(q.container(), next->container(),
+                                          q.container());
     if (updateRemainder)
       builder.create<rocisa::SCSelectB32>(r.container(), reduced->container(),
                                           r.container());
@@ -985,31 +1049,40 @@ static void correctQuotient(IRBuilder &builder, RegisterRef q, RegisterRef r,
   }
   RegisterRange mask = builder.allocateSgpr(2, 2);
   builder.cmpi32(Predicate::uge, mask.ref(), r, divisor);
-  builder.selectb32(q, mask.ref(), next, q);
+  if (updateQuotient)
+    builder.selectb32(q, mask.ref(), *next, q);
   if (updateRemainder)
     builder.selectb32(r, mask.ref(), *reduced, r);
 }
 
-static void emitExact(IRBuilder &builder, RegisterRef dst, Operand a,
-                      Operand b) {
+static void legalizeExactSources(IRBuilder &builder, RegisterKind kind,
+                                 Operand &a, Operand &b, Temporaries &temps) {
+  if (kind == RegisterKind::vgpr)
+    return legalizeVop3Sources(builder, a, b, temps);
+  // s_abs_i32 takes only registers.
+  for (Operand *source : {&a, &b})
+    if (source->isImmediate())
+      *source = copyToTemporary(builder, RegisterKind::sgpr, 1, *source, temps);
+}
+
+static void emitExact(IRBuilder &builder, RegisterRef dst, Operand a, Operand b,
+                      DivisionResult result) {
+  bool isQuotient = result == DivisionResult::quotient;
   RegisterKind kind = dst.kind;
   Temporaries temps;
-  if (kind == RegisterKind::vgpr)
-    legalizeVop3Sources(builder, a, b, temps);
-  else {
-    // s_abs_i32 takes only registers.
-    for (Operand *source : {&a, &b})
-      if (source->isImmediate())
-        *source =
-            copyToTemporary(builder, RegisterKind::sgpr, 1, *source, temps);
-  }
+  legalizeExactSources(builder, kind, a, b, temps);
   // a and b are read only here, before dst is written, so dst may alias them.
   RegisterRange divisor = absoluteValue(builder, kind, b);
   RegisterRange dividend = absoluteValue(builder, kind, a);
-  // 0 when the signs agree and -1 when they differ.
   RegisterRange sign = allocate(builder, kind);
-  createForKind<rocisa::SXorB32, rocisa::VXorB32>(builder, sign.ref(), a, b);
-  builder.shrsi32(sign.ref(), sign, 31);
+  if (isQuotient) {
+    // 0 when the signs agree and -1 when they differ.
+    createForKind<rocisa::SXorB32, rocisa::VXorB32>(builder, sign.ref(), a, b);
+    builder.shrsi32(sign.ref(), sign, 31);
+  } else {
+    // The remainder takes the sign of the dividend, as LLVM's srem does.
+    builder.shrsi32(sign.ref(), a, 31);
+  }
   RegisterRange x = reciprocalEstimate(builder, kind, divisor.ref());
   RegisterRange q = allocate(builder, kind);
   createForKind<rocisa::SMulHIU32, rocisa::VMulHIU32>(builder, q.ref(),
@@ -1017,12 +1090,16 @@ static void emitExact(IRBuilder &builder, RegisterRef dst, Operand a,
   RegisterRange r = allocate(builder, kind);
   builder.muli32(r.ref(), q, divisor);
   builder.subi32(r.ref(), dividend, r);
-  correctQuotient(builder, q.ref(), r.ref(), divisor.ref(), true);
-  // LLVM's second step updates only the quotient.
-  correctQuotient(builder, q.ref(), r.ref(), divisor.ref(), false);
-  // (q ^ sign) - sign negates q when the signs differ.
-  createForKind<rocisa::SXorB32, rocisa::VXorB32>(builder, q.ref(), q, sign);
-  builder.subi32(dst, q, sign);
+  // LLVM's quotient steps are the first of both and the second only for q, and
+  // its remainder steps update only r.
+  correctStep(builder, q.ref(), r.ref(), divisor.ref(), isQuotient, true);
+  correctStep(builder, q.ref(), r.ref(), divisor.ref(), isQuotient,
+              !isQuotient);
+  // (v ^ sign) - sign negates v when sign is -1.
+  RegisterRange &value = isQuotient ? q : r;
+  createForKind<rocisa::SXorB32, rocisa::VXorB32>(builder, value.ref(), value,
+                                                  sign);
+  builder.subi32(dst, value, sign);
 }
 
 namespace {
@@ -1071,16 +1148,9 @@ static FastEstimate estimateQuotient(IRBuilder &builder, Operand a, Operand b) {
 // bits, that is values in [-2^23, 2^23). Beyond that, fa * rcp(fb) can round up
 // to the next integer, and the single correction only fixes an estimate that
 // is too small.
-static void emitFast(IRBuilder &builder, RegisterRef dst, Operand a,
-                     Operand b) {
+static void emitFastQuotient(IRBuilder &builder, RegisterRef dst, Operand a,
+                             Operand b) {
   RegisterKind kind = dst.kind;
-  Temporaries temps;
-  // In the scalar case only s_xor reads both sources, and the VOP1 conversions
-  // take any scalar source.
-  if (kind == RegisterKind::vgpr)
-    legalizeVop3Sources(builder, a, b, temps);
-  else if (!isLegalSop2(a, b))
-    b = copyToTemporary(builder, RegisterKind::sgpr, 1, b, temps);
   // a and b are read only here, before dst is written, so dst may alias them.
   // LLVM computes ashr (a ^ b), bitWidth - 2 and then ors 1, giving +1 or -1.
   RegisterRange sign = allocate(builder, kind);
@@ -1109,11 +1179,70 @@ static void emitFast(IRBuilder &builder, RegisterRef dst, Operand a,
   builder.addi32(dst, estimate.quotient, correction);
 }
 
+static void emitFast(IRBuilder &builder, RegisterRef dst, Operand a, Operand b,
+                     DivisionResult result) {
+  RegisterKind kind = dst.kind;
+  Temporaries temps;
+  // In the scalar case only s_xor reads both sources, and the VOP1 conversions
+  // take any scalar source. Legalizing once shares a copied literal between
+  // the quotient and the remainder.
+  if (kind == RegisterKind::vgpr)
+    legalizeVop3Sources(builder, a, b, temps);
+  else if (!isLegalSop2(a, b))
+    b = copyToTemporary(builder, RegisterKind::sgpr, 1, b, temps);
+  if (result == DivisionResult::quotient)
+    return emitFastQuotient(builder, dst, a, b);
+  // LLVM's expandDivRem24 derives the remainder as a - q * b. dst is written
+  // only by the last instruction, so it may still alias a or b.
+  RegisterRange q = allocate(builder, kind);
+  emitFastQuotient(builder, q.ref(), a, b);
+  builder.muli32(q.ref(), q, b);
+  builder.subi32(dst, a, q);
+}
+
+// LLVM's sdiv and srem by 2^k: adding 2^k - 1 to a negative dividend makes the
+// arithmetic shift round toward zero, and the remainder is a minus the
+// dividend rounded toward zero to a multiple of 2^k.
+static void emitDivisionByPowerOfTwo(IRBuilder &builder, RegisterRef dst,
+                                     Operand a, int32_t exponent,
+                                     DivisionResult result) {
+  bool isQuotient = result == DivisionResult::quotient;
+  if (exponent == 0)
+    return builder.movb32(dst, isQuotient ? a : Operand(0));
+  RegisterRange biased = allocate(builder, dst.kind);
+  // 2^k - 1 for a negative a and 0 otherwise; for k == 1 that is the sign bit.
+  if (exponent == 1) {
+    builder.shrui32(biased.ref(), a, 31);
+  } else {
+    builder.shrsi32(biased.ref(), a, 31);
+    builder.shrui32(biased.ref(), biased, 32 - exponent);
+  }
+  builder.addi32(biased.ref(), a, biased);
+  if (isQuotient)
+    return builder.shrsi32(dst, biased, exponent);
+  builder.andi32(biased.ref(), biased, -(1 << exponent));
+  builder.subi32(dst, a, biased);
+}
+
+static void emitDivision(IRBuilder &builder, RegisterRef dst, Operand a,
+                         Operand b, bool useIEEE, DivisionResult result) {
+  // Negative powers of two and INT32_MIN take the general expansions.
+  if (std::optional<int32_t> exponent =
+          powerOfTwoExponent(b, largestPositiveExponent))
+    return emitDivisionByPowerOfTwo(builder, dst, a, *exponent, result);
+  if (useIEEE)
+    return emitExact(builder, dst, a, b, result);
+  emitFast(builder, dst, a, b, result);
+}
+
 void IRBuilder::divsi32(RegisterRef dst, Operand a, Operand b, bool useIEEE) {
   requireArithmetic("divsi32", dst, a, b, 1);
-  if (useIEEE)
-    return emitExact(*this, dst, a, b);
-  emitFast(*this, dst, a, b);
+  emitDivision(*this, dst, a, b, useIEEE, DivisionResult::quotient);
+}
+
+void IRBuilder::modsi32(RegisterRef dst, Operand a, Operand b, bool useIEEE) {
+  requireArithmetic("modsi32", dst, a, b, 1);
+  emitDivision(*this, dst, a, b, useIEEE, DivisionResult::remainder);
 }
 
 // Compare.

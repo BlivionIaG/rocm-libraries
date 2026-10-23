@@ -217,6 +217,9 @@ public:
   /// Emits dst = a - b.
   void subi32(RegisterRef dst, Operand a, Operand b);
   /// Emits dst = the low 32 bits of a * b.
+  /// An immediate 2^k in either operand (INT32_MIN counts as 2^31) gives a move
+  /// for k == 0 and otherwise a shift, s_lshl_b32 or v_lshlrev_b32. Unlike
+  /// s_mul_i32, the SALU shift writes SCC.
   void muli32(RegisterRef dst, Operand a, Operand b);
 
   // The 64-bit integer ops below share these rules. Results wrap modulo 2^64,
@@ -246,6 +249,10 @@ public:
   /// Emits dst = a - b.
   void subi64(RegisterRef dst, Operand a, Operand b);
   /// Emits dst = the low 64 bits of a * b.
+  /// An immediate 2^k (k 0..30) in either operand gives movb64 (k == 0) or
+  /// shli64: one s_lshl_b64 or v_lshlrev_b64 for even-aligned pairs, staged as
+  /// shli64 documents otherwise. The SALU form writes SCC like the other
+  /// 64-bit SALU sequences.
   void muli64(RegisterRef dst, Operand a, Operand b);
 
   // The bitwise and shift ops below share these rules.
@@ -301,36 +308,53 @@ public:
 
   // Division.
   //
+  // The signed divisions below share these rules.
+  //
+  // useIEEE selects one of LLVM's AMDGPU expansions. true is the exact one,
+  // correct for all inputs: an f32 reciprocal of |b| scaled by 2^32 - 512, one
+  // Newton step and two corrections on the magnitudes, then the sign. false is
+  // LLVM's 24-bit expansion, which divides in f32 and applies one +-1
+  // correction; it is exact only when |a| < 2^23 and |b| < 2^23, and other
+  // inputs give unspecified results.
+  //
+  // An immediate b = 2^k for k 0..30 (1 to 2^30) uses LLVM's shift expansions
+  // instead, exact for every a and for either useIEEE. The quotient is
+  // (a + ((a >> 31) >>> (32 - k))) >> k: four instructions, three for b = 2
+  // and a copy for b = 1. The remainder is a - ((a + that bias) & -2^k): five
+  // instructions, four for b = 2 and a move of 0 for b = 1. These are plain
+  // SALU or VALU ops, so the SALU form then has no readfirstlane and no
+  // active-lane precondition. Negative powers of two and INT32_MIN use the
+  // general expansions.
+  //
+  // The op is a SALU sequence iff dst and every register operand are SGPRs
+  // (the uniform form), and a VALU sequence for a VGPR dst, where SGPR and
+  // immediate operands are legalized. The uniform form computes the f32
+  // reciprocal in temporary VGPRs and moves it to an SGPR with
+  // v_readfirstlane_b32, as LLVM lowers uniform division, so it needs at least
+  // one active lane: readfirstlane with exec == 0 is undefined, and LLVM has
+  // the same precondition. It writes SCC, and the fast path reads exec.
+  //
+  // Neither form writes exec or VCC; every correction is a compare and a
+  // select, with masks in temporary SGPR pairs. Temporary VGPRs, SGPRs and an
+  // SGPR pair are allocated and released inside the op.
+  //
+  // a and b are read only at the start of the expansion and dst is written
+  // only by its last instruction, so dst may alias a or b.
+  //
+  // Throws std::invalid_argument, before emitting anything, if dst or a
+  // register operand is not exactly one register or is an AGPR, or if dst is
+  // an SGPR and an operand is a VGPR.
+
   /// Emits dst = a / b for signed 32-bit values, with the quotient truncated
   /// toward zero like C and LLVM's sdiv. INT32_MIN / -1 wraps to INT32_MIN.
   /// Division by zero gives an unspecified value, but never faults or hangs.
-  ///
-  /// useIEEE selects one of LLVM's AMDGPU expansions. true is the exact one,
-  /// correct for all inputs: an f32 reciprocal of |b| scaled by 2^32 - 512, one
-  /// Newton step and two corrections on the magnitudes, then the sign. false is
-  /// LLVM's 24-bit expansion, which divides in f32 and applies one +-1
-  /// correction; it is exact only when |a| < 2^23 and |b| < 2^23, and other
-  /// inputs give unspecified results.
-  ///
-  /// The op is a SALU sequence iff dst and every register operand are SGPRs
-  /// (the uniform form), and a VALU sequence for a VGPR dst, where SGPR and
-  /// immediate operands are legalized. The uniform form computes the f32
-  /// reciprocal in temporary VGPRs and moves it to an SGPR with
-  /// v_readfirstlane_b32, as LLVM lowers uniform division, so it needs at least
-  /// one active lane: readfirstlane with exec == 0 is undefined, and LLVM has
-  /// the same precondition. It writes SCC, and the fast path reads exec.
-  ///
-  /// Neither form writes exec or VCC; every correction is a compare and a
-  /// select, with masks in temporary SGPR pairs. Temporary VGPRs, SGPRs and an
-  /// SGPR pair are allocated and released inside the op.
-  ///
-  /// a and b are read only at the start of the expansion and dst is written
-  /// only by its last instruction, so dst may alias a or b.
-  ///
-  /// Throws std::invalid_argument, before emitting anything, if dst or a
-  /// register operand is not exactly one register or is an AGPR, or if dst is
-  /// an SGPR and an operand is a VGPR.
   void divsi32(RegisterRef dst, Operand a, Operand b, bool useIEEE);
+  /// Emits dst = a % b for signed 32-bit values with C semantics: the
+  /// remainder has the sign of a and a == (a / b) * b + a % b. INT32_MIN % -1
+  /// is 0. Division by zero gives an unspecified value, but never faults or
+  /// hangs. The exact form is LLVM's srem expansion; the 24-bit form computes
+  /// the quotient and returns a - q * b.
+  void modsi32(RegisterRef dst, Operand a, Operand b, bool useIEEE);
 
   // The comparisons below share these rules.
   //
