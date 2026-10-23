@@ -123,6 +123,106 @@ Tests:
   batch_mode: [0, 1]
   batch_count: 1
 
+# MXFP8 (preswizzled scales, scaleA/B 1001) skinny GEMMs that library logic also serves with the
+# generated SkinnyGEMM solutions (logic Range/*_SkinnyGEMM.yaml). requested_solution_num -1 runs and
+# checks every solution the library offers, Origami and generated, so each case covers all generated
+# kernels that match its shape. Only alpha 1 and beta 0: the generated solutions assert nothing
+# about alpha and beta, so with -1 they would be run for any other values and compute wrong results.
+# Their other conditions: batch 1, unit strides, lda, ldb and ldd multiples of 4 (hence ldc/ldd 4 for
+# the m skinny shapes, whose default ldd is M), and a K window per solution: the up-front scale kernels
+# take only K in ((U - 1) * KI, U * KI] with K % KI == 0, the ring kernels any K (K % KI == 0 for the
+# whole-step variants), where KI = 64 * lanesK.
+- name: matmul_skinny_mxfp8
+  category: pre_checkin
+  function:
+    matmul:
+    - { a_type: f8_r, b_type: f8_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+  matrix_size:
+    # n skinny.
+    - { M: 5120, N: 1, K: 8192 }
+    - { M: 5120, N: 2, K: 8192 }
+    - { M: 5120, N: 3, K: 8192 }
+    - { M: 5120, N: 4, K: 8192 }
+    # m skinny.
+    - { M: 1, N: 5120, K: 8192, ldc: 4, ldd: 4 }
+    - { M: 2, N: 5120, K: 5120, ldc: 4, ldd: 4 }
+    - { M: 4, N: 5120, K: 8192 }
+    # M and N tails.
+    - { M: 5000, N: 3, K: 8192 }
+    - { M: 4100, N: 2, K: 5120 }
+    - { M: 3, N: 4100, K: 5120, ldc: 4, ldd: 4 }
+    # Padded ldc and ldd. A padded lda or ldb is left out: every MX 1001 solution, Origami's
+    # included, fails the norm check there (norm_error about 100 instead of 5e-4 to 4e-3).
+    - { M: 5120, N: 2, K: 5120, ldc: 5128, ldd: 5136 }
+    - { M: 1, N: 4096, K: 4096, ldc: 8, ldd: 8 }
+    # K around the up-front windows: 4096 is just below the UP5 (LK16) and UP2 (LK64) windows, 6144
+    # is inside the UP2 and UP8 windows but is no multiple of their KI, 25600 is a ring K.
+    - { M: 5120, N: 1, K: 4096 }
+    - { M: 5120, N: 2, K: 4096 }
+    - { M: 5120, N: 1, K: 5120 }
+    - { M: 5120, N: 2, K: 5120 }
+    - { M: 5120, N: 1, K: 6144 }
+    - { M: 5120, N: 2, K: 6144 }
+    - { M: 5120, N: 2, K: 25600 }
+    - { M: 5120, N: 1, K: 25600 }
+    # A partial last K step: only the ring kernels without whole-step K match. Origami takes K % 32
+    # == 0 (5152); K % 4 == 0 (5124) has only generated solutions.
+    - { M: 5120, N: 2, K: 5152 }
+    - { M: 5120, N: 2, K: 5124 }
+    # K shorter than the prefetch depth of the ring kernels.
+    - { M: 5120, N: 2, K: 256 }
+    - { M: 5120, N: 2, K: 512 }
+  transA: T
+  transB: N
+  alpha: 1
+  beta: 0
+  initialization: hpl
+  unit_check: 0
+  norm_check: 1
+  requested_solution_num: -1
+  gpu_arch: '950'
+
+# The generated skinny solutions do not take a bias or an activation; these problems must still get
+# an answer from the Origami solutions, with the generated ones left out of the -1 list.
+- name: matmul_skinny_mxfp8_fallback
+  category: pre_checkin
+  function:
+    matmul:
+    - { a_type: f8_r, b_type: f8_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+  matrix_size:
+    - { M: 5120, N: 2, K: 8192 }
+    - { M: 1, N: 5120, K: 8192, ldc: 4, ldd: 4 }
+  transA: T
+  transB: N
+  alpha: 1
+  beta: 0
+  bias_vector: 1
+  bias_type: [f32_r, bf16_r]
+  initialization: hpl
+  unit_check: 0
+  norm_check: 1
+  requested_solution_num: -1
+  gpu_arch: '950'
+
+- name: matmul_skinny_mxfp8_fallback
+  category: pre_checkin
+  function:
+    matmul:
+    - { a_type: f8_r, b_type: f8_r, c_type: bf16_r, d_type: bf16_r, compute_type: c_f32_r, scaleA: 1001, scaleB: 1001, scale_type: f32_r}
+  matrix_size:
+    - { M: 5120, N: 2, K: 8192 }
+    - { M: 1, N: 5120, K: 8192, ldc: 4, ldd: 4 }
+  transA: T
+  transB: N
+  alpha: 1
+  beta: 0
+  activation_type: [relu, gelu]
+  initialization: hpl
+  unit_check: 0
+  norm_check: 1
+  requested_solution_num: -1
+  gpu_arch: '950'
+
 # Tests confirm no NaN propagation when alpha = 0, 2 and beta = 0. Value .NaN is converted into zero
 - {name: alpha_beta_zero_NaN, category: pre_checkin, precision: *real_precisions,
    function: matmul, transA: N, transB: N, M: 256, N: 128, K:  64, alpha: [ .NaN, 2 ], beta: [ .NaN, 2 ] }

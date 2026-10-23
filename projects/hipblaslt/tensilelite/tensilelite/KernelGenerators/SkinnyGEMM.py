@@ -11,6 +11,8 @@ Tensile launches it (arguments, tile shape, grid) and which problems it serves
 from copy import deepcopy
 from typing import Any, Dict, List
 
+from .Errors import GeneratorKernelRejected
+
 # The knobs of tensilelite_codegen.SkinnyGEMMConfig, in binding order.
 PARAMETERS = ("bm", "tn", "lanesK", "waves", "prefetch", "upIters",
               "partialSteps", "group", "numXcds", "grid3d")
@@ -99,7 +101,7 @@ def kernelName(params: Dict[str, Any]) -> str:
     try:
         return _codegen().skinnyGEMMKernelName(_config(params))
     except ValueError as error:
-        raise ValueError(f"invalid SkinnyGEMM generatorParams {params}: {error}") from error
+        raise GeneratorKernelRejected(f"invalid SkinnyGEMM generatorParams {params}: {error}") from error
 
 
 def emit(params: Dict[str, Any], arch: str) -> str:
@@ -107,7 +109,7 @@ def emit(params: Dict[str, Any], arch: str) -> str:
     try:
         return _codegen().emitSkinnyGEMM(_config(params), arch)
     except ValueError as error:
-        raise ValueError(f"invalid SkinnyGEMM generatorParams {params}: {error}") from error
+        raise GeneratorKernelRejected(f"invalid SkinnyGEMM generatorParams {params}: {error}") from error
 
 
 def _tileShape(params: Dict[str, Any]) -> List[int]:

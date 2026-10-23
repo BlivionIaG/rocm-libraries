@@ -12,6 +12,7 @@ provides, and its assembly is emitted when the kernel is written.
 from typing import Any, Dict
 
 from . import SkinnyGEMM
+from .Errors import GeneratorKernelRejected
 
 _GENERATORS = {"SkinnyGEMM": SkinnyGEMM}
 
@@ -33,10 +34,15 @@ def validateGeneratorKernel(customKernel: Dict[str, Any]) -> Dict[str, Any]:
     return _generatorOf(customKernel).validateParams(customKernel.get("generatorParams"))
 
 
-def getGeneratorKernelConfig(customKernel: Dict[str, Any], internalSupportParams: Dict[str, Any]) -> Dict[str, Any]:
-    """Expands a generator block; other keys of the block are replaced by the generator's output."""
+def getGeneratorKernelConfig(customKernel: Dict[str, Any], internalSupportParams: Dict[str, Any], arch: str) -> Dict[str, Any]:
+    """Expands a generator block; other keys of the block are replaced by the generator's output.
+
+    Raises GeneratorKernelRejected if the emitter rejects the parameters for arch.
+    """
     generator = _generatorOf(customKernel)
     params = generator.validateParams(customKernel.get("generatorParams"))
+    # Some rejections (such as the register budget) only show when the kernel is emitted; decide them here, once.
+    generator.emit(params, arch)
     config = generator.kernelConfig(params)
     config["CustomKernel"]["generator"] = customKernel["generator"]
     config["CustomKernel"]["generatorParams"] = dict(params)

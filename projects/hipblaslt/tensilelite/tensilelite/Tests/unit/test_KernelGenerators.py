@@ -20,6 +20,7 @@ from Tensile.Common import IsaVersion
 from Tensile.Common.Capabilities import makeIsaInfoMap
 from Tensile.Common.GlobalParameters import assignGlobalParameters, globalParameters
 from Tensile.KernelGenerators import (
+    GeneratorKernelRejected,
     SkinnyGEMM,
     generatedCodeObjectName,
     getGeneratorKernelConfig,
@@ -139,7 +140,7 @@ needsCodegen = pytest.mark.skipif(
     ],
 )
 def test_expanded_config(fakeCodegen, params, tile, grid, sizeGreater, sizeLess, kMultiple):
-    config = getGeneratorKernelConfig(block(params), {})
+    config = getGeneratorKernelConfig(block(params), {}, "gfx950")
     name = kernelNameOf(params)
     assert config["CustomKernelName"] == name
     assert config["KernelLanguage"] == "Assembly"
@@ -170,16 +171,16 @@ def test_expanded_config(fakeCodegen, params, tile, grid, sizeGreater, sizeLess,
 
 
 def test_expanded_args_are_copies(fakeCodegen):
-    first = getGeneratorKernelConfig(block(S1), {})
+    first = getGeneratorKernelConfig(block(S1), {}, "gfx950")
     first["CustomKernel"]["args"][0]["semantic"] = "Changed"
     first["CustomKernel"]["args"].pop()
     assert SkinnyGEMM.args() == EXPECTED_ARGS
-    assert getGeneratorKernelConfig(block(S1), {})["CustomKernel"]["args"] == EXPECTED_ARGS
+    assert getGeneratorKernelConfig(block(S1), {}, "gfx950")["CustomKernel"]["args"] == EXPECTED_ARGS
 
 
 def test_internal_support_params_fill_only_missing_keys(fakeCodegen):
     isp = {"KernArgsVersion": 3, "SupportUserGSU": True, "Other": 7}
-    config = getGeneratorKernelConfig(block(S1), isp)
+    config = getGeneratorKernelConfig(block(S1), isp, "gfx950")
     assert config["InternalSupportParams"] == {
         "KernArgsVersion": 0,
         "SupportUserGSU": False,
@@ -191,7 +192,7 @@ def test_internal_support_params_fill_only_missing_keys(fakeCodegen):
 
 def test_stale_keys_in_the_block_are_replaced(fakeCodegen):
     stale = {**block(S1), "name": "stale", "args": [], "macrotile": [1, 1, 1]}
-    ck = getGeneratorKernelConfig(stale, {})["CustomKernel"]
+    ck = getGeneratorKernelConfig(stale, {}, "gfx950")["CustomKernel"]
     assert ck["name"] == kernelNameOf(S1)
     assert ck["args"] == EXPECTED_ARGS
     assert ck["macrotile"] == [4, 1, 4096]
@@ -199,7 +200,7 @@ def test_stale_keys_in_the_block_are_replaced(fakeCodegen):
 
 def test_params_are_not_aliased(fakeCodegen):
     source = block(S1)
-    config = getGeneratorKernelConfig(source, {})
+    config = getGeneratorKernelConfig(source, {}, "gfx950")
     config["CustomKernel"]["generatorParams"]["bm"] = 99
     assert source["generatorParams"]["bm"] == 1
 
@@ -242,7 +243,7 @@ def withParam(key, value):
 )
 def test_invalid_blocks_raise(fakeCodegen, customKernel, message):
     with pytest.raises(ValueError, match=message):
-        getGeneratorKernelConfig(customKernel, {})
+        getGeneratorKernelConfig(customKernel, {}, "gfx950")
 
 
 def test_validate_generator_kernel_needs_no_codegen_module(monkeypatch):
@@ -256,7 +257,7 @@ def test_validate_generator_kernel_needs_no_codegen_module(monkeypatch):
 
 def test_binding_errors_name_the_parameters(fakeCodegen):
     with pytest.raises(ValueError, match="invalid SkinnyGEMM generatorParams.*'lanesK': 3"):
-        getGeneratorKernelConfig(withParam("lanesK", 3), {})
+        getGeneratorKernelConfig(withParam("lanesK", 3), {}, "gfx950")
     with pytest.raises(ValueError, match="unsupported lanesK 3"):
         getGeneratorKernelSource(withParam("lanesK", 3), "gfx950")
 
@@ -264,7 +265,7 @@ def test_binding_errors_name_the_parameters(fakeCodegen):
 def test_missing_module_is_a_runtime_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "tensilelite_codegen", None)
     with pytest.raises(RuntimeError, match="tensilelite_codegen"):
-        getGeneratorKernelConfig(block(S1), {})
+        getGeneratorKernelConfig(block(S1), {}, "gfx950")
     with pytest.raises(RuntimeError, match="TENSILELITE_ENABLE_JIT_PYTHON"):
         getGeneratorKernelSource(block(S1), "gfx950")
 
@@ -302,7 +303,7 @@ def test_no_feature_asserts_map_to_predicates(key, tag, value):
 
 
 def test_runtime_custom_kernel_has_no_generator_keys(fakeCodegen):
-    ck = getGeneratorKernelConfig(block(S1), {})["CustomKernel"]
+    ck = getGeneratorKernelConfig(block(S1), {}, "gfx950")["CustomKernel"]
     state = Contractions.CustomKernel.FromOriginalState(ck).state()
     assert "generator" not in state and "generatorParams" not in state
     assert "codeObjectFile" not in state
@@ -393,11 +394,82 @@ def test_handwritten_custom_kernel_keeps_its_path(fakeCodegen, parseEnv, monkeyp
     assert "generator" not in fields.solutions[0]["CustomKernel"]
 
 
-def test_invalid_generator_block_fails_the_parse(fakeCodegen, parseEnv):
+@pytest.mark.parametrize("mutate", [
+    lambda params: params.pop("waves"),
+    lambda params: params.update(partialSteps=2),
+    lambda params: params.update(grid3d=1),
+])
+def test_invalid_generator_block_fails_the_parse(fakeCodegen, parseEnv, mutate):
     raw = readLogic()
-    raw["Solutions"][0]["CustomKernel"]["generatorParams"]["lanesK"] = 3
-    with pytest.raises(ValueError, match="lanesK"):
+    mutate(raw["Solutions"][0]["CustomKernel"]["generatorParams"])
+    with pytest.raises(ValueError) as error:
         parseLogic(parseEnv, raw)
+    assert not isinstance(error.value, GeneratorKernelRejected)
+
+
+def matchingTables(library):
+    """The rows of every matching table below a library, as (key, solution index)."""
+    rows = []
+    for row in getattr(library, "rows", []):
+        rows += matchingTables(row["library"])
+    for child in (getattr(library, "mapping", None) or {}).values():
+        rows += matchingTables(child)
+    for entry in getattr(library, "table", []):
+        if isinstance(entry, dict) and "key" in entry:
+            rows.append((entry["key"], entry["index"].solution.index))
+    return rows
+
+
+def assertSecondSolutionDropped(env, raw, capsys, rejected):
+    """The solution at index 1 is dropped and every other solution keeps its row."""
+    original = readLogic()["ExactLogic"]
+    fields = parseLogic(env, raw)
+    output = capsys.readouterr().out
+    assert "Skipping generator kernel SkinnyGEMM" in output
+    assert rejected in output and "solution index 1" in output
+    kept = [S1, S3, S4, S5]
+    assert [s["CustomKernelName"] for s in fields.solutions] == [kernelNameOf(p) for p in kept]
+    assert sorted(fields.library.solutions) == [0, 2, 3, 4]
+    rows = matchingTables(fields.library.library)
+    assert sorted(index for _, index in rows) == [0, 2, 3, 4]
+    originalKeys = {index: original[index][0] for index in (0, 2, 3, 4)}
+    assert sorted(rows) == sorted((originalKeys[index], index) for index in (0, 2, 3, 4))
+
+
+def test_generator_kernel_rejected_by_the_emitter_is_dropped(fakeCodegen, parseEnv, capsys):
+    raw = readLogic()
+    raw["Solutions"][1]["CustomKernel"]["generatorParams"]["lanesK"] = 3
+    assertSecondSolutionDropped(parseEnv, raw, capsys, "'lanesK': 3")
+
+
+@needsCodegen
+def test_real_over_budget_generator_kernel_is_dropped(parseEnv, capsys):
+    overBudget = dict(bm=2, tn=8, lanesK=8, waves=2, prefetch=1, upIters=10, partialSteps=0, group=1,
+                      numXcds=1, grid3d=True)
+    raw = readLogic()
+    raw["Solutions"][1]["CustomKernel"]["generatorParams"] = dict(overBudget)
+    assertSecondSolutionDropped(parseEnv, raw, capsys, "register budget")
+
+
+def test_rejection_is_a_value_error():
+    assert issubclass(GeneratorKernelRejected, ValueError)
+
+
+def test_emitter_rejection_raises_generator_kernel_rejected(fakeCodegen):
+    rejected = withParam("lanesK", 3)
+    for call in (
+        lambda: SkinnyGEMM.emit(rejected["generatorParams"], "gfx950"),
+        lambda: SkinnyGEMM.kernelName(rejected["generatorParams"]),
+        lambda: getGeneratorKernelConfig(rejected, {}, "gfx950"),
+    ):
+        with pytest.raises(GeneratorKernelRejected, match="invalid SkinnyGEMM generatorParams.*unsupported lanesK 3"):
+            call()
+
+
+def test_shape_errors_are_not_rejections(fakeCodegen):
+    with pytest.raises(ValueError) as error:
+        getGeneratorKernelConfig(withParam("partialSteps", 2), {}, "gfx950")
+    assert not isinstance(error.value, GeneratorKernelRejected)
 
 
 # --------------------------------------------------------------------------- #
@@ -413,7 +485,7 @@ def test_kernel_source_uses_the_generator_and_not_the_custom_kernel_directory(fa
         "KernelLanguage": "Assembly",
         "ISA": [9, 5, 0],
         "CustomKernelName": kernelNameOf(S1),
-        "CustomKernel": getGeneratorKernelConfig(block(S1), {})["CustomKernel"],
+        "CustomKernel": getGeneratorKernelConfig(block(S1), {}, "gfx950")["CustomKernel"],
         "CUOccupancy": -1,
     }
     errcode, code = kwa.getSourceFileString(kernel)
@@ -526,7 +598,7 @@ def test_codegen_definition_is_unchanged_without_an_own_file():
 
 
 def test_assign_generated_code_object_files(fakeCodegen):
-    generated = getGeneratorKernelConfig(block(S1), {})["CustomKernel"]
+    generated = getGeneratorKernelConfig(block(S1), {}, "gfx950")["CustomKernel"]
     shared = dict(generated)
     plain = customKernelState()
     lazyName = "TensileLibrary_Type_ID75a0_gfx950"
