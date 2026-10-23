@@ -68,6 +68,27 @@ TEST(RocisaCore, EmitsScaledPackedFp8ToBf16Convert) {
   expectContains(text, "v_cvt_scalef32_pk_bf16_fp8 v0, v0, v76 op_sel:[1,0,0]");
 }
 
+TEST(RocisaCore, EmitsArithmeticShiftRight64) {
+  selectGfx950();
+  rocisa::Module module("ashr64");
+  module.addT<rocisa::SAShiftRightI64>(rocisa::sgpr(4, 2), rocisa::sgpr(6),
+                                       rocisa::sgpr(0, 2));
+  module.addT<rocisa::SAShiftRightI64>(rocisa::sgpr(4, 2), 3,
+                                       rocisa::sgpr(0, 2));
+  module.addT<rocisa::VAShiftRightI64>(rocisa::vgpr(2, 2), rocisa::vgpr(4),
+                                       rocisa::vgpr(0, 2));
+  module.addT<rocisa::VAShiftRightI64>(rocisa::vgpr(2, 2), 3,
+                                       rocisa::vgpr(0, 2));
+  module.addT<rocisa::VAShiftRightI64>(rocisa::vgpr(2, 2), rocisa::sgpr(6),
+                                       rocisa::vgpr(0, 2));
+  std::string text = module.toString();
+  expectContains(text, "s_ashr_i64 s[4:5], s[0:1], s6");
+  expectContains(text, "s_ashr_i64 s[4:5], s[0:1], 3");
+  expectContains(text, "v_ashrrev_i64 v[2:3], v4, v[0:1]");
+  expectContains(text, "v_ashrrev_i64 v[2:3], 3, v[0:1]");
+  expectContains(text, "v_ashrrev_i64 v[2:3], s6, v[0:1]");
+}
+
 // Builds the cross-lane reduction forms: full bank mask and optional
 // bound_ctrl.
 static rocisa::DPPModifiers reductionDpp(int32_t rowBcast,
