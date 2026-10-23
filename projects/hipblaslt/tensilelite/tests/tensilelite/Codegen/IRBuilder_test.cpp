@@ -18,8 +18,10 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <memory>
@@ -5905,16 +5907,6 @@ protected:
   }
 };
 
-enum class SizeSource { sgpr, immediate };
-
-// Byte offsets of the arguments in the kernarg segment.
-struct CopyOffsets {
-  int32_t in;
-  int32_t out;
-  int32_t inBytes;
-  int32_t outBytes;
-};
-
 } // namespace
 
 // The upper word 0x00020000 as rocisa prints a decimal immediate.
@@ -6100,169 +6092,707 @@ TEST_F(RsrcTest, ErrorMessagesNameTheOperation) {
             std::string::npos);
 }
 
-static constexpr int32_t copyWorkgroupSize = 64;
-static constexpr int32_t copyGroupCount = 2;
-static constexpr int32_t copyLaneCount = copyWorkgroupSize * copyGroupCount;
-// The input is shorter than the output, and both are shorter than the lane
-// count, so lanes run past each descriptor's end.
-static constexpr int32_t inWords = 77;
-static constexpr int32_t outWords = 101;
-static constexpr int32_t copyPadding = 64;
-static constexpr uint32_t copySentinel = 0xDEADBEEFu;
-static constexpr const char *copyKernelName = "codegen_buffer_copy";
+// Memory.
 
-static CopyOffsets declareArguments(KernelSignature &signature) {
+namespace {
+
+struct WidthSpec {
+  MemoryWidth width;
+  const char *name;
+  // The bytes accessed, the bytes a lane owns and the registers used.
+  int32_t bytes;
+  int32_t slot;
+  int32_t registers;
+  // The mnemonics rocisa prints on gfx950.
+  const char *bufferLoad;
+  const char *bufferStore;
+  const char *dsLoad;
+  const char *dsStore;
+};
+
+enum class MemoryOp { loadDs, storeDs, loadBuffer, storeBuffer };
+
+// The arguments of one memory op; address is the DS address or the buffer
+// voffset. The defaults are legal.
+struct MemoryArgs {
+  RegisterRef payload{vgpr, 2, 1};
+  RegisterRef address{vgpr, 0, 1};
+  RegisterRef rsrc{sgpr, 4, 4};
+  Operand soffset = 0;
+  MemoryWidth width = MemoryWidth::b32;
+  int32_t offset = 0;
+  BufferAccess access;
+};
+
+class MemoryTest : public BuilderTest {
+protected:
+  static void issue(IRBuilder &target, MemoryOp op, const MemoryArgs &a) {
+    switch (op) {
+    case MemoryOp::loadDs:
+      return target.loadDs(a.payload, a.address, a.width, a.offset);
+    case MemoryOp::storeDs:
+      return target.storeDs(a.address, a.payload, a.width, a.offset);
+    case MemoryOp::loadBuffer:
+      return target.loadBuffer(a.payload, a.rsrc, a.address, a.soffset, a.width,
+                               a.access);
+    case MemoryOp::storeBuffer:
+      return target.storeBuffer(a.payload, a.rsrc, a.address, a.soffset,
+                                a.width, a.access);
+    }
+  }
+  std::string emitOne(MemoryOp op, const MemoryArgs &args) {
+    return emitted([&](IRBuilder &local) { issue(local, op, args); });
+  }
+  // Asserts that op throws with args and emits nothing.
+  void expectOpRejected(MemoryOp op, const MemoryArgs &args) {
+    expectRejected([&] { issue(builder, op, args); });
+  }
+  void expectAllRejected(std::span<const MemoryOp> ops,
+                         const MemoryArgs &args) {
+    for (MemoryOp op : ops)
+      expectOpRejected(op, args);
+  }
+  std::string errorOf(MemoryOp op, const MemoryArgs &args) {
+    try {
+      issue(builder, op, args);
+    } catch (const std::invalid_argument &error) {
+      return error.what();
+    }
+    return {};
+  }
+};
+
+enum class SizeSource { sgpr, immediate };
+
+// Byte offsets of the arguments in the kernarg segment.
+struct MemoryOffsets {
+  int32_t in;
+  int32_t out;
+  int32_t first;
+  int32_t slots;
+  int32_t inBytes;
+  int32_t outBytes;
+};
+
+struct MemoryCase {
+  MemoryWidth width = MemoryWidth::b32;
+  // Where the in and out descriptor sizes come from.
+  SizeSource source = SizeSource::sgpr;
+  // The descriptor sizes in slots. The defaults are shorter than the lane
+  // count, so lanes run past each descriptor's end.
+  int32_t inSlots = 77;
+  int32_t outSlots = 101;
+  bool soffsetInSgpr = false;
+  int32_t soffset = 0;
+  BufferAccess access;
+  bool useAgpr = false;
+  bool throughLds = false;
+  int32_t dsOffset = 0;
+};
+
+// The registers and descriptors the kernel body uses.
+struct MemoryRegisters {
+  RegisterRange in, out, first, slots;
+  RegisterRange local, voffset, firstOffset;
+  RegisterRange payload;
+};
+
+struct MemoryResults {
+  std::vector<uint8_t> out, first, slots;
+};
+
+} // namespace
+
+static constexpr std::array<MemoryOp, 4> allOps = {
+    MemoryOp::loadDs, MemoryOp::storeDs, MemoryOp::loadBuffer,
+    MemoryOp::storeBuffer};
+static constexpr std::array<MemoryOp, 2> dsOps = {MemoryOp::loadDs,
+                                                  MemoryOp::storeDs};
+static constexpr std::array<MemoryOp, 2> bufferOps = {MemoryOp::loadBuffer,
+                                                      MemoryOp::storeBuffer};
+
+static const std::array<WidthSpec, 6> widthSpecs = {{
+    {MemoryWidth::b8, "b8", 1, 4, 1, "buffer_load_ubyte", "buffer_store_byte",
+     "ds_read_u8", "ds_write_b8"},
+    {MemoryWidth::b16, "b16", 2, 4, 1, "buffer_load_ushort",
+     "buffer_store_short", "ds_read_u16", "ds_write_b16"},
+    {MemoryWidth::b32, "b32", 4, 4, 1, "buffer_load_dword",
+     "buffer_store_dword", "ds_read_b32", "ds_write_b32"},
+    {MemoryWidth::b64, "b64", 8, 8, 2, "buffer_load_dwordx2",
+     "buffer_store_dwordx2", "ds_read_b64", "ds_write_b64"},
+    {MemoryWidth::b96, "b96", 12, 16, 3, "buffer_load_dwordx3",
+     "buffer_store_dwordx3", "ds_read_b96", "ds_write_b96"},
+    {MemoryWidth::b128, "b128", 16, 16, 4, "buffer_load_dwordx4",
+     "buffer_store_dwordx4", "ds_read_b128", "ds_write_b128"},
+}};
+
+static const WidthSpec &specOf(MemoryWidth width) {
+  return widthSpecs[static_cast<size_t>(width)];
+}
+
+static constexpr int32_t memoryWorkgroupSize = 64;
+static constexpr int32_t memoryGroupCount = 2;
+static constexpr int32_t memoryLaneCount =
+    memoryWorkgroupSize * memoryGroupCount;
+// The instruction each op prints for default arguments and the given payload.
+static std::string defaultLine(MemoryOp op, const WidthSpec &spec,
+                               const std::string &payload) {
+  switch (op) {
+  case MemoryOp::loadDs:
+    return line(spec.dsLoad, payload, "v0") + " offset:0\n";
+  case MemoryOp::storeDs:
+    return std::string(spec.dsStore) + " v0, " + payload + " offset:0\n";
+  case MemoryOp::loadBuffer:
+    return line(spec.bufferLoad, payload, "v0", "s[4:7]") +
+           ", 0 offen offset:0\n";
+  case MemoryOp::storeBuffer:
+    return line(spec.bufferStore, payload, "v0", "s[4:7]") +
+           ", 0 offen offset:0\n";
+  }
+}
+
+TEST_F(MemoryTest, EveryWidthPrintsItsMnemonic) {
+  for (RegisterKind kind : {vgpr, agpr}) {
+    for (const WidthSpec &spec : widthSpecs) {
+      SCOPED_TRACE(std::string(spec.name) + (kind == vgpr ? " vgpr" : " agpr"));
+      MemoryArgs args;
+      args.payload = RegisterRef{kind, 2, spec.registers};
+      args.width = spec.width;
+      for (MemoryOp op : allOps)
+        EXPECT_EQ(emitOne(op, args), defaultLine(op, spec, text(args.payload)));
+    }
+  }
+}
+
+TEST_F(MemoryTest, SingleRegistersMayStartAtAnyIndex) {
+  MemoryArgs args;
+  args.payload = {vgpr, 1, 1};
+  EXPECT_EQ(emitOne(MemoryOp::loadDs, args), "ds_read_b32 v1, v0 offset:0\n");
+  args.payload = {agpr, 3, 1};
+  EXPECT_EQ(emitOne(MemoryOp::storeBuffer, args),
+            "buffer_store_dword acc3, v0, s[4:7], 0 offen offset:0\n");
+}
+
+TEST_F(MemoryTest, DsOffsetsPrint) {
+  MemoryArgs args;
+  for (int32_t offset : {1, 4096, 65535}) {
+    args.offset = offset;
+    std::string suffix = " offset:" + std::to_string(offset) + "\n";
+    EXPECT_EQ(emitOne(MemoryOp::loadDs, args), "ds_read_b32 v2, v0" + suffix);
+    EXPECT_EQ(emitOne(MemoryOp::storeDs, args), "ds_write_b32 v0, v2" + suffix);
+  }
+}
+
+TEST_F(MemoryTest, BufferOptionsPrint) {
+  struct Case {
+    Operand soffset;
+    BufferAccess access;
+    std::string suffix;
+  };
+  const Case cases[] = {
+      {RegisterRef{sgpr, 9, 1}, {}, "s9 offen offset:0"},
+      {0, {}, "0 offen offset:0"},
+      {64, {}, "64 offen offset:0"},
+      {0, {.offset = 4095}, "0 offen offset:4095"},
+      {0, {.sc0 = true}, "0 offen offset:0 sc0"},
+      {0, {.sc1 = true}, "0 offen offset:0 sc1"},
+      {0, {.nt = true}, "0 offen offset:0 nt"},
+      {RegisterRef{sgpr, 9, 1},
+       {.offset = 4095, .sc0 = true, .sc1 = true, .nt = true},
+       "s9 offen offset:4095 sc0 sc1 nt"},
+  };
+  for (const Case &current : cases) {
+    SCOPED_TRACE(current.suffix);
+    MemoryArgs args;
+    args.soffset = current.soffset;
+    args.access = current.access;
+    EXPECT_EQ(emitOne(MemoryOp::loadBuffer, args),
+              "buffer_load_dword v2, v0, s[4:7], " + current.suffix + "\n");
+    EXPECT_EQ(emitOne(MemoryOp::storeBuffer, args),
+              "buffer_store_dword v2, v0, s[4:7], " + current.suffix + "\n");
+  }
+}
+
+TEST_F(MemoryTest, RejectsPayloadsOfTheWrongSize) {
+  for (RegisterKind kind : {vgpr, agpr}) {
+    for (const WidthSpec &spec : widthSpecs) {
+      for (int32_t count : {spec.registers - 1, spec.registers + 1}) {
+        if (count < 1)
+          continue;
+        SCOPED_TRACE(std::string(spec.name) + " count " +
+                     std::to_string(count));
+        MemoryArgs args;
+        args.payload = {kind, 2, count};
+        args.width = spec.width;
+        expectAllRejected(allOps, args);
+      }
+    }
+  }
+}
+
+TEST_F(MemoryTest, RejectsScalarPayloads) {
+  for (const WidthSpec &spec : widthSpecs) {
+    SCOPED_TRACE(spec.name);
+    MemoryArgs args;
+    args.payload = {sgpr, 8, spec.registers};
+    args.width = spec.width;
+    expectAllRejected(allOps, args);
+  }
+}
+
+TEST_F(MemoryTest, RejectsMisalignedTuples) {
+  for (RegisterKind kind : {vgpr, agpr}) {
+    for (const WidthSpec &spec : widthSpecs) {
+      if (spec.registers < 2)
+        continue;
+      for (int32_t start : {1, 3}) {
+        SCOPED_TRACE(std::string(spec.name) + " start " +
+                     std::to_string(start));
+        MemoryArgs args;
+        args.payload = {kind, start, spec.registers};
+        args.width = spec.width;
+        expectAllRejected(allOps, args);
+      }
+    }
+  }
+}
+
+TEST_F(MemoryTest, RejectsBadAddresses) {
+  for (RegisterRef address : {RegisterRef{sgpr, 0, 1}, RegisterRef{agpr, 0, 1},
+                              RegisterRef{vgpr, 0, 2}}) {
+    SCOPED_TRACE(text(address));
+    MemoryArgs args;
+    args.address = address;
+    expectAllRejected(allOps, args);
+  }
+}
+
+TEST_F(MemoryTest, RejectsOffsetsOutOfRange) {
+  MemoryArgs args;
+  for (int32_t offset : {-1, 65536}) {
+    args.offset = offset;
+    expectAllRejected(dsOps, args);
+  }
+  args = {};
+  for (int32_t offset : {-1, 4096}) {
+    args.access.offset = offset;
+    expectAllRejected(bufferOps, args);
+  }
+}
+
+TEST_F(MemoryTest, RejectsBadResources) {
+  for (RegisterRef rsrc : {RegisterRef{vgpr, 4, 4}, RegisterRef{agpr, 4, 4},
+                           RegisterRef{sgpr, 4, 3}, RegisterRef{sgpr, 4, 8},
+                           RegisterRef{sgpr, 2, 4}}) {
+    SCOPED_TRACE(text(rsrc));
+    MemoryArgs args;
+    args.rsrc = rsrc;
+    expectAllRejected(bufferOps, args);
+  }
+}
+
+TEST_F(MemoryTest, RejectsBadSoffsets) {
+  for (Operand soffset :
+       {Operand(RegisterRef{vgpr, 6, 1}), Operand(RegisterRef{agpr, 6, 1}),
+        Operand(RegisterRef{sgpr, 8, 2}), Operand(65), Operand(-1),
+        Operand(-16), Operand(-17)}) {
+    MemoryArgs args;
+    args.soffset = soffset;
+    expectAllRejected(bufferOps, args);
+  }
+}
+
+TEST_F(MemoryTest, ErrorMessagesNameTheOperationAndTheProblem) {
+  struct Case {
+    MemoryOp op;
+    MemoryArgs args;
+    std::string name;
+    std::string problem;
+  };
+  std::vector<Case> cases(8);
+  cases[0] = {MemoryOp::loadDs, {}, "loadDs", "needs 2 vgprs or agprs"};
+  cases[0].args.width = MemoryWidth::b64;
+  cases[1] = {MemoryOp::storeDs, {}, "storeDs", "vgprs or agprs"};
+  cases[1].args.payload = {sgpr, 8, 1};
+  cases[2] = {MemoryOp::loadDs, {}, "loadDs", "must start at an even index"};
+  cases[2].args.payload = {vgpr, 3, 2};
+  cases[2].args.width = MemoryWidth::b64;
+  cases[3] = {
+      MemoryOp::storeDs, {}, "storeDs", "address must be a single vgpr"};
+  cases[3].args.address = {sgpr, 0, 1};
+  cases[4] = {
+      MemoryOp::loadDs, {}, "loadDs", "offset 65536 is outside 0 to 65535"};
+  cases[4].args.offset = 65536;
+  cases[5] = {MemoryOp::loadBuffer, {}, "loadBuffer", "multiple of 4"};
+  cases[5].args.rsrc = {sgpr, 6, 4};
+  cases[6] = {
+      MemoryOp::storeBuffer,
+      {},
+      "storeBuffer",
+      "soffset must be a single sgpr or an immediate from 0 to 64, got 65"};
+  cases[6].args.soffset = 65;
+  cases[7] = {MemoryOp::storeBuffer,
+              {},
+              "storeBuffer",
+              "offset 4096 is outside 0 to 4095"};
+  cases[7].args.access.offset = 4096;
+  for (const Case &current : cases) {
+    std::string message = errorOf(current.op, current.args);
+    SCOPED_TRACE(message);
+    EXPECT_EQ(message.rfind(current.name, 0), 0u);
+    EXPECT_NE(message.find(current.problem), std::string::npos);
+    EXPECT_NE(message.back(), '.');
+  }
+}
+
+// Emits every width, payload kind and option into one kernel.
+TEST(MemoryAssembly, AllWidthsAndOptionsAssemble) {
+  Target target = Target::get("gfx950");
+  Kernel kernel(target, "codegen_memory_assembly", memoryWorkgroupSize);
+  IRBuilder &builder = kernel.builder();
+  kernel.setLdsSize(1 << 16);
+  RegisterRange rsrc = builder.allocateSgpr(4, 4);
+  RegisterRange soffsetReg = builder.allocateSgpr(1);
+  RegisterRange address = builder.allocateVgpr(1);
+  const BufferAccess accesses[] = {
+      {},
+      {.offset = 4095},
+      {.sc0 = true},
+      {.sc1 = true},
+      {.nt = true},
+      {.offset = 4095, .sc0 = true, .sc1 = true, .nt = true}};
+  for (RegisterKind kind : {vgpr, agpr}) {
+    for (const WidthSpec &spec : widthSpecs) {
+      RegisterRange payload = kind == vgpr
+                                  ? builder.allocateVgpr(spec.registers, 2)
+                                  : builder.allocateAgpr(spec.registers, 2);
+      for (int32_t offset : {0, 65535}) {
+        builder.loadDs(payload.ref(), address.ref(), spec.width, offset);
+        builder.storeDs(address.ref(), payload.ref(), spec.width, offset);
+      }
+      for (Operand soffset : {Operand(soffsetReg), Operand(0), Operand(64)}) {
+        for (const BufferAccess &access : accesses) {
+          builder.loadBuffer(payload.ref(), rsrc.ref(), address.ref(), soffset,
+                             spec.width, access);
+          builder.storeBuffer(payload.ref(), rsrc.ref(), address.ref(), soffset,
+                              spec.width, access);
+        }
+      }
+    }
+  }
+  builder.createEndProgram();
+  std::string assembly = kernel.toAssembly();
+  SCOPED_TRACE(assembly);
+  EXPECT_NO_THROW(assembleToHSACO(assembly, target.isaName()));
+}
+
+// Host bytes past each descriptor, so an access that escapes its descriptor
+// lands in memory the test can see rather than in someone else's.
+static constexpr int32_t memoryPadding = 8192;
+static constexpr uint32_t memorySentinel = 0xDEADBEEFu;
+static constexpr const char *memoryKernelName = "codegen_memory";
+
+static MemoryOffsets declareArguments(KernelSignature &signature) {
   int32_t in = signature.addPointer("in");
   int32_t out = signature.addPointer("out");
+  int32_t first = signature.addPointer("first");
+  int32_t slots = signature.addPointer("slots");
   int32_t inBytes = signature.addScalar("inBytes", 4);
   int32_t outBytes = signature.addScalar("outBytes", 4);
-  return {in, out, inBytes, outBytes};
+  return {in, out, first, slots, inBytes, outBytes};
 }
 
-// The pointers and sizes sit in SGPRs apart from the descriptors.
-static void buildDescriptorsFromSgprs(Kernel &kernel, CopyOffsets offsets,
-                                      const RegisterRange &inRsrc,
-                                      const RegisterRange &outRsrc) {
+// Builds a descriptor over the pointer argument. With a size argument the
+// pointer and size sit in SGPRs apart from the descriptor; without one the
+// pointer is loaded straight into the descriptor, so makeRsrc skips copying it,
+// and the size is an immediate.
+static RegisterRange makeDescriptor(Kernel &kernel, int32_t pointerOffset,
+                                    std::optional<int32_t> sizeOffset,
+                                    int32_t sizeBytes) {
   IRBuilder &builder = kernel.builder();
-  const RegisterRange &kernarg = kernel.kernargSegmentPtr();
-  RegisterRange inPointer = builder.allocateSgpr(2, 2);
-  RegisterRange outPointer = builder.allocateSgpr(2, 2);
-  RegisterRange sizes = builder.allocateSgpr(2);
-  builder.create<rocisa::SLoadB64>(inPointer.container(), kernarg.container(),
-                                   offsets.in);
-  builder.create<rocisa::SLoadB64>(outPointer.container(), kernarg.container(),
-                                   offsets.out);
-  builder.create<rocisa::SLoadB32>(sizes.sub(0), kernarg.container(),
-                                   offsets.inBytes);
-  builder.create<rocisa::SLoadB32>(sizes.sub(1), kernarg.container(),
-                                   offsets.outBytes);
+  RegisterRange rsrc = builder.allocateSgpr(4, 4);
+  if (!sizeOffset) {
+    kernel.loadArgument(rsrc.ref(0, 2), pointerOffset);
+    builder.createWaitCnt({.scalarMemory = 0});
+    builder.makeRsrc(rsrc.ref(), rsrc.ref(0, 2), sizeBytes);
+    return rsrc;
+  }
+  RegisterRange pointer = builder.allocateSgpr(2, 2);
+  RegisterRange size = builder.allocateSgpr(1);
+  kernel.loadArgument(pointer.ref(), pointerOffset);
+  kernel.loadArgument(size.ref(), *sizeOffset);
   builder.createWaitCnt({.scalarMemory = 0});
-  builder.makeRsrc(inRsrc.ref(), inPointer, sizes.ref(0));
-  builder.makeRsrc(outRsrc.ref(), outPointer, sizes.ref(1));
+  builder.makeRsrc(rsrc.ref(), pointer, size);
+  return rsrc;
 }
 
-// The pointers are loaded straight into the descriptors, so makeRsrc skips
-// copying them and the sizes are immediates.
-static void buildDescriptorsInPlace(Kernel &kernel, CopyOffsets offsets,
-                                    const RegisterRange &inRsrc,
-                                    const RegisterRange &outRsrc) {
-  IRBuilder &builder = kernel.builder();
-  const RegisterRange &kernarg = kernel.kernargSegmentPtr();
-  builder.create<rocisa::SLoadB64>(inRsrc.sub(0, 2), kernarg.container(),
-                                   offsets.in);
-  builder.create<rocisa::SLoadB64>(outRsrc.sub(0, 2), kernarg.container(),
-                                   offsets.out);
-  builder.createWaitCnt({.scalarMemory = 0});
-  builder.makeRsrc(inRsrc.ref(), inRsrc.ref(0, 2), inWords * 4);
-  builder.makeRsrc(outRsrc.ref(), outRsrc.ref(0, 2), outWords * 4);
+static int32_t descriptorBytes(const WidthSpec &spec, int32_t slots) {
+  return slots * spec.slot;
 }
 
-static RegisterRange computeByteOffset(Kernel &kernel) {
+// Allocates the registers. voffset is the lane's slot in the buffers; the
+// local lane is kept for the LDS addresses.
+static MemoryRegisters allocateRegisters(Kernel &kernel, const MemoryCase &test,
+                                         const WidthSpec &spec,
+                                         MemoryOffsets offsets) {
   IRBuilder &builder = kernel.builder();
-  RegisterRange localId = builder.allocateVgpr(1);
+  bool sgprSizes = test.source == SizeSource::sgpr;
+  MemoryRegisters regs{
+      makeDescriptor(kernel, offsets.in,
+                     sgprSizes ? std::optional<int32_t>(offsets.inBytes)
+                               : std::nullopt,
+                     descriptorBytes(spec, test.inSlots)),
+      makeDescriptor(kernel, offsets.out,
+                     sgprSizes ? std::optional<int32_t>(offsets.outBytes)
+                               : std::nullopt,
+                     descriptorBytes(spec, test.outSlots)),
+      makeDescriptor(kernel, offsets.first, std::nullopt, memoryLaneCount * 4),
+      makeDescriptor(kernel, offsets.slots, std::nullopt,
+                     memoryLaneCount * spec.slot),
+      builder.allocateVgpr(1),
+      builder.allocateVgpr(1),
+      builder.allocateVgpr(1),
+      test.useAgpr
+          ? builder.allocateAgpr(spec.registers, spec.registers > 1 ? 2 : 1)
+          : builder.allocateVgpr(spec.registers, spec.registers > 1 ? 2 : 1)};
   RegisterRange groupBase = builder.allocateSgpr(1);
-  RegisterRange globalId = builder.allocateVgpr(1);
-  RegisterRange offset = builder.allocateVgpr(1);
+  RegisterRange global = builder.allocateVgpr(1);
   // The workitem id register packs the x, y and z ids.
-  builder.create<rocisa::VAndB32>(localId.container(), 0x3ff,
-                                  kernel.workitemId().container());
-  builder.muli32(groupBase.ref(), kernel.workgroupIdX(), copyWorkgroupSize);
-  builder.addi32(globalId.ref(), groupBase, localId);
-  builder.create<rocisa::VLShiftLeftB32>(offset.container(), 2,
-                                         globalId.container());
-  return offset;
+  builder.andi32(regs.local.ref(), kernel.workitemId(), 0x3ff);
+  builder.muli32(groupBase.ref(), kernel.workgroupIdX(), memoryWorkgroupSize);
+  builder.addi32(global.ref(), regs.local, groupBase);
+  builder.muli32(regs.voffset.ref(), global, spec.slot);
+  builder.muli32(regs.firstOffset.ref(), global, 4);
+  return regs;
+}
+
+// Fills every payload register with ones, so zero-extension and clipped loads
+// are visible.
+static void fillPayload(IRBuilder &builder, const MemoryRegisters &regs,
+                        const WidthSpec &spec) {
+  for (int32_t i = 0; i < spec.registers; ++i)
+    builder.movb32(regs.payload.ref(i), -1);
+}
+
+// Sends the loaded payload through LDS and back from the mirrored lane's slot,
+// so data crosses lanes, and stores the mirrored whole slot to the slots
+// output. A workgroup is one wave, so no barrier is needed.
+static void exchangeThroughLds(Kernel &kernel, const MemoryCase &test,
+                               const WidthSpec &spec,
+                               const MemoryRegisters &regs) {
+  IRBuilder &builder = kernel.builder();
+  kernel.setLdsSize(test.dsOffset + memoryWorkgroupSize * spec.slot);
+  RegisterRange address = builder.allocateVgpr(1);
+  RegisterRange mirror = builder.allocateVgpr(1);
+  RegisterRange sentinel = builder.allocateVgpr(1);
+  RegisterRange slot = builder.allocateVgpr(spec.slot / 4);
+  builder.muli32(address.ref(), regs.local, spec.slot);
+  builder.subi32(mirror.ref(), memoryWorkgroupSize - 1, regs.local);
+  builder.muli32(mirror.ref(), mirror, spec.slot);
+  builder.movb32(sentinel.ref(), static_cast<int32_t>(memorySentinel));
+  for (int32_t i = 0; i < spec.slot / 4; ++i)
+    builder.storeDs(address.ref(), sentinel.ref(), MemoryWidth::b32,
+                    test.dsOffset + 4 * i);
+  builder.storeDs(address.ref(), regs.payload.ref(), spec.width, test.dsOffset);
+  builder.createWaitCnt({.lds = 0});
+
+  fillPayload(builder, regs, spec);
+  builder.loadDs(regs.payload.ref(), mirror.ref(), spec.width, test.dsOffset);
+  for (int32_t i = 0; i < spec.slot / 4; ++i)
+    builder.loadDs(slot.ref(i), mirror.ref(), MemoryWidth::b32,
+                   test.dsOffset + 4 * i);
+  builder.createWaitCnt({.lds = 0});
+  for (int32_t i = 0; i < spec.slot / 4; ++i)
+    builder.storeBuffer(slot.ref(i), regs.slots.ref(), regs.voffset.ref(), 0,
+                        MemoryWidth::b32, {.offset = 4 * i});
 }
 
 // Every lane accesses memory, so the descriptor bounds do all the clipping.
-static void buildCopy(Kernel &kernel, SizeSource source, CopyOffsets offsets) {
+static void buildMemoryKernel(Kernel &kernel, const MemoryCase &test,
+                              const WidthSpec &spec, MemoryOffsets offsets) {
   IRBuilder &builder = kernel.builder();
-  RegisterRange inRsrc = builder.allocateSgpr(4, 4);
-  RegisterRange outRsrc = builder.allocateSgpr(4, 4);
-  if (source == SizeSource::sgpr)
-    buildDescriptorsFromSgprs(kernel, offsets, inRsrc, outRsrc);
-  else
-    buildDescriptorsInPlace(kernel, offsets, inRsrc, outRsrc);
-
-  RegisterRange offset = computeByteOffset(kernel);
-  RegisterRange value = builder.allocateVgpr(1);
-  builder.create<rocisa::BufferLoadB32>(value.container(), offset.container(),
-                                        inRsrc.container(), 0,
-                                        rocisa::MUBUFModifiers(true, 0));
+  MemoryRegisters regs = allocateRegisters(kernel, test, spec, offsets);
+  RegisterRange soffsetReg = builder.allocateSgpr(1);
+  Operand soffset = test.soffset;
+  if (test.soffsetInSgpr) {
+    builder.movb32(soffsetReg.ref(), test.soffset);
+    soffset = soffsetReg;
+  }
+  fillPayload(builder, regs, spec);
+  builder.loadBuffer(regs.payload.ref(), regs.in.ref(), regs.voffset.ref(),
+                     soffset, spec.width, test.access);
   builder.createWaitCnt({.vectorLoads = 0});
-  builder.create<rocisa::BufferStoreB32>(value.container(), offset.container(),
-                                         outRsrc.container(), 0,
-                                         rocisa::MUBUFModifiers(true, 0));
+  if (test.throughLds)
+    exchangeThroughLds(kernel, test, spec, regs);
+  builder.storeBuffer(regs.payload.ref(), regs.out.ref(), regs.voffset.ref(),
+                      soffset, spec.width, test.access);
+  builder.storeBuffer(regs.payload.ref(0), regs.first.ref(),
+                      regs.firstOffset.ref(), 0, MemoryWidth::b32);
   builder.createEndProgram();
 }
 
-// Every word is nonzero and differs from the copySentinel, so a load that is
+// The input words are nonzero and differ from the sentinel, so a load that is
 // not clipped to zero shows up in the output.
-static std::vector<uint32_t> makeInput() {
-  std::vector<uint32_t> in(copyLaneCount + copyPadding);
-  for (int32_t i = 0; i < std::ssize(in); ++i)
-    in[i] = (0x01000000u + static_cast<uint32_t>(i) * 2654435761u) | 1u;
+static std::vector<uint8_t> makeInput(int32_t bytes) {
+  std::vector<uint8_t> in(bytes);
+  for (int32_t i = 0; i < bytes / 4; ++i) {
+    uint32_t word = (0x01000000u + static_cast<uint32_t>(i) * 2654435761u) | 1u;
+    std::memcpy(in.data() + 4 * i, &word, 4);
+  }
   return in;
 }
 
-static std::vector<uint32_t> computeExpected(const std::vector<uint32_t> &in) {
-  std::vector<uint32_t> expected(copyLaneCount + copyPadding, copySentinel);
-  for (int32_t i = 0; i < outWords; ++i)
-    expected[i] = i < inWords ? in[i] : 0u;
+static std::vector<uint8_t> makeSentinelBytes(int32_t bytes) {
+  std::vector<uint8_t> sentinel(bytes);
+  for (int32_t i = 0; i < bytes; i += 4)
+    std::memcpy(sentinel.data() + i, &memorySentinel, 4);
+  return sentinel;
+}
+
+// Whether an access at voffset is inside a descriptor of sizeBytes.
+static bool isInRange(const MemoryCase &test, int32_t voffset,
+                      int32_t sizeBytes) {
+  return voffset + test.soffset + test.access.offset < sizeBytes;
+}
+
+using LanePayload = std::array<uint32_t, 4>;
+
+// What each lane holds after loading from in: the bytes read, zero-extended,
+// or zeros when the access is out of range.
+static std::vector<LanePayload> expectedLoads(const MemoryCase &test,
+                                              const WidthSpec &spec,
+                                              const std::vector<uint8_t> &in) {
+  std::vector<LanePayload> loads(memoryLaneCount);
+  for (int32_t lane = 0; lane < memoryLaneCount; ++lane) {
+    int32_t voffset = lane * spec.slot;
+    if (!isInRange(test, voffset, descriptorBytes(spec, test.inSlots)))
+      continue;
+    int32_t address = voffset + test.soffset + test.access.offset;
+    std::memcpy(loads[lane].data(), in.data() + address, spec.bytes);
+  }
+  return loads;
+}
+
+static int32_t mirrorOf(int32_t lane) {
+  return lane - lane % memoryWorkgroupSize + memoryWorkgroupSize - 1 -
+         lane % memoryWorkgroupSize;
+}
+
+// The slot of a lane after the LDS stores: the sentinel with the low bytes of
+// its payload written over it.
+static std::vector<uint8_t> expectedLdsSlot(const WidthSpec &spec,
+                                            const LanePayload &payload) {
+  std::vector<uint8_t> slot = makeSentinelBytes(spec.slot);
+  std::memcpy(slot.data(), payload.data(), spec.bytes);
+  return slot;
+}
+
+static MemoryResults computeExpected(const MemoryCase &test,
+                                     const WidthSpec &spec,
+                                     const std::vector<uint8_t> &in) {
+  std::vector<LanePayload> loads = expectedLoads(test, spec, in);
+  int32_t outBytes = descriptorBytes(spec, test.outSlots);
+  MemoryResults expected{makeSentinelBytes(outBytes + memoryPadding),
+                         makeSentinelBytes(memoryLaneCount * 4),
+                         makeSentinelBytes(memoryLaneCount * spec.slot)};
+  for (int32_t lane = 0; lane < memoryLaneCount; ++lane) {
+    const LanePayload &payload =
+        test.throughLds ? loads[mirrorOf(lane)] : loads[lane];
+    int32_t voffset = lane * spec.slot;
+    if (isInRange(test, voffset, outBytes))
+      std::memcpy(expected.out.data() + voffset + test.soffset +
+                      test.access.offset,
+                  payload.data(), spec.bytes);
+    std::memcpy(expected.first.data() + 4 * lane, payload.data(), 4);
+    if (!test.throughLds)
+      continue;
+    std::vector<uint8_t> slot = expectedLdsSlot(spec, loads[mirrorOf(lane)]);
+    std::memcpy(expected.slots.data() + voffset, slot.data(), spec.slot);
+  }
   return expected;
 }
 
-static std::vector<std::byte> makeKernarg(int32_t segmentSize,
-                                          CopyOffsets offsets, const void *in,
-                                          const void *out) {
+static std::vector<std::byte>
+makeKernarg(int32_t segmentSize, const MemoryOffsets &offsets,
+            const MemoryCase &test, const WidthSpec &spec,
+            const std::vector<DevicePtr> &buffers) {
   std::vector<std::byte> kernarg(segmentSize);
-  writeArgument(kernarg, offsets.in, in);
-  writeArgument(kernarg, offsets.out, out);
+  writeArgument(kernarg, offsets.in, buffers[0].get());
+  writeArgument(kernarg, offsets.out, buffers[1].get());
+  writeArgument(kernarg, offsets.first, buffers[2].get());
+  writeArgument(kernarg, offsets.slots, buffers[3].get());
   writeArgument(kernarg, offsets.inBytes,
-                static_cast<uint32_t>(inWords * sizeof(uint32_t)));
+                static_cast<uint32_t>(descriptorBytes(spec, test.inSlots)));
   writeArgument(kernarg, offsets.outBytes,
-                static_cast<uint32_t>(outWords * sizeof(uint32_t)));
+                static_cast<uint32_t>(descriptorBytes(spec, test.outSlots)));
   return kernarg;
 }
 
-// Uploads the buffers, launches the kernel and downloads out.
-static void runCopy(const std::vector<uint8_t> &hsaco, CopyOffsets offsets,
-                    int32_t segmentSize, const std::vector<uint32_t> &in,
-                    std::vector<uint32_t> &out) {
+// Uploads the buffers, launches the kernel and downloads the outputs.
+static void runMemory(const std::vector<uint8_t> &hsaco,
+                      const MemoryOffsets &offsets, int32_t segmentSize,
+                      const MemoryCase &test, const WidthSpec &spec,
+                      const std::vector<uint8_t> &in, MemoryResults &results) {
   ModulePtr module;
   hipFunction_t function = nullptr;
-  loadKernel(hsaco, copyKernelName, module, function);
-  DevicePtr deviceIn;
-  DevicePtr deviceOut;
-  upload(in, deviceIn);
-  upload(out, deviceOut);
+  loadKernel(hsaco, memoryKernelName, module, function);
+  std::vector<DevicePtr> buffers(4);
+  upload(in, buffers[0]);
+  upload(results.out, buffers[1]);
+  upload(results.first, buffers[2]);
+  upload(results.slots, buffers[3]);
   ASSERT_FALSE(testing::Test::HasFatalFailure());
 
   std::vector<std::byte> kernarg =
-      makeKernarg(segmentSize, offsets, deviceIn.get(), deviceOut.get());
-  launchWithKernarg(function, copyGroupCount, copyWorkgroupSize, kernarg);
+      makeKernarg(segmentSize, offsets, test, spec, buffers);
+  launchWithKernarg(function, memoryGroupCount, memoryWorkgroupSize, kernarg);
   ASSERT_FALSE(testing::Test::HasFatalFailure());
-  download(deviceOut, out);
+  download(buffers[1], results.out);
+  download(buffers[2], results.first);
+  download(buffers[3], results.slots);
 }
 
-static void checkSource(const std::string &assembly, SizeSource source) {
-  expectLinesInOrder(assembly, {"buffer_load_dword", "buffer_store_dword"});
-  EXPECT_EQ(countLinesContaining(assembly, " offen"), 2);
-  if (source == SizeSource::sgpr)
+static void checkAssembly(const std::string &assembly, const MemoryCase &test,
+                          const WidthSpec &spec) {
+  if (test.throughLds)
+    expectLinesInOrder(assembly, {spec.bufferLoad, spec.dsStore, spec.dsLoad,
+                                  spec.bufferStore});
+  else
+    expectLinesInOrder(assembly, {spec.bufferLoad, spec.bufferStore});
+  using CacheBit = std::pair<bool, const char *>;
+  for (const auto &[enabled, bit] :
+       {CacheBit{test.access.sc0, " sc0"}, CacheBit{test.access.sc1, " sc1"},
+        CacheBit{test.access.nt, " nt"}})
+    EXPECT_EQ(enabled, countLinesContaining(assembly, bit) > 0) << bit;
+  if (test.source == SizeSource::sgpr)
     return;
   // The pointers are already in place, so no pointer copy is emitted.
   EXPECT_EQ(countLinesContaining(assembly, "s_mov_b64"), 0);
-  EXPECT_GT(countLinesContaining(assembly, "308"), 0);
-  EXPECT_GT(countLinesContaining(assembly, "404"), 0);
+  EXPECT_GT(countLinesContaining(
+                assembly, std::to_string(descriptorBytes(spec, test.inSlots))),
+            0);
+  EXPECT_GT(countLinesContaining(
+                assembly, std::to_string(descriptorBytes(spec, test.outSlots))),
+            0);
 }
 
-static void runBufferCopyTest(SizeSource source) {
+static void expectBytes(const std::vector<uint8_t> &actual,
+                        const std::vector<uint8_t> &expected,
+                        const char *name) {
+  ASSERT_EQ(actual.size(), expected.size()) << name;
+  for (int32_t i = 0; i < std::ssize(actual); ++i)
+    ASSERT_EQ(actual[i], expected[i]) << name << " byte " << i;
+}
+
+static void runMemoryCase(const MemoryCase &test) {
+  const WidthSpec &spec = specOf(test.width);
   Target target = Target::get("gfx950");
-  Kernel kernel(target, copyKernelName, copyWorkgroupSize);
-  CopyOffsets offsets = declareArguments(kernel.signature());
-  buildCopy(kernel, source, offsets);
+  Kernel kernel(target, memoryKernelName, memoryWorkgroupSize);
+  MemoryOffsets offsets = declareArguments(kernel.signature());
+  buildMemoryKernel(kernel, test, spec, offsets);
   std::string assembly = kernel.toAssembly();
   SCOPED_TRACE("assembly:\n" + assembly);
-  checkSource(assembly, source);
+  checkAssembly(assembly, test, spec);
 
   // Assembling is checked before the device so it runs without a GPU.
   std::vector<uint8_t> hsaco =
@@ -6271,18 +6801,79 @@ static void runBufferCopyTest(SizeSource source) {
   if (!hasHipDevice())
     GTEST_SKIP() << "no HIP device";
 
-  std::vector<uint32_t> in = makeInput();
-  std::vector<uint32_t> expected = computeExpected(in);
-  std::vector<uint32_t> out(copyLaneCount + copyPadding, copySentinel);
-  runCopy(hsaco, offsets, kernel.signature().segmentSize(), in, out);
+  std::vector<uint8_t> in =
+      makeInput(descriptorBytes(spec, test.inSlots) + memoryPadding);
+  MemoryResults expected = computeExpected(test, spec, in);
+  MemoryResults results{makeSentinelBytes(std::ssize(expected.out)),
+                        makeSentinelBytes(std::ssize(expected.first)),
+                        makeSentinelBytes(std::ssize(expected.slots))};
+  runMemory(hsaco, offsets, kernel.signature().segmentSize(), test, spec, in,
+            results);
   if (testing::Test::HasFatalFailure())
     return;
-
-  ASSERT_EQ(out.size(), expected.size());
-  for (int32_t i = 0; i < std::ssize(out); ++i)
-    ASSERT_EQ(out[i], expected[i]) << "word " << i;
+  expectBytes(results.out, expected.out, "out");
+  expectBytes(results.first, expected.first, "first");
+  expectBytes(results.slots, expected.slots, "slots");
 }
 
-TEST(RsrcDevice, SgprSizes) { runBufferCopyTest(SizeSource::sgpr); }
+// Runs the case at every width, stopping at the first failure or skip.
+static void runAllWidths(MemoryCase test) {
+  for (const WidthSpec &spec : widthSpecs) {
+    SCOPED_TRACE(spec.name);
+    test.width = spec.width;
+    runMemoryCase(test);
+    if (testing::Test::HasFailure() || testing::Test::IsSkipped())
+      return;
+  }
+}
 
-TEST(RsrcDevice, ImmediateSizes) { runBufferCopyTest(SizeSource::immediate); }
+TEST(RsrcDevice, SgprSizes) { runMemoryCase({.source = SizeSource::sgpr}); }
+
+TEST(RsrcDevice, ImmediateSizes) {
+  runMemoryCase({.source = SizeSource::immediate});
+}
+
+// The range check covers voffset + soffset + offset, so lanes clip earlier the
+// larger soffset and offset are.
+TEST(MemoryDevice, BufferOutOfBounds) { runAllWidths({}); }
+
+TEST(MemoryDevice, SgprSoffsetOffsetAndAllCacheBits) {
+  runAllWidths(
+      {.soffsetInSgpr = true,
+       .soffset = 32,
+       .access = {.offset = 16, .sc0 = true, .sc1 = true, .nt = true}});
+}
+
+TEST(MemoryDevice, InlineSoffsetIsRangeChecked) {
+  runAllWidths({.soffset = 64, .access = {.offset = 32}});
+}
+
+TEST(MemoryDevice, MaximumOffsetWithEachCacheBit) {
+  // The descriptors cover every access, so only the encoding is under test.
+  MemoryCase test{.inSlots = 2048,
+                  .outSlots = 2048,
+                  .soffset = 64,
+                  .access = {.offset = 4080}};
+  for (bool BufferAccess::*bit :
+       {&BufferAccess::sc0, &BufferAccess::sc1, &BufferAccess::nt}) {
+    test.access.*bit = true;
+    runAllWidths(test);
+    if (testing::Test::HasFailure() || testing::Test::IsSkipped())
+      return;
+    test.access.*bit = false;
+  }
+}
+
+TEST(MemoryDevice, ThroughLds) {
+  for (int32_t dsOffset : {0, 64000}) {
+    SCOPED_TRACE("ds offset " + std::to_string(dsOffset));
+    runAllWidths({.throughLds = true, .dsOffset = dsOffset});
+    if (testing::Test::HasFailure() || testing::Test::IsSkipped())
+      return;
+  }
+}
+
+TEST(MemoryDevice, AgprPayloads) {
+  runAllWidths({.useAgpr = true});
+  runAllWidths({.useAgpr = true, .throughLds = true});
+}

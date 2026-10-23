@@ -10,6 +10,7 @@
 #include "instruction/common.hpp"
 #include "instruction/cvt.hpp"
 #include "instruction/instruction.hpp"
+#include "instruction/mem.hpp"
 
 #include <array>
 #include <bit>
@@ -1588,15 +1589,24 @@ void IRBuilder::selectb64(RegisterRef dst, RegisterRef cond, Operand a,
 
 // Buffer resource.
 
+// Throws std::invalid_argument naming opName unless ref is 4 SGPRs at an index
+// that is a multiple of 4; role is how the message calls ref.
+static void requireRsrcRegister(std::string_view opName, std::string_view role,
+                                RegisterRef ref) {
+  if (ref.kind != RegisterKind::sgpr || ref.count != 4)
+    throw std::invalid_argument(std::string(opName) + " needs a " +
+                                std::string(role) + " of 4 sgprs, got " +
+                                registerText(ref));
+  if (ref.start % 4 != 0)
+    throw std::invalid_argument(
+        std::string(opName) + " " + std::string(role) + " " +
+        registerText(ref) +
+        " must start at an sgpr index that is a multiple of 4");
+}
+
 static void requireRsrcOperands(RegisterRef dst, Operand pointer,
                                 Operand sizeBytes) {
-  if (dst.kind != RegisterKind::sgpr || dst.count != 4)
-    throw std::invalid_argument(
-        "makeRsrc needs a destination of 4 sgprs, got " + registerText(dst));
-  if (dst.start % 4 != 0)
-    throw std::invalid_argument(
-        "makeRsrc destination " + registerText(dst) +
-        " must start at an sgpr index that is a multiple of 4");
+  requireRsrcRegister("makeRsrc", "destination", dst);
 
   std::string prefix = "makeRsrc pointer must be an sgpr ";
   if (pointer.isImmediate())
@@ -1649,4 +1659,157 @@ void IRBuilder::makeRsrc(RegisterRef dst, Operand pointer, Operand sizeBytes) {
     movb32(sizeDst, sizeBytes);
   int32_t upper = rocisa::SrdUpperValue(target().isaVersion())->getValue();
   movb32(upperDst, upper);
+}
+
+// Memory.
+
+namespace {
+
+// How a MemoryWidth maps onto rocisa. The DS mnemonics use the gfx11 spellings
+// of rocisa's own classes, which print as ds_read_* and ds_write_* on gfx9.
+struct MemoryWidthInfo {
+  int32_t registers;
+  rocisa::InstType loadType;
+  rocisa::InstType storeType;
+  const char *dsLoad;
+  const char *dsStore;
+};
+
+} // namespace
+
+static MemoryWidthInfo memoryWidthInfo(MemoryWidth width) {
+  using rocisa::InstType;
+  static constexpr std::array<MemoryWidthInfo, 6> table = {{
+      {1, InstType::INST_U8, InstType::INST_B8, "ds_load_u8", "ds_store_b8"},
+      {1, InstType::INST_U16, InstType::INST_B16, "ds_load_u16",
+       "ds_store_b16"},
+      {1, InstType::INST_B32, InstType::INST_B32, "ds_load_b32",
+       "ds_store_b32"},
+      {2, InstType::INST_B64, InstType::INST_B64, "ds_load_b64",
+       "ds_store_b64"},
+      {3, InstType::INST_B96, InstType::INST_B96, "ds_load_b96",
+       "ds_store_b96"},
+      {4, InstType::INST_B128, InstType::INST_B128, "ds_load_b128",
+       "ds_store_b128"},
+  }};
+  return table[static_cast<size_t>(width)];
+}
+
+static constexpr int32_t maxDsOffset = 65535;
+static constexpr int32_t maxBufferOffset = 4095;
+// The largest non-negative inline integer constant.
+static constexpr int32_t maxSoffsetImmediate = 64;
+
+// Throws std::invalid_argument naming opName unless ref is a VGPR or AGPR
+// group of the width's register count, at an even index if it has 2 or more.
+static void requireMemoryPayload(std::string_view opName, RegisterRef ref,
+                                 MemoryWidth width) {
+  int32_t count = memoryWidthInfo(width).registers;
+  if (ref.kind == RegisterKind::sgpr || ref.count != count)
+    throw std::invalid_argument(
+        std::string(opName) + " needs " + std::to_string(count) +
+        " vgprs or agprs for this width, got " + registerText(ref));
+  if (count >= 2 && ref.start % 2 != 0)
+    throw std::invalid_argument(std::string(opName) + " register " +
+                                registerText(ref) +
+                                " must start at an even index");
+}
+
+static void requireSingleVgpr(std::string_view opName, std::string_view role,
+                              RegisterRef ref) {
+  if (ref.kind == RegisterKind::vgpr && ref.count == 1)
+    return;
+  throw std::invalid_argument(std::string(opName) + " " + std::string(role) +
+                              " must be a single vgpr, got " +
+                              registerText(ref));
+}
+
+static void requireOffset(std::string_view opName, int32_t offset,
+                          int32_t maxOffset) {
+  if (offset >= 0 && offset <= maxOffset)
+    return;
+  throw std::invalid_argument(std::string(opName) + " offset " +
+                              std::to_string(offset) + " is outside 0 to " +
+                              std::to_string(maxOffset));
+}
+
+// Throws std::invalid_argument naming opName unless soffset is a single SGPR or
+// an immediate from 0 to maxSoffsetImmediate.
+static void requireSoffset(std::string_view opName, Operand soffset) {
+  if (soffset.isImmediate() && soffset.immediate() >= 0 &&
+      soffset.immediate() <= maxSoffsetImmediate)
+    return;
+  if (soffset.isRegister(RegisterKind::sgpr) && soffset.reg().count == 1)
+    return;
+  throw std::invalid_argument(
+      std::string(opName) +
+      " soffset must be a single sgpr or an immediate from 0 to " +
+      std::to_string(maxSoffsetImmediate) + ", got " +
+      (soffset.isImmediate() ? std::to_string(soffset.immediate())
+                             : registerText(soffset.reg())));
+}
+
+static void requireDsAccess(std::string_view opName, RegisterRef payload,
+                            RegisterRef address, MemoryWidth width,
+                            int32_t offset) {
+  requireMemoryPayload(opName, payload, width);
+  requireSingleVgpr(opName, "address", address);
+  requireOffset(opName, offset, maxDsOffset);
+}
+
+static void requireBufferAccess(std::string_view opName, RegisterRef payload,
+                                RegisterRef rsrc, RegisterRef voffset,
+                                Operand soffset, MemoryWidth width,
+                                BufferAccess access) {
+  requireMemoryPayload(opName, payload, width);
+  requireRsrcRegister(opName, "resource", rsrc);
+  requireSingleVgpr(opName, "voffset", voffset);
+  requireSoffset(opName, soffset);
+  requireOffset(opName, access.offset, maxBufferOffset);
+}
+
+void IRBuilder::loadDs(RegisterRef dst, RegisterRef address, MemoryWidth width,
+                       int32_t offset) {
+  requireDsAccess("loadDs", dst, address, width, offset);
+  MemoryWidthInfo info = memoryWidthInfo(width);
+  insert(std::make_shared<rocisa::DSLoadInstruction>(
+             info.loadType, dst.container(), address.container(),
+             rocisa::DSModifiers(1, offset)))
+      ->setInst(info.dsLoad);
+}
+
+void IRBuilder::storeDs(RegisterRef address, RegisterRef data,
+                        MemoryWidth width, int32_t offset) {
+  requireDsAccess("storeDs", data, address, width, offset);
+  MemoryWidthInfo info = memoryWidthInfo(width);
+  insert(std::make_shared<rocisa::DSStoreInstruction>(
+             info.storeType, address.container(), data.container(), nullptr,
+             rocisa::DSModifiers(1, offset)))
+      ->setInst(info.dsStore);
+}
+
+static rocisa::MUBUFModifiers bufferModifiers(BufferAccess access,
+                                              bool isStore) {
+  return rocisa::MUBUFModifiers(/*offen=*/true, access.offset, access.sc0,
+                                access.sc1, /*dlc=*/false, access.nt,
+                                /*lds=*/false, isStore);
+}
+
+void IRBuilder::loadBuffer(RegisterRef dst, RegisterRef rsrc,
+                           RegisterRef voffset, Operand soffset,
+                           MemoryWidth width, BufferAccess access) {
+  requireBufferAccess("loadBuffer", dst, rsrc, voffset, soffset, width, access);
+  create<rocisa::MUBUFReadInstruction>(
+      memoryWidthInfo(width).loadType, dst.container(), voffset.container(),
+      rsrc.container(), soffset, bufferModifiers(access, false));
+}
+
+void IRBuilder::storeBuffer(RegisterRef data, RegisterRef rsrc,
+                            RegisterRef voffset, Operand soffset,
+                            MemoryWidth width, BufferAccess access) {
+  requireBufferAccess("storeBuffer", data, rsrc, voffset, soffset, width,
+                      access);
+  create<rocisa::MUBUFStoreInstruction>(
+      memoryWidthInfo(width).storeType, data.container(), voffset.container(),
+      rsrc.container(), soffset, bufferModifiers(access, true));
 }

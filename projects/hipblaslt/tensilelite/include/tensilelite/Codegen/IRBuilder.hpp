@@ -86,6 +86,21 @@ struct WaitCounts {
 /// unsigned values; eq and ne are sign-agnostic.
 enum class Predicate { eq, ne, slt, sle, sgt, sge, ult, ule, ugt, uge };
 
+/// The size of a memory access. b8 and b16 use one register and loads
+/// zero-extend into it; b32 to b128 use one register per dword.
+enum class MemoryWidth { b8, b16, b32, b64, b96, b128 };
+
+/// The encoding controls of a buffer load or store, all off by default.
+struct BufferAccess {
+  /// Unsigned byte offset added to the address, 0 to 4095.
+  int32_t offset = 0;
+  /// The gfx950 cache-policy bits (rocisa's glc, slc and nt). They select the
+  /// cache coherence scope and the non-temporal hint as in the CDNA3 ISA.
+  bool sc0 = false;
+  bool sc1 = false;
+  bool nt = false;
+};
+
 /// Appends rocisa instructions to an insertion point, in the style of LLVM's
 /// IRBuilder.
 ///
@@ -424,6 +439,53 @@ public:
   /// std::invalid_argument, before emitting anything, if an operand has the
   /// wrong kind, width or alignment.
   void makeRsrc(RegisterRef dst, Operand pointer, Operand sizeBytes);
+
+  // Memory.
+  //
+  // The loads and stores below only issue the instruction. Waiting for the
+  // result of a load or the completion of a store is the caller's job, with
+  // createWaitCnt: WaitCounts::lds for DS, WaitCounts::vectorLoads and
+  // vectorStores for buffer.
+  //
+  // dst and data are VGPRs or AGPRs with as many registers as the width needs:
+  // 1 for b8, b16 and b32, 2 for b64, 3 for b96 and 4 for b128. Two or more
+  // registers must start at an even index, the gfx950 tuple rule. b8 and b16
+  // loads zero-extend into the register; b8 and b16 stores write only the low
+  // byte or short.
+  //
+  // Throws std::invalid_argument, before emitting anything, if dst, data,
+  // address, rsrc, voffset or soffset has the wrong kind, count or alignment,
+  // if soffset is an immediate outside 0 to 64, or if an offset is out of
+  // range.
+
+  /// Emits a DS load (ds_read_*) of width from the LDS byte address in address,
+  /// which is one VGPR, plus offset, an unsigned 16-bit immediate (0 to 65535).
+  /// The access must lie inside the kernel's LDS allocation
+  /// (Kernel::setLdsSize). gfx950 has no GDS, so offset is the only DS control.
+  void loadDs(RegisterRef dst, RegisterRef address, MemoryWidth width,
+              int32_t offset = 0);
+  /// Emits a DS store (ds_write_*) of data at address plus offset, with the
+  /// rules of loadDs.
+  void storeDs(RegisterRef address, RegisterRef data, MemoryWidth width,
+               int32_t offset = 0);
+  /// Emits a buffer load (buffer_load_*) of width through the descriptor rsrc,
+  /// which is 4 SGPRs at an index that is a multiple of 4, as makeRsrc writes.
+  /// The byte offset is voffset + soffset + access.offset: voffset is one VGPR
+  /// (there is no form without one, so pass a VGPR holding 0 if needed),
+  /// soffset is one SGPR or an immediate 0 to 64 (it is an unsigned byte
+  /// offset, so a negative value is never valid) and
+  /// access.offset is 0 to 4095, which the builder checks because the
+  /// assembler silently mis-encodes larger values. An access is out of bounds
+  /// when that whole offset, soffset included, is >= the descriptor's
+  /// sizeBytes: loads return 0 and stores are dropped. Accesses that straddle
+  /// the end are not specified, so keep sizes a multiple of the access size.
+  void loadBuffer(RegisterRef dst, RegisterRef rsrc, RegisterRef voffset,
+                  Operand soffset, MemoryWidth width, BufferAccess access = {});
+  /// Emits a buffer store (buffer_store_*) of data, with the rules of
+  /// loadBuffer.
+  void storeBuffer(RegisterRef data, RegisterRef rsrc, RegisterRef voffset,
+                   Operand soffset, MemoryWidth width,
+                   BufferAccess access = {});
 
 private:
   void insertItem(const std::shared_ptr<rocisa::Item> &item);
