@@ -28,6 +28,11 @@ def _generatorOf(customKernel: Dict[str, Any]):
     return generator
 
 
+def validateGeneratorKernel(customKernel: Dict[str, Any]) -> Dict[str, Any]:
+    """Checks a generator block without the code generation module; returns the validated parameters."""
+    return _generatorOf(customKernel).validateParams(customKernel.get("generatorParams"))
+
+
 def getGeneratorKernelConfig(customKernel: Dict[str, Any], internalSupportParams: Dict[str, Any]) -> Dict[str, Any]:
     """Expands a generator block; other keys of the block are replaced by the generator's output."""
     generator = _generatorOf(customKernel)

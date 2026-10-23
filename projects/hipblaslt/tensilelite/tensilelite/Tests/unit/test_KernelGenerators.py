@@ -25,6 +25,7 @@ from Tensile.KernelGenerators import (
     getGeneratorKernelConfig,
     getGeneratorKernelSource,
     isGeneratorKernel,
+    validateGeneratorKernel,
 )
 from Tensile.TensileCreateLibrary import Run
 from Tensile.Toolchain.Assembly import buildAssemblyCodeObjectFiles, makeAssemblyToolchain
@@ -242,6 +243,15 @@ def withParam(key, value):
 def test_invalid_blocks_raise(fakeCodegen, customKernel, message):
     with pytest.raises(ValueError, match=message):
         getGeneratorKernelConfig(customKernel, {})
+
+
+def test_validate_generator_kernel_needs_no_codegen_module(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tensilelite_codegen", None)
+    assert validateGeneratorKernel(block(S1)) == S1
+    with pytest.raises(ValueError, match="upIters must not be negative"):
+        validateGeneratorKernel(withParam("upIters", -1))
+    with pytest.raises(ValueError, match="unknown kernel generator"):
+        validateGeneratorKernel({"generator": "Nope"})
 
 
 def test_binding_errors_name_the_parameters(fakeCodegen):
