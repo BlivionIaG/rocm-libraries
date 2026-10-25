@@ -20,7 +20,7 @@ batch when `seq_len_q/kv` are set).
 
 ### SEM-001: Meaning of `left_bound`
 
-- **Status:** Matches cuDNN (fixed after a team decision; it used to keep one key too many).
+- **Status:** Matches cuDNN (it used to keep one key too many).
 - **cuDNN:** `left_bound = L` keeps `j > i + off - L`, so each row sees **L** keys including the diagonal.
   `set_sliding_window_length(L)` is the same field. `left_bound = 0` would keep no keys and is rejected.
   - Sources: cudnn-frontend `include/cudnn_frontend/utils/attn_score_modifiers.h:207-247` (retain
@@ -34,7 +34,7 @@ batch when `seq_len_q/kv` are set).
     and backward, hip_flash2), and `Gfx1151WmmaAttentionNative.cpp` `maskFor` passes `left_bound - 1` as
     `window_left`. The gfx950 dense pack declines windows.
   - Before the fix every hipDNN component used `j >= i + off - L` (L + 1 keys). It was internally consistent, so no
-    test caught it: see `~/attn-ref-gaps/left-bound-divergence.md`.
+    test caught it. `TestCpuFpReferenceSdpaFp64.LeftBoundCountsTheDiagonalKey` now pins the count.
 - **Other use cases:**
   - FlashAttention, AITER, AOTriton, TransformerEngine and FlashInfer: `window_left = L - 1`.
   - vLLM `sliding_window = W` keeps W keys including self, so it maps to `L = W`.
@@ -77,8 +77,8 @@ batch when `seq_len_q/kv` are set).
 
 - **Status:** Diverges (hipDNN is more permissive).
 - **cuDNN:** rejects `left_bound <= 0` and `right_bound < 0`. A left bound with `s_q > s_kv` needs padding.
-  - Source: survey `~/attn-ref-gaps/04-external-references.md` §3 D3. Re-verify against cudnn-frontend
-    validation before the fix lands.
+  - Source: cudnn-frontend v1.24.0 `include/cudnn_frontend/node/sdpa_support_surface.h:229-232`. The forward
+    check applies only to backends before 9.10; the backward check always applies.
 - **hipDNN today:** accepts any bound `>= -1`, with `-1` meaning unbounded.
 - **Contract:** to be decided together with SEM-001. Under cuDNN's meaning `left_bound = 0` masks every key,
   so it must be rejected.
@@ -189,10 +189,10 @@ batch when `seq_len_q/kv` are set).
 - **hipDNN today:** the CPU reference and the GPU graph plans (dense and ragged) compute P in fp32, so the GPU
   reference is an independent oracle for bf16 as well. Rounding P to bf16 before P@V (what the AITER kernel does) is
   available only as an explicit opt-in emulation mode (`GpuSdpaFwdOptions::probabilityMode` for `GpuFpReferenceSdpa::fprop`,
-  `providerSdpaProbabilityMode`). Decided 2026-10-23 (decision C2).
+  `providerSdpaProbabilityMode`).
 - **Contract:** fp32 P in every reference by default.
 - **Watch:** provider engines checked against the GPU reference in bf16 lose the matching P rounding; the difference
-  is expected inside bf16 tolerances but needs one targeted run on gfx942/gfx950 before push.
+  is expected to stay inside bf16 tolerances.
 
 ### SEM-013: Default scale
 
@@ -231,7 +231,7 @@ batch when `seq_len_q/kv` are set).
   one-element FLOAT scale, optional scale_inv). `dropout_probability` / seed / offset and RNG_DUMP are declined: no
   reference can reproduce a kernel's random stream. Pinned by `TestCpuFpReferenceSdpaGradCheck.ExplicitMaskDropout`
   (mutation: dropping the scale_inv factor fails dQ, dK and dBias).
-- **Philox dropout (decision C3):** validated through RNG_DUMP. A forward graph with `dropout_probability`, seed,
+- **Philox dropout:** validated through RNG_DUMP. A forward graph with `dropout_probability`, seed,
   offset and an `rng_dump` output FLOAT `[B, H_q, Sq, Skv]` is accepted by the CPU and GPU forward references, which
   read the engine's dumped keep mask as the explicit mask with scale `1/(1−p)`. Engines that claim Philox dropout must
   support RNG_DUMP. Without RNG_DUMP the references decline (no exact oracle). The integration harness checks the
@@ -294,9 +294,9 @@ batch when `seq_len_q/kv` are set).
   post-softcap gradient, dQ and dK also take `1 - tanh^2(s / c)`. Pinned by
   `TestCpuFpReferenceSdpaGradCheck.Softcap`, `SoftcapClosedFormAndLargeCapLimit` and
   `TestGpuSdpaSoftcapFp32` (mutations: missing derivative, missing forward cap).
-- **Decided 2026-10-23 (C4):** a first-class attribute will be added, but the schema / frontend / backend / engine
-  plumbing waits for a team discussion. Until then nothing in a graph reaches it. Plumbing checklist and the
-  engine-gating finding (hand-written decline lists ignore new attributes) are in the decisions notes.
+- **Plan:** a first-class attribute will be added; the schema, frontend, backend and engine plumbing is not yet
+  done, so nothing in a graph reaches it. Engines that decline from hand-written attribute lists must add it
+  to those lists when it lands.
 
 ### SEM-021: ALiBi
 
