@@ -15,8 +15,8 @@ The cases are what the dispatcher can select:
 * the default knobs (no tuned table) on the same general keys, and the dense
   keys with dense defaults on gfx942 and gfx950;
 * every unified tuned page tile, in direct and atomic page mode;
-* knob values that are registered but in no shipped table, where one is
-  known to diverge (``_KNOB_CASES``).
+* knob values that are registered but in no shipped table and emit an op
+  no other case does (``_KNOB_CASES``).
 
 Each case lowers every kernel of its plan (prep, main, dq, convert, reduce,
 dense, page_*), once per LLVM flavor in ``GOLDEN_FLAVORS``.
@@ -26,19 +26,14 @@ from __future__ import annotations
 
 import pytest
 
-# Registered knob values outside every shipped table that the C++ engine
-# cannot lower yet: {(arch, knob, value, general table key index): reason}.
-# The key is one where the knob is not inert (on the other keys the plan
-# leaves the op out). Pinned here, not swept, so the gate stays fast.
-# strict=True: when the gap closes the xfail fails, and the entry goes.
-_BUFFER_LOAD_GAP = (
-    "tile.buffer_load has no C++ parser or lowerer (core_types.cpp op table)"
+# Registered knob values outside every shipped table that need an op no
+# shipped case emits (tile.buffer_load): (arch, knob, value, general table key
+# index). The key is one where the knob is not inert (on the other keys the
+# plan leaves the op out). Pinned here, not swept, so the gate stays fast.
+_KNOB_CASES = (
+    ("gfx942", "ws_bounds", "buffer", 1),
+    ("gfx950", "ws_bounds", "buffer", 0),
 )
-_CPP_GAPS = {
-    ("gfx942", "ws_bounds", "buffer", 1): _BUFFER_LOAD_GAP,
-    ("gfx950", "ws_bounds", "buffer", 0): _BUFFER_LOAD_GAP,
-}
-_KNOB_CASES = tuple(_CPP_GAPS)
 
 
 def _flavors():
@@ -153,11 +148,7 @@ def _params():
         return [pytest.param(None, marks=pytest.mark.skip(reason=str(e)))]
     params = []
     for cid, family, arch, recipe in cases:
-        marks = ()
-        if recipe[0] == "knob":
-            reason = _CPP_GAPS[(arch, *recipe[1])]
-            marks = (pytest.mark.xfail(reason=reason, strict=True),)
-        params.append(pytest.param((family, arch, recipe), id=cid, marks=marks))
+        params.append(pytest.param((family, arch, recipe), id=cid))
     return params
 
 

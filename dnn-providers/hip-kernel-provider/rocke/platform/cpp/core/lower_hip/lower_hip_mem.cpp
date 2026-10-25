@@ -1053,6 +1053,54 @@ static rocke_status_t _op_tile_buffer_rsrc(rocke_h_lowerer_t* lw, const rocke_op
 /* ============================== buffer load ============================= */
 
 /* Python _op_tile_buffer_load_f16 */
+/* Python _op_tile_buffer_load: the dtype-generic scalar buffer load. 2-byte
+ * types (f16, bf16) use __builtin_amdgcn_raw_buffer_load_b16, every other
+ * type the _b32 one, then a memcpy into the element type. A missing
+ * elem_type is Python's KeyError; a type with no HIP spelling is refused by
+ * _hip_scalar_type. */
+static rocke_status_t _op_tile_buffer_load(rocke_h_lowerer_t* lw, const rocke_op_t* op)
+{
+    rocke_value_t *rsrc, *voffset, *soffset;
+    const char *elem, *hip_t, *res, *tmp;
+    bool two_byte;
+    if(!rocke_h_live(lw))
+    {
+        return lw->status;
+    }
+    if(op->num_operands < 3 || op->num_results < 1)
+    {
+        return rocke_h_fail(lw, ROCKE_ERR_VALUE, "tile.buffer_load: bad operand/result count");
+    }
+    elem = rocke_attr_get_str(&op->attrs, "elem_type");
+    if(elem == NULL)
+    {
+        return rocke_h_fail(lw, ROCKE_ERR_KEY, "'elem_type'");
+    }
+    hip_t = rocke_h_require_hip_scalar(lw, elem);
+    if(hip_t == NULL)
+    {
+        return lw->status;
+    }
+    rsrc = op->operands[0];
+    voffset = op->operands[1];
+    soffset = op->operands[2];
+    res = rocke_h_name(lw, op->results[0]); /* without leading '%' */
+    tmp = rocke_arena_printf(&lw->b->arena, "_bl_%s", res);
+    two_byte = strcmp(elem, "f16") == 0 || strcmp(elem, "bf16") == 0;
+    rocke_h_emitf(lw,
+                  "%s %s = (%s)__builtin_amdgcn_raw_buffer_load_%s(%s, %s, %s, 0);",
+                  two_byte ? "unsigned short" : "unsigned int",
+                  tmp,
+                  two_byte ? "unsigned short" : "unsigned int",
+                  two_byte ? "b16" : "b32",
+                  rocke_h_name(lw, rsrc),
+                  rocke_h_name(lw, voffset),
+                  rocke_h_name(lw, soffset));
+    rocke_h_emitf(
+        lw, "%s %s; __builtin_memcpy(&%s, &%s, %d);", hip_t, res, res, tmp, two_byte ? 2 : 4);
+    return lw->status;
+}
+
 static rocke_status_t _op_tile_buffer_load_f16(rocke_h_lowerer_t* lw, const rocke_op_t* op)
 {
     rocke_value_t *rsrc, *voffset, *soffset;
@@ -1717,6 +1765,7 @@ const rocke_h_handler_entry_t* rocke_h_handlers_mem(void)
            {ROCKE_OP_TILE_GLOBAL_PTR_ADD, _op_tile_global_ptr_add},
            {ROCKE_OP_TILE_BUFFER_RSRC, _op_tile_buffer_rsrc},
            /* buffer load/store */
+           {ROCKE_OP_TILE_BUFFER_LOAD, _op_tile_buffer_load},
            {ROCKE_OP_TILE_BUFFER_LOAD_F16, _op_tile_buffer_load_f16},
            {ROCKE_OP_TILE_BUFFER_LOAD_VN_F16, _op_tile_buffer_load_vN_f16},
            {ROCKE_OP_TILE_BUFFER_LOAD_VN, _op_tile_buffer_load_vN},

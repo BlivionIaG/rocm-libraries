@@ -475,6 +475,10 @@ typedef enum rocke_opcode
     /* arith.fdot2 (appended: keeps every earlier opcode value stable) */
     ROCKE_OP_ARITH_FDOT2,
 
+    /* tile.buffer_load: dtype-generic scalar buffer load (appended: keeps every
+     * earlier opcode value stable) */
+    ROCKE_OP_TILE_BUFFER_LOAD,
+
     ROCKE_OP__COUNT
 } rocke_opcode_t;
 
@@ -1549,6 +1553,13 @@ rocke_value_t* rocke_b_buffer_load_vN(rocke_ir_builder_t* b,
                                       rocke_value_t* soffset,
                                       const rocke_type_t* dtype,
                                       int n);
+/* Dtype-generic scalar buffer load (Python IRBuilder.buffer_load): one
+ * f16/bf16/f32/i32 element; out-of-range offsets read zero. */
+rocke_value_t* rocke_b_buffer_load(rocke_ir_builder_t* b,
+                                   rocke_value_t* rsrc,
+                                   rocke_value_t* voffset,
+                                   rocke_value_t* soffset,
+                                   const rocke_type_t* dtype);
 rocke_value_t* rocke_b_buffer_load_f16(rocke_ir_builder_t* b,
                                        rocke_value_t* rsrc,
                                        rocke_value_t* voffset,

@@ -1238,6 +1238,31 @@ rocke_value_t* rocke_b_buffer_load_vN(rocke_ir_builder_t* b,
         b, ROCKE_OP_TILE_BUFFER_LOAD_VN, ops, 3, rocke_vector_type(b, dtype, n), &attrs, hint);
 }
 
+/* Python IRBuilder.buffer_load: dtype-generic scalar buffer load. */
+rocke_value_t* rocke_b_buffer_load(rocke_ir_builder_t* b,
+                                   rocke_value_t* rsrc,
+                                   rocke_value_t* voffset,
+                                   rocke_value_t* soffset,
+                                   const rocke_type_t* dtype)
+{
+    rocke_value_t* ops[3];
+    rocke_attr_map_t attrs;
+    if(!rocke_i_live(b))
+        return NULL;
+    if(!rsrc || !voffset || !soffset || !dtype)
+        return (rocke_value_t*)rocke_i_set_err(b, ROCKE_ERR_VALUE, "buffer_load: NULL operand");
+    if(!(dtype == rocke_f16() || dtype == rocke_bf16() || dtype == rocke_f32()
+         || dtype == rocke_i32()))
+        return (rocke_value_t*)rocke_i_set_err(
+            b, ROCKE_ERR_VALUE, "buffer_load: unsupported dtype '%s'", dtype->name);
+    attrs = rocke_i_attrs(b);
+    rocke_attr_set_str(b, &attrs, "elem_type", dtype->name);
+    ops[0] = rsrc;
+    ops[1] = voffset;
+    ops[2] = soffset;
+    return rocke_i_op1(b, ROCKE_OP_TILE_BUFFER_LOAD, ops, 3, dtype, &attrs, "bl1");
+}
+
 rocke_value_t* rocke_b_buffer_load_f16(rocke_ir_builder_t* b,
                                        rocke_value_t* rsrc,
                                        rocke_value_t* voffset,
