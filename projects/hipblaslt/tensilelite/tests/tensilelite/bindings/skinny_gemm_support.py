@@ -969,25 +969,51 @@ def expectedD(p: Problem, inputs: Inputs) -> np.ndarray:
     return (fused + scaled.astype(np.float64)).astype(np.float32)
 
 
-# Kernels are emitted and loaded once per session, by name and code object
-# version; the modules stay loaded until the process exits.
-_kernelCache: dict[tuple[str, int], LoadedKernel] = {}
+# Kernels are emitted and loaded once per session, by name, code object version
+# and kernarg preload size; the modules stay loaded until the process exits.
+_kernelCache: dict[tuple[str, int, int], LoadedKernel] = {}
 
 
-def gemmAsm(p: Problem, codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION) -> str:
+def gemmAsm(
+    p: Problem,
+    codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION,
+    maxPreloadDwords: int = 0,
+) -> str:
     """The assembly text of the problem's GEMM kernel."""
     import tensilelite_codegen
 
     return tensilelite_codegen.emitSkinnyGEMM(
-        skinnyConfig(p), ARCH, codeObjectVersion
+        skinnyConfig(p), ARCH, codeObjectVersion, maxPreloadDwords
     )
 
 
-def reduceAsm(codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION) -> str:
+def reduceAsm(
+    codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION, maxPreloadDwords: int = 0
+) -> str:
     """The assembly text of the splitk_reduce kernel."""
     import tensilelite_codegen
 
-    return tensilelite_codegen.emitSplitKReduce(ARCH, codeObjectVersion)
+    return tensilelite_codegen.emitSplitKReduce(
+        ARCH, codeObjectVersion, maxPreloadDwords
+    )
+
+
+PRELOAD_DIRECTIVES = (
+    ".amdhsa_user_sgpr_kernarg_preload_length",
+    ".amdhsa_user_sgpr_kernarg_preload_offset",
+)
+
+
+def stripPreloadDirectives(asm: str) -> str:
+    """The assembly without the kernarg preload directives, so that the
+    hardware does not preload and the kernel reads its arguments from memory,
+    which a preloading kernel must support (the registers are then unset)."""
+    lines = asm.splitlines(keepends=True)
+    return "".join(
+        line
+        for line in lines
+        if not any(directive in line for directive in PRELOAD_DIRECTIVES)
+    )
 
 
 def assemble(asm: str) -> bytes:
@@ -1013,24 +1039,26 @@ def hasHiddenArgs(source: str | bytes) -> bool:
 
 
 def gemmKernel(
-    p: Problem, codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION
+    p: Problem,
+    codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION,
+    maxPreloadDwords: int = 0,
 ) -> LoadedKernel:
     """The loaded GEMM kernel of the problem's configuration."""
     name = gemmKernelName(p)
-    key = (name, codeObjectVersion)
+    key = (name, codeObjectVersion, maxPreloadDwords)
     if key not in _kernelCache:
-        hsaco = assemble(gemmAsm(p, codeObjectVersion))
+        hsaco = assemble(gemmAsm(p, codeObjectVersion, maxPreloadDwords))
         _kernelCache[key] = LoadedKernel(hsaco, name)
     return _kernelCache[key]
 
 
 def reduceKernel(
-    codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION,
+    codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION, maxPreloadDwords: int = 0
 ) -> LoadedKernel:
     """The loaded splitk_reduce kernel."""
-    key = (REDUCE_KERNEL_NAME, codeObjectVersion)
+    key = (REDUCE_KERNEL_NAME, codeObjectVersion, maxPreloadDwords)
     if key not in _kernelCache:
-        hsaco = assemble(reduceAsm(codeObjectVersion))
+        hsaco = assemble(reduceAsm(codeObjectVersion, maxPreloadDwords))
         _kernelCache[key] = LoadedKernel(hsaco, REDUCE_KERNEL_NAME)
     return _kernelCache[key]
 
@@ -1097,13 +1125,17 @@ def executeProblem(
     verifyFn=None,
     aliasC: bool = False,
     codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION,
+    maxPreloadDwords: int = 0,
+    asmTransform=None,
 ) -> np.ndarray:
     """Launches the GEMM (and the split-K reduction) iters times each, which must
     be idempotent, checks the results against the reference unless the inputs
     carry none, and returns the D bits. verifyFn(inputs, (dBits, ws)) replaces
     the GEMM check. With aliasC, C and D share one buffer that starts as C
     (ldC == ldD), and a single iteration is allowed since the reduce overwrites
-    C. The kernels are emitted for codeObjectVersion."""
+    C. The kernels are emitted for codeObjectVersion and maxPreloadDwords; with
+    asmTransform their assembly text goes through it (uncached) before being
+    assembled."""
     dBits, ws = makeOutputs(p.m, p.n, p.ldD, p.splits)
     if aliasC:
         assert p.ldC == p.ldD and iters == 1, "aliasing needs ldC == ldD, 1 iter"
@@ -1114,7 +1146,18 @@ def executeProblem(
             stack.enter_context(DeviceBuffer(array)) for array in arrays
         )
         cBuf = dBuf if aliasC else stack.enter_context(DeviceBuffer(inputs.cBits))
-        kernel = gemmKernel(p, codeObjectVersion)
+        kernel = (
+            gemmKernel(p, codeObjectVersion, maxPreloadDwords)
+            if asmTransform is None
+            else stack.enter_context(
+                loadKernel(
+                    assemble(
+                        asmTransform(gemmAsm(p, codeObjectVersion, maxPreloadDwords))
+                    ),
+                    gemmKernelName(p),
+                )
+            )
+        )
         for _ in range(iters):
             launchGemm(p, kernel, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf)
         dBuf.download(dBits)
@@ -1124,7 +1167,18 @@ def executeProblem(
         elif inputs.expected is not None:
             verifyGemm(p, inputs, dBits, ws)
         if p.splits > 1:
-            reducer = reduceKernel(codeObjectVersion)
+            reducer = (
+                reduceKernel(codeObjectVersion, maxPreloadDwords)
+                if asmTransform is None
+                else stack.enter_context(
+                    loadKernel(
+                        assemble(
+                            asmTransform(reduceAsm(codeObjectVersion, maxPreloadDwords))
+                        ),
+                        REDUCE_KERNEL_NAME,
+                    )
+                )
+            )
             for _ in range(iters):
                 launchReduce(
                     reducer,
@@ -1151,10 +1205,18 @@ def runProblem(
     seed: int = 42,
     verifyFn=None,
     codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION,
+    maxPreloadDwords: int = 0,
+    asmTransform=None,
 ) -> None:
     """Runs and verifies the problem on random inputs."""
     executeProblem(
-        p, makeInputs(p, seed), iters, verifyFn, codeObjectVersion=codeObjectVersion
+        p,
+        makeInputs(p, seed),
+        iters,
+        verifyFn,
+        codeObjectVersion=codeObjectVersion,
+        maxPreloadDwords=maxPreloadDwords,
+        asmTransform=asmTransform,
     )
 
 

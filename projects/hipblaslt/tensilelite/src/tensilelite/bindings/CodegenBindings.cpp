@@ -19,8 +19,12 @@ using namespace rocm::tensilelite::codegen;
 
 // The version is an int because the JIT module already registers the
 // CodeObjectVersion enum.
-static KernelAbi makeAbi(int32_t codeObjectVersion) {
+static KernelAbi makeAbi(int32_t codeObjectVersion, int32_t maxPreloadDwords) {
+  if (maxPreloadDwords < 0)
+    throw std::invalid_argument("maxPreloadDwords must be non-negative, got " +
+                                std::to_string(maxPreloadDwords));
   KernelAbi abi;
+  abi.maxPreloadDwords = maxPreloadDwords;
   switch (codeObjectVersion) {
   case 4:
     abi.codeObjectVersion = CodeObjectVersion::v4;
@@ -88,11 +92,12 @@ NB_MODULE(tensilelite_codegen, m) {
   m.def(
       "emitSkinnyGEMM",
       [](const SkinnyGEMMConfig &config, const std::string &arch,
-         int32_t codeObjectVersion) {
+         int32_t codeObjectVersion, int32_t maxPreloadDwords) {
         return emitSkinnyGEMM(Target::get(arch), config,
-                              makeAbi(codeObjectVersion));
+                              makeAbi(codeObjectVersion, maxPreloadDwords));
       },
       "config"_a, "arch"_a = "gfx950", "codeObjectVersion"_a = 6,
+      "maxPreloadDwords"_a = 0,
       "Returns the assembly text of the GEMM kernel for config, for the 3-D "
       "launch (grid3d, group = 1, numXcds = 1) with any upIters and "
       "partialSteps. Raises ValueError for invalid knobs, an unsupported arch, "
@@ -100,18 +105,25 @@ NB_MODULE(tensilelite_codegen, m) {
       "the message names the knob) and a configuration that exceeds the "
       "register budget. codeObjectVersion (4, 5 or 6) selects the directives "
       "and the metadata, and raises ValueError for another value; the kernargs "
-      "are the same at every version.");
+      "are the same at every version. maxPreloadDwords (default 0, no "
+      "preloading) preloads the leading kernarg pointers into SGPRs, at most "
+      "that many dwords and 14 on the supported targets, and raises ValueError "
+      "if negative or if the arch does not support kernarg preloading.");
 
   m.def(
       "emitSplitKReduce",
-      [](const std::string &arch, int32_t codeObjectVersion) {
-        return emitSplitKReduce(Target::get(arch), makeAbi(codeObjectVersion));
+      [](const std::string &arch, int32_t codeObjectVersion,
+         int32_t maxPreloadDwords) {
+        return emitSplitKReduce(Target::get(arch),
+                                makeAbi(codeObjectVersion, maxPreloadDwords));
       },
-      "arch"_a = "gfx950", "codeObjectVersion"_a = 6,
+      "arch"_a = "gfx950", "codeObjectVersion"_a = 6, "maxPreloadDwords"_a = 0,
       "Returns the assembly text of the splitk_reduce kernel: D[i, j] is the "
       "bf16 truncation of fma(beta, C[j * ldC + i], alpha * sum), with sum the "
       "f32 sum over the splits of ws[z * m * n + j * m + i]; C is read only "
       "when beta is not zero. Block (256, 1, 1), grid (ceil(m / 256), n, 1). "
       "codeObjectVersion (4, 5 or 6) selects the directives and the metadata. "
-      "Raises ValueError for an unsupported arch or code object version.");
+      "maxPreloadDwords (default 0) preloads the kernel arguments into SGPRs. "
+      "Raises ValueError for an unsupported arch, code object version or "
+      "maxPreloadDwords.");
 }

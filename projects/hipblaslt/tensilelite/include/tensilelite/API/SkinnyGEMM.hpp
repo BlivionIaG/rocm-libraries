@@ -56,8 +56,12 @@ std::string skinnyGEMMKernelName(const SkinnyGEMMConfig &config);
 /// numWorkGroupsZ (104), the grid dimensions that the host (or the launcher)
 /// fills with the launched workgroup counts, for a segment size of 112. There
 /// are no hidden arguments at any code object version. abi selects the code
-/// object version (v4, v5 or v6) of the directives and the metadata;
-/// maxPreloadDwords is not honoured yet. The block is (64 * waves, 1, 1).
+/// object version (v4, v5 or v6) of the directives and the metadata, and
+/// maxPreloadDwords, which preloads the leading pointers into SGPRs (the first
+/// 14 dwords are D, A, B, scalesA, scalesB, ws and C): each is copied into its
+/// resource and its register released right after, so the registers are
+/// reusable, and with 0 the emitted kernel is unchanged. The block is
+/// (64 * waves, 1, 1).
 /// BN = waves * (64 / lanesK) * tn. Both values of useBeta share this ABI.
 ///
 /// With several splits (k > spk) the kernel stores each split's raw f32 slice
@@ -111,7 +115,9 @@ std::string emitSkinnyGEMM(const codegen::Target &target,
 /// (40), then the f32 alpha (44) and beta (48), for a segment size of 56 (the
 /// 52 bytes of arguments rounded up to 8). It has no hidden arguments and needs
 /// no workgroup counts. The block is (256, 1, 1) and the grid is (ceil(m /
-/// 256), n, 1); splits must be at least 1. The abi is as for emitSkinnyGEMM.
+/// 256), n, 1); splits must be at least 1. The abi is as for emitSkinnyGEMM,
+/// and so is the preloading; its 13 dwords of arguments all fit in 14, and
+/// only the pointers are released after their copy.
 std::string emitSplitKReduce(const codegen::Target &target,
                              const codegen::KernelAbi &abi = {});
 

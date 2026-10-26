@@ -2785,15 +2785,25 @@ def test_code_object_version_cases_cover_both_launches():
     assert 1 < persistent.blocks < tiles
 
 
+# 0 is no preloading; 14 is the whole preload window of the targets, which
+# holds the 7 pointers of the GEMM and the 13 dwords of the reduce arguments.
+PRELOAD_DWORDS = [0, 14]
+
+
+@pytest.mark.parametrize("maxPreloadDwords", PRELOAD_DWORDS)
 @pytest.mark.parametrize("codeObjectVersion", support.CODE_OBJECT_VERSIONS)
 @pytest.mark.parametrize("name", CODE_OBJECT_VERSION_CASES)
-def test_gemm_mxfp8_skinny_code_object_versions_run(name, codeObjectVersion):
-    """The GEMM (and the split-K reduce) built for the code object version
-    matches the reference."""
+def test_gemm_mxfp8_skinny_code_object_versions_run(
+    name, codeObjectVersion, maxPreloadDwords
+):
+    """The GEMM (and the split-K reduce) built for the code object version and
+    the kernarg preload size matches the reference."""
     p = codeObjectVersionProblem(name)
     skipUnlessRunnable(p)
     try:
-        support.runProblem(p, 3, codeObjectVersion=codeObjectVersion)
+        support.runProblem(
+            p, 3, codeObjectVersion=codeObjectVersion, maxPreloadDwords=maxPreloadDwords
+        )
     except ValueError as err:
         if p.use_beta and "register budget" in str(err):
             pytest.skip(str(err))
@@ -2830,3 +2840,47 @@ def test_code_object_version_must_be_4_5_or_6():
         codegen.emitSplitKReduce("gfx950", 3)
     with pytest.raises(ValueError, match="codeObjectVersion must be 4, 5 or 6, got 7"):
         codegen.emitSkinnyGEMM(codegen.SkinnyGEMMConfig(), "gfx950", 7)
+
+
+PRELOAD_LENGTH = ".amdhsa_user_sgpr_kernarg_preload_length"
+
+
+@pytest.mark.parametrize("name", CODE_OBJECT_VERSION_CASES)
+def test_max_preload_dwords_emits_the_preload_directive(name):
+    p = codeObjectVersionProblem(name)
+    for preload in (0, 14):
+        asms = [support.gemmAsm(p, 6, preload)]
+        if p.splits > 1:
+            asms.append(support.reduceAsm(6, preload))
+        assert all((PRELOAD_LENGTH in asm) == (preload > 0) for asm in asms)
+
+
+def test_max_preload_dwords_must_not_be_negative():
+    with pytest.raises(ValueError, match="maxPreloadDwords must be non-negative"):
+        codegen.emitSkinnyGEMM(codegen.SkinnyGEMMConfig(), "gfx950", 6, -1)
+    with pytest.raises(ValueError, match="maxPreloadDwords must be non-negative"):
+        codegen.emitSplitKReduce("gfx950", 6, -1)
+
+
+def test_strip_preload_directives_removes_only_the_two_directives():
+    asm = "a\n  .amdhsa_user_sgpr_kernarg_preload_length 14\nb\n"
+    asm += ".amdhsa_user_sgpr_kernarg_preload_offset 0\nc\n"
+    assert support.stripPreloadDirectives(asm) == "a\nb\nc\n"
+
+
+# Without the directives the hardware preloads nothing, so the kernel must
+# fetch its arguments itself, which the preloading kernels support.
+@pytest.mark.parametrize("name", ["grid3d", "persistent_beta", "grid3d_split_k"])
+def test_gemm_mxfp8_skinny_preload_kernel_runs_without_preload(name):
+    p = codeObjectVersionProblem(name)
+    skipUnlessRunnable(p)
+    asm = support.gemmAsm(p, 6, 14)
+    assert PRELOAD_LENGTH in asm
+    assert PRELOAD_LENGTH not in support.stripPreloadDirectives(asm)
+    support.runProblem(
+        p,
+        3,
+        codeObjectVersion=6,
+        maxPreloadDwords=14,
+        asmTransform=support.stripPreloadDirectives,
+    )

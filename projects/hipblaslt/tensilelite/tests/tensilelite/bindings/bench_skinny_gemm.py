@@ -220,25 +220,37 @@ def loadAsmKernel(stack: ExitStack, pattern: str, name: str) -> LoadedKernel:
 
 
 def gemmKernelFor(
-    stack: ExitStack, p: Problem, asmDir: str | None, codeObjectVersion: int
+    stack: ExitStack,
+    p: Problem,
+    asmDir: str | None,
+    codeObjectVersion: int,
+    maxPreloadDwords: int,
 ) -> LoadedKernel:
     if asmDir is None:
-        return support.gemmKernel(p, codeObjectVersion)
+        return support.gemmKernel(p, codeObjectVersion, maxPreloadDwords)
     name = support.gemmKernelName(p)
     return loadAsmKernel(stack, f"{asmDir}/{name}_*/kernel.s", name)
 
 
 def reduceKernelFor(
-    stack: ExitStack, asmDir: str | None, codeObjectVersion: int
+    stack: ExitStack,
+    asmDir: str | None,
+    codeObjectVersion: int,
+    maxPreloadDwords: int,
 ) -> LoadedKernel:
     if asmDir is None:
-        return support.reduceKernel(codeObjectVersion)
+        return support.reduceKernel(codeObjectVersion, maxPreloadDwords)
     name = support.REDUCE_KERNEL_NAME
     return loadAsmKernel(stack, f"{asmDir}/{name}_*/kernel.s", name)
 
 
 def benchProblem(
-    p: Problem, iters: int, verify: bool, asmDir: str | None, codeObjectVersion: int
+    p: Problem,
+    iters: int,
+    verify: bool,
+    asmDir: str | None,
+    codeObjectVersion: int,
+    maxPreloadDwords: int,
 ) -> tuple[list[int], list[int] | None]:
     """Times the GEMM (cold LLC) and, for split-K, the reduce (warm) in ns per
     iteration; with verify the results are checked against the host reference."""
@@ -258,7 +270,9 @@ def benchProblem(
         dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf = (
             stack.enter_context(DeviceBuffer(array)) for array in arrays
         )
-        kernel = gemmKernelFor(stack, p, asmDir, codeObjectVersion)
+        kernel = gemmKernelFor(
+            stack, p, asmDir, codeObjectVersion, maxPreloadDwords
+        )
         flush = stack.enter_context(LlcFlush())
         args = support.gemmArgs(p, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf)
         gemmTimes = timeLaunches(
@@ -269,7 +283,9 @@ def benchProblem(
             wsBuf.download(ws)
             support.verifyGemm(p, inputs, dBits, ws)
         if p.splits > 1:
-            reducer = reduceKernelFor(stack, asmDir, codeObjectVersion)
+            reducer = reduceKernelFor(
+                stack, asmDir, codeObjectVersion, maxPreloadDwords
+            )
             grid, block = support.reduceLaunchDims(p.m, p.n)
             args = support.reduceArgs(
                 dBuf, wsBuf, cBuf, p.ldD, p.m, p.n, p.splits, p.ldC, p.alpha, p.beta
@@ -312,14 +328,14 @@ def formatSweepLine(p: Problem, gemmTimes, reduceTimes) -> str:
     return "SWEEP " + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
-def printAsm(p: Problem, codeObjectVersion: int) -> None:
+def printAsm(p: Problem, codeObjectVersion: int, maxPreloadDwords: int) -> None:
     """Prints the emitted GEMM kernel's .s, and the split-K reduce's if the
     problem splits K, straight from the emitter (no assembling or GPU)."""
     print(f"# ASM {p.label}", flush=True)
-    print(support.gemmAsm(p, codeObjectVersion))
+    print(support.gemmAsm(p, codeObjectVersion, maxPreloadDwords))
     if p.splits > 1:
         print(f"# ASM {support.REDUCE_KERNEL_NAME}", flush=True)
-        print(support.reduceAsm(codeObjectVersion))
+        print(support.reduceAsm(codeObjectVersion, maxPreloadDwords))
 
 
 def sweepShape(
@@ -332,6 +348,7 @@ def sweepShape(
     asmDir,
     printOnly: bool,
     codeObjectVersion: int,
+    maxPreloadDwords: int,
 ) -> None:
     """Runs one shape and prints its SWEEP line, or with printOnly its emitted
     asm instead of benchmarking it; a shape that violates the constraints with
@@ -341,10 +358,10 @@ def sweepShape(
     try:
         p = support.makeProblem(m, n, k, padding=(0, 0, 0), **knobs)
         if printOnly:
-            printAsm(p, codeObjectVersion)
+            printAsm(p, codeObjectVersion, maxPreloadDwords)
             return
         gemmTimes, reduceTimes = benchProblem(
-            p, iters, verify, asmDir, codeObjectVersion
+            p, iters, verify, asmDir, codeObjectVersion, maxPreloadDwords
         )
     except (AssertionError, MissingAsm) as err:
         reason = str(err).splitlines()[0]
@@ -404,6 +421,12 @@ def makeParser() -> argparse.ArgumentParser:
         choices=support.CODE_OBJECT_VERSIONS,
         default=support.DEFAULT_CODE_OBJECT_VERSION,
         help="Code object version the kernels are emitted for",
+    )
+    parser.add_argument(
+        "--max-preload-dwords",
+        type=int,
+        default=0,
+        help="Kernarg dwords the kernels preload into SGPRs (0 disables it)",
     )
     parser.add_argument("--alpha", type=float, default=1.0, help="Scale of A * B")
     parser.add_argument("--beta", type=float, default=0.0, help="Scale of C")
@@ -469,6 +492,7 @@ def main() -> None:
             args.asm_dir,
             args.print_asm,
             args.code_object_version,
+            args.max_preload_dwords,
         )
         return
     if not args.print_asm:
@@ -488,6 +512,7 @@ def main() -> None:
             args.asm_dir,
             args.print_asm,
             args.code_object_version,
+            args.max_preload_dwords,
         )
 
 

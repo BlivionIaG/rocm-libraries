@@ -481,6 +481,13 @@ static constexpr int32_t outOfRange = -1;
 
 static bool isScalar(RegisterRef ref) { return ref.kind == RegisterKind::sgpr; }
 
+// Every pointer is copied once into a longer-lived resource, so a preloaded
+// range is dead right after the copy.
+static void loadPointer(Kernel &kernel, RegisterRef dst, int32_t offset) {
+  kernel.loadArgument(dst, offset);
+  kernel.releasePreloadedArgument(offset);
+}
+
 // Returns whether value is a positive power of two.
 static bool isPowerOfTwo(int32_t value) {
   return value > 0 && (value & (value - 1)) == 0;
@@ -719,16 +726,19 @@ void SkinnyGEMMEmitter::setupResources(SetupScalars &scalars) {
   kernel.loadArgument(resources.ldB.ref(), arguments.ldB);
   kernel.loadArgument(resources.ldA.ref(), arguments.ldA);
   kernel.loadArgument(resources.ldD.ref(), arguments.ldD);
-  kernel.loadArgument(wsRsrc.ref(0, 2), arguments.ws);
-  kernel.loadArgument(resources.sclBPtr.ref(), arguments.scalesB);
-  kernel.loadArgument(resources.sclAPtr.ref(), arguments.scalesA);
-  kernel.loadArgument(resources.bPtr.ref(), arguments.b);
-  kernel.loadArgument(resources.aPtr.ref(), arguments.a);
-  kernel.loadArgument(dRsrc.ref(0, 2), arguments.d);
+  loadPointer(kernel, wsRsrc.ref(0, 2), arguments.ws);
+  loadPointer(kernel, resources.sclBPtr.ref(), arguments.scalesB);
+  loadPointer(kernel, resources.sclAPtr.ref(), arguments.scalesA);
+  loadPointer(kernel, resources.bPtr.ref(), arguments.b);
+  loadPointer(kernel, resources.aPtr.ref(), arguments.a);
+  loadPointer(kernel, dRsrc.ref(0, 2), arguments.d);
   if (dims.useBeta) {
     kernel.loadArgument(beta->ref(), arguments.beta);
     kernel.loadArgument(resources.ldC->ref(), arguments.ldC);
-    kernel.loadArgument(cRsrc->ref(0, 2), arguments.c);
+    loadPointer(kernel, cRsrc->ref(0, 2), arguments.c);
+  } else {
+    // C is in the ABI but never read, so its preloaded range is not held.
+    kernel.releasePreloadedArgument(arguments.c);
   }
   // Scalar loads return out of order, so only lgkmcnt(0) guarantees any of
   // them.
@@ -3280,9 +3290,9 @@ public:
     kernel.loadArgument(ldC.ref(), offsets.ldC);
     kernel.loadArgument(alpha.ref(), offsets.alpha);
     kernel.loadArgument(beta.ref(), offsets.beta);
-    kernel.loadArgument(wsRsrc.ref(0, 2), offsets.ws);
-    kernel.loadArgument(dRsrc.ref(0, 2), offsets.d);
-    kernel.loadArgument(cRsrc.ref(0, 2), offsets.c);
+    loadPointer(kernel, wsRsrc.ref(0, 2), offsets.ws);
+    loadPointer(kernel, dRsrc.ref(0, 2), offsets.d);
+    loadPointer(kernel, cRsrc.ref(0, 2), offsets.c);
     computeRows();
     makeResources();
     sumSplits();

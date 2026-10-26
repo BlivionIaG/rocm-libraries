@@ -1388,3 +1388,37 @@ TEST(SplitKReduce, KernargsAreTheSameAtEveryCodeObjectVersion) {
     EXPECT_EQ(assembly.find("hidden_"), std::string::npos);
   }
 }
+
+static constexpr const char *preloadDirective =
+    ".amdhsa_user_sgpr_kernarg_preload_length";
+
+static KernelAbi preloadAbi(int32_t maxPreloadDwords) {
+  KernelAbi abi;
+  abi.maxPreloadDwords = maxPreloadDwords;
+  return abi;
+}
+
+// The GEMM preloads its pointers on request, with and without beta, and the
+// default emits no preload directive.
+TEST(SkinnyGEMM, MaxPreloadDwordsPreloadsThePointers) {
+  for (bool useBeta : {false, true}) {
+    SkinnyGEMMConfig gemm = config(1, 1, 16, 2, 1);
+    gemm.useBeta = useBeta;
+    std::string plain = emitted(gemm);
+    std::string preloaded =
+        emitSkinnyGEMM(Target::get("gfx950"), gemm, preloadAbi(14));
+    SCOPED_TRACE("useBeta " + std::to_string(useBeta));
+    EXPECT_EQ(plain.find(preloadDirective), std::string::npos);
+    EXPECT_NE(preloaded.find(preloadDirective), std::string::npos);
+    EXPECT_NE(plain, preloaded);
+  }
+}
+
+TEST(SplitKReduce, MaxPreloadDwordsPreloadsTheArguments) {
+  std::string plain = emitSplitKReduce(Target::get("gfx950"));
+  std::string preloaded =
+      emitSplitKReduce(Target::get("gfx950"), preloadAbi(14));
+  EXPECT_EQ(plain.find(preloadDirective), std::string::npos);
+  EXPECT_NE(preloaded.find(preloadDirective), std::string::npos);
+  EXPECT_NE(plain, preloaded);
+}

@@ -48,9 +48,9 @@ int32_t Target::maxUserSgprs() const {
 }
 
 bool Target::supportsKernargPreload() const {
-  // rocisa has no cap for this; the assembler accepts the preload directives
-  // from gfx90a (9.0.10) on.
-  return isa >= IsaVersion{9, 0, 10};
+  // rocisa has no cap for this; the preload directives exist on gfx90a (9.0.10)
+  // and the later gfx9 targets, but not on gfx10 and gfx11.
+  return isa[0] == 9 && isa >= IsaVersion{9, 0, 10};
 }
 
 void Target::selectForCurrentThread() const {
