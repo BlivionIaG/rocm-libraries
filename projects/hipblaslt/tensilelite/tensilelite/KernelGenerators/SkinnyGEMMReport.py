@@ -37,7 +37,7 @@ def render_rows(routes: Sequence[Route], description: str) -> str:
     lines = [*LICENSE_LINES, description]
     for route in routes:
         lines += [f"- range: {SkinnyGEMMLogic.flow_list(route.key)}",
-                  f"  params: {SkinnyGEMMLogic.render_params(route.knobs)}"]
+                  f"  params: {SkinnyGEMMLogic.render_routing_params(route.knobs)}"]
     return "\n".join(lines) + "\n"
 
 
@@ -74,7 +74,7 @@ def csv_text(table: Table) -> str:
 
 
 def knobs_label(knobs: Knobs) -> str:
-    bm, tn, lanesK, waves, prefetch, upIters, partialSteps, group, numXcds, grid3d = knobs
+    bm, tn, lanesK, waves, prefetch, upIters, partialSteps, group, numXcds, grid3d, _ = knobs
     return (f"bm{bm} tn{tn} lk{lanesK} w{waves} pf{prefetch} up{upIters} ps{partialSteps} "
             f"g{group} x{numXcds} {'3d' if grid3d else 'persistent'}")
 

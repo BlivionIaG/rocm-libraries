@@ -121,7 +121,8 @@ def _measure(phase: str, point: Point, runs: Sequence[RunRecord], later_runs: Se
     for run in all_runs:
         for index, microseconds in run.times.items():
             knobs = table.knobs(index)
-            if knobs is not None:
+            # Routing only targets the useBeta=false variants, and the bench times both with beta 0.
+            if knobs is not None and not SkinnyGEMMLogic.usesBeta(knobs):
                 gen[knobs] = min(microseconds, gen.get(knobs, microseconds))
     return Measurement(phase, point, old, min(old_times, default=math.inf), gen)
 

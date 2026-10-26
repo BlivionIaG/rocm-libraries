@@ -6,6 +6,19 @@
 `SkinnyGEMM.py` describes the skinny MXFP8 GEMM kernels emitted by `tensilelite_codegen` as custom kernels.
 `SkinnyGEMMLogic.py` writes the gfx950 logic file that lists the pool of knob sets and the routing rows.
 
+## Pool and routing
+
+The pool holds every knob set in both `useBeta` variants. `useBeta=false` ignores C and beta and asserts
+`AssertBetaZero`; `useBeta=true` prefetches C, computes `alpha * acc + beta * C` and asserts the C strides that match
+its vector widths. Every pool entry has an enumeration-only row (an empty range), so explicit selection and
+`--requested_solution -1` list both variants.
+
+Routing rows (`data/SkinnyGEMMRows.yaml`, params without `useBeta`) target the `useBeta=false` variant only. A call
+with beta != 0 fails its `AssertBetaZero`, the Range table returns no solution (it returns on the first row whose
+range matches, with no fall-through to other rows), and `ExactLogicLibrary` (`include/Tensile/ExactLogicLibrary.hpp`,
+`findBestSolution`) falls through to the next library (Origami). The `useBeta=true` variants are reachable only through
+the enumeration or explicit selection. Tuning therefore ignores the `useBeta=true` results of the bench.
+
 ## Re-tuning the skinny GEMM routing
 
 The routing rows (`data/SkinnyGEMMRows.yaml`) are measured, not hand-written. Everything below runs from

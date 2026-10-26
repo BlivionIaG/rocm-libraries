@@ -15,7 +15,7 @@ from .Errors import GeneratorKernelRejected
 
 # The knobs of tensilelite_codegen.SkinnyGEMMConfig, in binding order.
 PARAMETERS = ("bm", "tn", "lanesK", "waves", "prefetch", "upIters",
-              "partialSteps", "group", "numXcds", "grid3d")
+              "partialSteps", "group", "numXcds", "grid3d", "useBeta")
 
 # Limits of the emitted kernel's 32-bit index arithmetic.
 MAX_EXTENT = 2**20
@@ -23,6 +23,8 @@ MAX_WIDE = 2**30
 LD_MULTIPLE = 4
 
 _WAVE_SIZE = 64
+
+_BOOL_PARAMETERS = ("grid3d", "useBeta")
 
 _ARGS = (
     {"type": "address", "semantic": "AddressD"},
@@ -32,7 +34,7 @@ _ARGS = (
     {"type": "address", "semantic": "AddressMXScaleB"},
     # The split-K workspace: unused with a single split, passed as a null pointer.
     {"type": "uint64", "semantic": "ConstantZero"},
-    # C is declared for the ABI; the GEMM never reads it, the split-K reduce does.
+    # C is read by the useBeta variant and by the split-K reduce, never by the other variants.
     {"type": "address", "semantic": "AddressC"},
     {"type": "int32", "semantic": "StrideD0"},
     {"type": "int32", "semantic": "StrideA0"},
@@ -85,9 +87,9 @@ def validateParams(params: Any) -> Dict[str, Any]:
 
 
 def _validateParam(key: str, value: Any) -> None:
-    if key == "grid3d":
+    if key in _BOOL_PARAMETERS:
         if not isinstance(value, bool):
-            raise ValueError(f"the SkinnyGEMM generatorParams grid3d must be a bool, got {value!r}")
+            raise ValueError(f"the SkinnyGEMM generatorParams {key} must be a bool, got {value!r}")
         return
     if not _isInt(value):
         raise ValueError(f"the SkinnyGEMM generatorParams {key} must be an int, got {value!r}")
@@ -149,6 +151,13 @@ def _asserts(params: Dict[str, Any]) -> Dict[str, Any]:
         "AssertNoScaleAB": True,
         "AssertNoScaleAlphaVec": True,
     }
+    # Without useBeta the kernel ignores C and beta, so it only serves beta == 0; with it, C is read
+    # with the vector widths of D.
+    if params["useBeta"]:
+        asserts["AssertStrideCEqual"] = {0: 1}
+        asserts["AssertStrideCMultiple"] = {1: LD_MULTIPLE}
+    else:
+        asserts["AssertBetaZero"] = True
     # A partial last step handles any K; otherwise K must fill whole steps.
     if params["partialSteps"] == 0:
         asserts["AssertSummationElementMultiple"] = kStep

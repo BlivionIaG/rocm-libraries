@@ -104,35 +104,69 @@ Solutions:
 - SolutionIndex: 0
   CustomKernel:
     generator: SkinnyGEMM
-    generatorParams: {bm: 1, tn: 1, lanesK: 64, waves: 4, prefetch: 2, upIters: 2, partialSteps: 0, group: 1, numXcds: 1, grid3d: true}
+    generatorParams: {bm: 1, tn: 1, lanesK: 64, waves: 4, prefetch: 2, upIters: 2, partialSteps: 0, group: 1, numXcds: 1, grid3d: true, useBeta: false}
 - SolutionIndex: 1
   CustomKernel:
     generator: SkinnyGEMM
-    generatorParams: {bm: 1, tn: 1, lanesK: 16, waves: 4, prefetch: 2, upIters: 0, partialSteps: 0, group: 1, numXcds: 1, grid3d: true}
+    generatorParams: {bm: 1, tn: 1, lanesK: 64, waves: 4, prefetch: 2, upIters: 2, partialSteps: 0, group: 1, numXcds: 1, grid3d: true, useBeta: true}
 - SolutionIndex: 2
   CustomKernel:
     generator: SkinnyGEMM
-    generatorParams: {bm: 2, tn: 2, lanesK: 16, waves: 4, prefetch: 1, upIters: 0, partialSteps: 1, group: 1, numXcds: 1, grid3d: true}
+    generatorParams: {bm: 1, tn: 1, lanesK: 16, waves: 4, prefetch: 2, upIters: 0, partialSteps: 0, group: 1, numXcds: 1, grid3d: true, useBeta: false}
 - SolutionIndex: 3
   CustomKernel:
     generator: SkinnyGEMM
-    generatorParams: {bm: 1, tn: 1, lanesK: 64, waves: 4, prefetch: 2, upIters: 2, partialSteps: 0, group: 1, numXcds: 1, grid3d: false}
+    generatorParams: {bm: 1, tn: 1, lanesK: 16, waves: 4, prefetch: 2, upIters: 0, partialSteps: 0, group: 1, numXcds: 1, grid3d: true, useBeta: true}
 - SolutionIndex: 4
   CustomKernel:
     generator: SkinnyGEMM
-    generatorParams: {bm: 1, tn: 2, lanesK: 16, waves: 2, prefetch: 2, upIters: 3, partialSteps: 1, group: 2, numXcds: 8, grid3d: false}
+    generatorParams: {bm: 2, tn: 2, lanesK: 16, waves: 4, prefetch: 1, upIters: 0, partialSteps: 1, group: 1, numXcds: 1, grid3d: true, useBeta: false}
+- SolutionIndex: 5
+  CustomKernel:
+    generator: SkinnyGEMM
+    generatorParams: {bm: 2, tn: 2, lanesK: 16, waves: 4, prefetch: 1, upIters: 0, partialSteps: 1, group: 1, numXcds: 1, grid3d: true, useBeta: true}
+- SolutionIndex: 6
+  CustomKernel:
+    generator: SkinnyGEMM
+    generatorParams: {bm: 1, tn: 1, lanesK: 64, waves: 4, prefetch: 2, upIters: 2, partialSteps: 0, group: 1, numXcds: 1, grid3d: false, useBeta: false}
+- SolutionIndex: 7
+  CustomKernel:
+    generator: SkinnyGEMM
+    generatorParams: {bm: 1, tn: 1, lanesK: 64, waves: 4, prefetch: 2, upIters: 2, partialSteps: 0, group: 1, numXcds: 1, grid3d: false, useBeta: true}
+- SolutionIndex: 8
+  CustomKernel:
+    generator: SkinnyGEMM
+    generatorParams: {bm: 1, tn: 2, lanesK: 16, waves: 2, prefetch: 2, upIters: 3, partialSteps: 1, group: 2, numXcds: 8, grid3d: false, useBeta: false}
+- SolutionIndex: 9
+  CustomKernel:
+    generator: SkinnyGEMM
+    generatorParams: {bm: 1, tn: 2, lanesK: 16, waves: 2, prefetch: 2, upIters: 3, partialSteps: 1, group: 2, numXcds: 8, grid3d: false, useBeta: true}
 IndexOrder: [0, 1, 2, 3, 4, 5, 6, 7]
 ExactLogic:
 - - [1, -1, 1, -1, 1, 1, 4097, 8192]
   - [0, 0.0]
-- - [1, -1, 1, -1, 1, 1, 1, -1]
-  - [1, 0.0]
-- - [1, -1, 1, -1, 1, 1, 1, -1]
-  - [2, 0.0]
-- - [1, -1, 1, -1, 1, 1, 4097, 8192]
-  - [3, 0.0]
 - - [1, -1, 1, -1, 1, 1, 2049, 3072]
+  - [8, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
+  - [0, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
+  - [1, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
+  - [2, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
+  - [3, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
   - [4, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
+  - [5, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
+  - [6, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
+  - [7, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
+  - [8, 0.0]
+- - [1, 0, 1, 0, 1, 0, 1, 0]
+  - [9, 0.0]
 RangeLogic: null
 TileSelectionIndices: null
 PerfMetric: DeviceEfficiency

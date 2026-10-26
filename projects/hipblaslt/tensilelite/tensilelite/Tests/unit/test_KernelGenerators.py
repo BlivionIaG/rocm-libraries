@@ -39,11 +39,19 @@ LOGIC_FILE = (
     / "gfx950_Cijk_Alik_Bljk_F8BS_MXAE8B32_MXBE8B32_BH_Bias_HA_S_SAB_SAV_UserArgs_SkinnyGEMM.yaml"
 )
 
-S1 = dict(bm=1, tn=1, lanesK=64, waves=4, prefetch=2, upIters=2, partialSteps=0, group=1, numXcds=1, grid3d=True)
-S2 = dict(bm=1, tn=1, lanesK=16, waves=4, prefetch=2, upIters=0, partialSteps=0, group=1, numXcds=1, grid3d=True)
-S3 = dict(bm=2, tn=2, lanesK=16, waves=4, prefetch=1, upIters=0, partialSteps=1, group=1, numXcds=1, grid3d=True)
-S4 = dict(bm=1, tn=1, lanesK=64, waves=4, prefetch=2, upIters=2, partialSteps=0, group=1, numXcds=1, grid3d=False)
-S5 = dict(bm=1, tn=2, lanesK=16, waves=2, prefetch=2, upIters=3, partialSteps=1, group=2, numXcds=8, grid3d=False)
+S1 = dict(bm=1, tn=1, lanesK=64, waves=4, prefetch=2, upIters=2, partialSteps=0, group=1, numXcds=1, grid3d=True, useBeta=False)
+S2 = dict(bm=1, tn=1, lanesK=16, waves=4, prefetch=2, upIters=0, partialSteps=0, group=1, numXcds=1, grid3d=True, useBeta=False)
+S3 = dict(bm=2, tn=2, lanesK=16, waves=4, prefetch=1, upIters=0, partialSteps=1, group=1, numXcds=1, grid3d=True, useBeta=False)
+S4 = dict(bm=1, tn=1, lanesK=64, waves=4, prefetch=2, upIters=2, partialSteps=0, group=1, numXcds=1, grid3d=False, useBeta=False)
+S5 = dict(bm=1, tn=2, lanesK=16, waves=2, prefetch=2, upIters=3, partialSteps=1, group=2, numXcds=8, grid3d=False, useBeta=False)
+
+
+def betaVariant(params):
+    return {**params, "useBeta": True}
+
+
+# The fixture lists every knob set with useBeta false, then true.
+FIXTURE_SOLUTIONS = [variant for p in (S1, S2, S3, S4, S5) for variant in (p, betaVariant(p))]
 
 EXPECTED_ARGS = [
     {"type": "address", "semantic": "AddressD"},
@@ -78,6 +86,9 @@ COMMON_ASSERTS = {
     "AssertNoScaleAB": True,
     "AssertNoScaleAlphaVec": True,
 }
+# Without useBeta the kernel ignores C and beta; with it C is read with the vector widths of D.
+NO_BETA_ASSERTS = {"AssertBetaZero": True}
+BETA_ASSERTS = {"AssertStrideCEqual": {0: 1}, "AssertStrideCMultiple": {1: 4}}
 
 
 def kernelNameOf(p):
@@ -144,7 +155,9 @@ needsCodegen = pytest.mark.skipif(
         (S5, [16, 1, 1024], ["ComputeUnits", "One", "One"], 2048, 3073, None),
     ],
 )
-def test_expanded_config(fakeCodegen, params, tile, grid, sizeGreater, sizeLess, kMultiple):
+@pytest.mark.parametrize("useBeta", [False, True])
+def test_expanded_config(fakeCodegen, params, tile, grid, sizeGreater, sizeLess, kMultiple, useBeta):
+    params = {**params, "useBeta": useBeta}
     config = getGeneratorKernelConfig(block(params), {}, "gfx950")
     name = kernelNameOf(params)
     assert config["CustomKernelName"] == name
@@ -166,7 +179,7 @@ def test_expanded_config(fakeCodegen, params, tile, grid, sizeGreater, sizeLess,
     assert ck["generator"] == "SkinnyGEMM"
     assert ck["generatorParams"] == params
 
-    expected = dict(COMMON_ASSERTS)
+    expected = {**COMMON_ASSERTS, **(BETA_ASSERTS if useBeta else NO_BETA_ASSERTS)}
     expected["AssertSizeGreaterThan"] = {3: sizeGreater}
     expected["AssertSizeLessThan"] = {0: 2**20 + 1, 1: 2**30 + 1, 3: sizeLess}
     if kMultiple is not None:
@@ -241,6 +254,10 @@ def withParam(key, value):
         (withParam("bm", True), "bm must be an int"),
         (withParam("lanesK", 16.0), "lanesK must be an int"),
         (withParam("grid3d", 1), "grid3d must be a bool"),
+        (withParam("useBeta", 1), "useBeta must be a bool"),
+        (withParam("useBeta", "true"), "useBeta must be a bool"),
+        (withParam("useBeta", None), "useBeta must be a bool"),
+        ({"generator": "SkinnyGEMM", "generatorParams": {k: v for k, v in S1.items() if k != "useBeta"}}, "missing useBeta"),
         (withParam("partialSteps", 2), "partialSteps must be 0 or 1"),
         (withParam("upIters", -1), "upIters must not be negative"),
         (withParam("lanesK", 3), "unsupported lanesK 3"),
@@ -307,6 +324,24 @@ def test_no_feature_asserts_map_to_predicates(key, tag, value):
     assert Contractions.ProblemPredicate.FromOriginalKeyPair((key, False)) is None
 
 
+def test_use_beta_reaches_the_binding(fakeCodegen):
+    assert SkinnyGEMM._config(betaVariant(S1)).useBeta is True
+    assert SkinnyGEMM._config(S1).useBeta is False
+    assert SkinnyGEMM.kernelName(betaVariant(S1)).endswith("_USE_BETA1")
+    assert SkinnyGEMM.kernelName(S1).endswith("_USE_BETA0")
+
+
+def test_beta_zero_assert_maps_to_a_predicate():
+    assert Contractions.ProblemPredicate.FromOriginalKeyPair(("AssertBetaZero", True)).state() == {"type": "BetaZero"}
+
+
+def test_c_stride_asserts_map_to_predicates():
+    assert Contractions.ProblemPredicate.FromOriginalKeyPair(("AssertStrideCEqual", {0: 1})).state() == {
+        "type": "StrideCEqual", "index": 0, "value": 1}
+    assert Contractions.ProblemPredicate.FromOriginalKeyPair(("AssertStrideCMultiple", {1: 4})).state() == {
+        "type": "StrideCMultiple", "index": 1, "value": 4}
+
+
 def test_runtime_custom_kernel_has_no_generator_keys(fakeCodegen):
     ck = getGeneratorKernelConfig(block(S1), {}, "gfx950")["CustomKernel"]
     state = Contractions.CustomKernel.FromOriginalState(ck).state()
@@ -351,14 +386,16 @@ def readLogic():
 def test_logic_round_trip(fakeCodegen, parseEnv):
     fields = parseLogic(parseEnv, readLogic())
     assert [s["CustomKernelName"] for s in fields.solutions] == [
-        kernelNameOf(p) for p in (S1, S2, S3, S4, S5)
+        kernelNameOf(p) for p in FIXTURE_SOLUTIONS
     ]
-    for solution, params in zip(fields.solutions, (S1, S2, S3, S4, S5)):
+    for solution, params in zip(fields.solutions, FIXTURE_SOLUTIONS):
         ck = solution["CustomKernel"]
         assert ck["name"] == kernelNameOf(params)
         assert ck["generatorParams"] == params
         assert ck["args"] == EXPECTED_ARGS
         assert solution["AssertNoBias"] is True
+        assert solution.get("AssertBetaZero", False) is (not params["useBeta"])
+        assert ("AssertStrideCEqual" in solution) is params["useBeta"]
 
 
 def test_logic_predicates_reach_the_library_solution(fakeCodegen, parseEnv):
@@ -379,6 +416,24 @@ def test_logic_predicates_reach_the_library_solution(fakeCodegen, parseEnv):
     assert {"type": "SizeGreaterThan", "index": 3, "value": 4096} in byType["SizeGreaterThan"]
     custom = solution.customKernel.state()
     assert "generator" not in custom and "codeObjectFile" not in custom
+
+
+def libraryPredicates(env, index):
+    fields = parseLogic(env, readLogic())
+    solution = Contractions.Solution.FromSolutionStruct(
+        fields.solutions[index], False, False, False, env.assembler, env.isaInfoMap
+    )
+    return solution.problemPredicate.state()["value"]
+
+
+def test_beta_predicates_per_variant(fakeCodegen, parseEnv):
+    withoutBeta = libraryPredicates(parseEnv, FIXTURE_SOLUTIONS.index(S1))
+    withBeta = libraryPredicates(parseEnv, FIXTURE_SOLUTIONS.index(betaVariant(S1)))
+    assert {"type": "BetaZero"} in withoutBeta
+    assert not any(p["type"] in ("StrideCEqual", "StrideCMultiple") for p in withoutBeta)
+    assert {"type": "BetaZero"} not in withBeta
+    assert {"type": "StrideCEqual", "index": 0, "value": 1} in withBeta
+    assert {"type": "StrideCMultiple", "index": 1, "value": 4} in withBeta
 
 
 def test_handwritten_custom_kernel_keeps_its_path(fakeCodegen, parseEnv, monkeypatch):
@@ -426,19 +481,19 @@ def matchingTables(library):
 
 
 def assertSecondSolutionDropped(env, raw, capsys, rejected):
-    """The solution at index 1 is dropped and every other solution keeps its row."""
-    original = readLogic()["ExactLogic"]
+    """The solution at index 1 is dropped and every other solution keeps its rows."""
+    original = [(key, value[0]) for key, value in readLogic()["ExactLogic"]]
     fields = parseLogic(env, raw)
     output = capsys.readouterr().out
     assert "Skipping generator kernel SkinnyGEMM" in output
     assert rejected in output and "solution index 1" in output
-    kept = [S1, S3, S4, S5]
-    assert [s["CustomKernelName"] for s in fields.solutions] == [kernelNameOf(p) for p in kept]
-    assert sorted(fields.library.solutions) == [0, 2, 3, 4]
+    keptIndices = [index for index in range(len(FIXTURE_SOLUTIONS)) if index != 1]
+    assert [s["CustomKernelName"] for s in fields.solutions] == [
+        kernelNameOf(FIXTURE_SOLUTIONS[index]) for index in keptIndices
+    ]
+    assert sorted(fields.library.solutions) == keptIndices
     rows = matchingTables(fields.library.library)
-    assert sorted(index for _, index in rows) == [0, 2, 3, 4]
-    originalKeys = {index: original[index][0] for index in (0, 2, 3, 4)}
-    assert sorted(rows) == sorted((originalKeys[index], index) for index in (0, 2, 3, 4))
+    assert sorted(rows) == sorted((key, index) for key, index in original if index != 1)
 
 
 def test_generator_kernel_rejected_by_the_emitter_is_dropped(fakeCodegen, parseEnv, capsys):
@@ -450,7 +505,7 @@ def test_generator_kernel_rejected_by_the_emitter_is_dropped(fakeCodegen, parseE
 @needsCodegen
 def test_real_over_budget_generator_kernel_is_dropped(parseEnv, capsys):
     overBudget = dict(bm=2, tn=8, lanesK=8, waves=2, prefetch=1, upIters=10, partialSteps=0, group=1,
-                      numXcds=1, grid3d=True)
+                      numXcds=1, grid3d=True, useBeta=True)
     raw = readLogic()
     raw["Solutions"][1]["CustomKernel"]["generatorParams"] = dict(overBudget)
     assertSecondSolutionDropped(parseEnv, raw, capsys, "register budget")
@@ -643,7 +698,7 @@ def test_real_kernel_name():
     assert SkinnyGEMM.kernelName(S1) == (
         "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS2_PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA0"
     )
-    for params in (S1, S2, S3, S4, S5):
+    for params in FIXTURE_SOLUTIONS:
         assert SkinnyGEMM.kernelName(params) == kernelNameOf(params)
 
 
@@ -661,7 +716,7 @@ def test_real_source_is_code_object_v6():
 
 
 @needsCodegen
-@pytest.mark.parametrize("params", [S1, S4])
+@pytest.mark.parametrize("params", [S1, S4, betaVariant(S1), betaVariant(S4)])
 def test_real_emitted_arguments_match_the_declared_ones(params):
     explicit = emittedExplicitArgs(SkinnyGEMM.emit(params, "gfx950"))
     declared = SkinnyGEMM.args()

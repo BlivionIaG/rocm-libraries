@@ -18,9 +18,9 @@ from Tensile.KernelGenerators import (SkinnyGEMM, SkinnyGEMMBench, SkinnyGEMMCel
                                       SkinnyGEMMReport, SkinnyGEMMTune)
 from Tensile.KernelGenerators.SkinnyGEMMBench import Job, Point, RunRecord
 
-RING = (1, 1, 16, 1, 1, 0, 1, 1, 1, True)
-RING_B = (1, 1, 16, 2, 1, 0, 1, 1, 1, True)
-UP_FRONT = (1, 1, 64, 4, 2, 2, 0, 1, 1, True)
+RING = (1, 1, 16, 1, 1, 0, 1, 1, 1, True, False)
+RING_B = (1, 1, 16, 2, 1, 0, 1, 1, 1, True, False)
+UP_FRONT = (1, 1, 64, 4, 2, 2, 0, 1, 1, True, False)
 LIMITS = SkinnyGEMMCells.Thresholds()
 GRID_DATA = {"orientations": ["n", "m"], "skinny": [1, 6, 4], "wide": [4096, 1024], "k": [1024, 4100],
              "extra_points": [], "held_out": {"count": 20, "seed": 3},
@@ -28,9 +28,9 @@ GRID_DATA = {"orientations": ["n", "m"], "skinny": [1, 6, 4], "wide": [4096, 102
 
 
 def generated_name(knobs):
-    bm, tn, lanesK, waves, prefetch, upIters, partialSteps, group, numXcds, grid3d = knobs
+    bm, tn, lanesK, waves, prefetch, upIters, partialSteps, group, numXcds, grid3d, useBeta = knobs
     return (f"gemm_BM{bm}_TN{tn}_LANES_K{lanesK}_WAVES{waves}_UP_ITERS{upIters}_PARTIAL_STEPS{partialSteps}"
-            f"_PF{prefetch}_GROUP{group}_NUM_XCDS{numXcds}_GRID_3D{int(grid3d)}_USE_BETA0")
+            f"_PF{prefetch}_GROUP{group}_NUM_XCDS{numXcds}_GRID_3D{int(grid3d)}_USE_BETA{int(useBeta)}")
 
 
 def block_text(index, us, kernel):
@@ -83,9 +83,18 @@ class TestParser:
         assert SkinnyGEMMBench.generated_knobs(generated_name(UP_FRONT), pool) == UP_FRONT
         assert SkinnyGEMMBench.generated_knobs("Cijk_Alik_Bljk", pool) is None
 
+    def test_use_beta_is_parsed_from_the_name(self, pool):
+        withBeta = SkinnyGEMMLogic.withBeta(RING, True)
+        assert generated_name(withBeta).endswith("_USE_BETA1")
+        assert SkinnyGEMMBench.generated_knobs(generated_name(withBeta), pool) == withBeta
+        assert SkinnyGEMMBench.generated_knobs(generated_name(RING), pool) == RING
+
+    def test_name_without_suffix_is_use_beta_false(self, pool):
+        assert SkinnyGEMMBench.generated_knobs(generated_name(RING).removesuffix("_USE_BETA0"), pool) == RING
+
     def test_unknown_knobs_are_errors(self, pool):
         with pytest.raises(ValueError, match="not in the pool"):
-            SkinnyGEMMBench.generated_knobs(generated_name((1, 1, 4, 1, 1, 0, 1, 1, 1, True)), pool)
+            SkinnyGEMMBench.generated_knobs(generated_name((1, 1, 4, 1, 1, 0, 1, 1, 1, True, False)), pool)
         with pytest.raises(ValueError, match="unparsable"):
             SkinnyGEMMBench.generated_knobs("gemm_BM1_TN1", pool)
 
@@ -260,6 +269,14 @@ class TestAggregation:
         assert measurement.gen == {RING: 40.0, RING_B: 50.0}
         assert measurement.best_gen == 40.0
 
+    def test_use_beta_results_are_ignored(self, tmp_path, pool):
+        table = make_table(tmp_path, pool)
+        table.names[4] = generated_name(SkinnyGEMMLogic.withBeta(RING, True))
+        point = Point(1024, 1, 1024)
+        measurement = SkinnyGEMMCells.aggregate([record(point, {0: 100.0, 1: 40.0, 4: 10.0})], table)[("grid", point)]
+        assert measurement.gen == {RING: 40.0}
+        assert measurement.best_gen == 40.0
+
     def test_generated_first_pick_means_no_old_default(self, tmp_path, pool):
         table = make_table(tmp_path, pool)
         point = Point(1024, 1, 4100)
@@ -302,7 +319,7 @@ class TestKSupports:
         assert not supports(UP_FRONT, 4097, 8191)
 
     def test_partial_step_free_entries_need_a_point_interval(self):
-        twin = (1, 1, 16, 1, 1, 0, 0, 1, 1, True)
+        twin = (1, 1, 16, 1, 1, 0, 0, 1, 1, True, False)
         assert SkinnyGEMMCells.k_supports(twin, 2048, 2048) and not SkinnyGEMMCells.k_supports(twin, 1025, 2047)
         assert not SkinnyGEMMCells.k_supports(twin, 1500, 1500)
 
@@ -550,6 +567,7 @@ class TestTuneCommands:
         assert rows == (tmp_path / "b.rows.yaml").read_text()
         assert (tmp_path / "a.logic.yaml").read_bytes() == (tmp_path / "b.logic.yaml").read_bytes()
         params = SkinnyGEMMLogic.asParams(RING)
+        del params["useBeta"]
         assert yaml.safe_load(rows) == [{"range": [1, 4, 1024, 4096, 1, 1, 1024, 2048], "params": params},
                                         {"range": [1024, 4096, 1, 4, 1, 1, 1024, 2048], "params": params}]
         for report in ("cells.md", "points.md", "points.csv", "summary.md"):

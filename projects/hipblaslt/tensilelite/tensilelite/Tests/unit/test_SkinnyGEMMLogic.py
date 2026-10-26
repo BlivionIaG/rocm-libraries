@@ -12,6 +12,7 @@ from Tensile.KernelGenerators import SkinnyGEMM, SkinnyGEMMLogic
 
 RING_PARAMS = {"bm": 1, "tn": 1, "lanesK": 16, "waves": 1, "prefetch": 1, "upIters": 0, "partialSteps": 1,
                "group": 1, "numXcds": 1, "grid3d": True}
+RING_KNOBS = SkinnyGEMMLogic.to_knobs(dict(RING_PARAMS, useBeta=False))
 
 
 @pytest.fixture(scope="module")
@@ -47,6 +48,18 @@ class TestPool:
             SkinnyGEMM.validateParams(SkinnyGEMMLogic.asParams(knobs))
         assert all(reasons for reasons in pool.values())
 
+    def test_both_variants_of_every_knob_set(self, pool):
+        falseVariants = [knobs for knobs in pool if not SkinnyGEMMLogic.usesBeta(knobs)]
+        assert len(falseVariants) * 2 == len(pool)
+        for knobs in falseVariants:
+            twin = SkinnyGEMMLogic.withBeta(knobs, True)
+            assert twin in pool
+            assert pool[twin] == pool[knobs]
+            assert list(pool).index(twin) == list(pool).index(knobs) + 1
+
+    def test_cap_is_twice_the_knob_set_cap(self):
+        assert SkinnyGEMMLogic.MAX_POOL == 2 * SkinnyGEMMLogic.MAX_KNOB_SETS
+
     def test_contains_picks_and_baseline(self, pool, pickedShapes):
         for shape, knobs in pickedShapes.items():
             assert knobs in pool, shape
@@ -61,7 +74,7 @@ class TestPool:
         allowed = set(pickedShapes.values()) | {SkinnyGEMMLogic._ringTwin(k) for k in pickedShapes.values()}
         persistent = [knobs for knobs in pool if not knobs[SkinnyGEMMLogic._GRID3D]]
         assert persistent
-        assert all(knobs in allowed for knobs in persistent)
+        assert all(SkinnyGEMMLogic.withBeta(knobs, False) in allowed for knobs in persistent)
 
     def test_up_front_windows_hold_a_measured_k(self, pool):
         ks = {k for _, _, k in SkinnyGEMMLogic.measuredShapes()}
@@ -73,18 +86,18 @@ class TestPool:
             assert any((upIters - 1) * step < k <= upIters * step for k in ks), knobs
 
     def test_size(self, pool):
-        assert len(pool) == 86
+        assert len(pool) == 172
 
 
 class TestKCoverage:
     def test_ring_partial_steps(self):
-        assert SkinnyGEMMLogic.kCoverage((1, 1, 16, 1, 1, 0, 1, 1, 1, True)) == "(0, 2^20]"
+        assert SkinnyGEMMLogic.kCoverage((1, 1, 16, 1, 1, 0, 1, 1, 1, True, False)) == "(0, 2^20]"
 
     def test_ring_whole_steps(self):
-        assert SkinnyGEMMLogic.kCoverage((1, 1, 16, 1, 1, 0, 0, 1, 1, True)) == "(0, 2^20], K % 1024 == 0"
+        assert SkinnyGEMMLogic.kCoverage((1, 1, 16, 1, 1, 0, 0, 1, 1, True, True)) == "(0, 2^20], K % 1024 == 0"
 
     def test_up_front(self):
-        assert SkinnyGEMMLogic.kCoverage((1, 1, 64, 4, 2, 2, 0, 1, 1, True)) == "(4096, 8192], K % 4096 == 0"
+        assert SkinnyGEMMLogic.kCoverage((1, 1, 64, 4, 2, 2, 0, 1, 1, True, False)) == "(4096, 8192], K % 4096 == 0"
 
 
 class TestHeader:
@@ -144,6 +157,21 @@ class TestRender:
         assert [key for key, _ in enumeration] == [SkinnyGEMMLogic.EMPTY_RANGE] * len(pool)
         assert [value[0] for _, value in enumeration] == list(range(len(pool)))
 
+    def test_params_carry_use_beta(self, rendered, pool):
+        logic, _ = rendered
+        flags = [solution["CustomKernel"]["generatorParams"]["useBeta"] for solution in logic["Solutions"]]
+        assert flags == [SkinnyGEMMLogic.usesBeta(knobs) for knobs in pool]
+        assert set(flags) == {False, True}
+
+    def test_render_is_deterministic(self, pool):
+        header = SkinnyGEMMLogic.headerLines(SkinnyGEMMLogic.ORIGAMI_LOGIC)
+        rows = [([1, 10, 1, -1, 1, 1, 1, -1], 0)]
+        assert SkinnyGEMMLogic.renderLogic(header, pool, rows) == SkinnyGEMMLogic.renderLogic(header, pool, rows)
+
+    def test_routing_params_have_no_use_beta(self):
+        assert "useBeta" not in SkinnyGEMMLogic.render_routing_params(RING_KNOBS)
+        assert SkinnyGEMMLogic.render_params(RING_KNOBS).endswith("useBeta: false}")
+
 
 class TestRows:
     def test_valid_file(self, tmp_path, pool):
@@ -153,9 +181,27 @@ class TestRows:
         indexOf = {knobs: index for index, knobs in enumerate(pool)}
         routing = SkinnyGEMMLogic.readRoutingRows(path, pool)
         assert routing == [
-            (row["range"], indexOf[SkinnyGEMMLogic.to_knobs(row["params"])]),
-            (other["range"], indexOf[SkinnyGEMMLogic.to_knobs(other["params"])]),
+            (row["range"], indexOf[RING_KNOBS]),
+            (other["range"], indexOf[SkinnyGEMMLogic.to_knobs(dict(other["params"], useBeta=False))]),
         ]
+
+    def test_rows_route_to_the_use_beta_false_variant(self, tmp_path, pool):
+        path = writeRows(tmp_path / "rows.yaml", [validRow()])
+        ((_, index),) = SkinnyGEMMLogic.readRoutingRows(path, pool)
+        knobs = list(pool)[index]
+        assert not SkinnyGEMMLogic.usesBeta(knobs)
+        assert knobs == RING_KNOBS
+
+    def test_committed_rows_route_to_the_use_beta_false_variant(self, pool):
+        routing = SkinnyGEMMLogic.readRoutingRows(SkinnyGEMMLogic.DEFAULT_ROWS, pool)
+        assert routing
+        assert not any(SkinnyGEMMLogic.usesBeta(list(pool)[index]) for _, index in routing)
+
+    @pytest.mark.parametrize("useBeta", [False, True])
+    def test_rows_with_use_beta_are_rejected(self, tmp_path, pool, useBeta):
+        path = writeRows(tmp_path / "rows.yaml", [validRow(params=dict(RING_PARAMS, useBeta=useBeta))])
+        with pytest.raises(ValueError, match="must not set useBeta"):
+            SkinnyGEMMLogic.readRoutingRows(path, pool)
 
     @pytest.mark.parametrize("change, message", [
         ({"params": dict(RING_PARAMS, lanesK=4)}, "not in the pool"),
@@ -187,6 +233,12 @@ class TestMain:
         output = tmp_path / "x.yaml"
         SkinnyGEMMLogic.main(["--output", str(output)])
         assert output.read_bytes() == SkinnyGEMMLogic.OUTPUT_LOGIC.read_bytes()
+
+    def test_regeneration_is_deterministic(self, tmp_path):
+        first, second = tmp_path / "a.yaml", tmp_path / "b.yaml"
+        SkinnyGEMMLogic.main(["--output", str(first)])
+        SkinnyGEMMLogic.main(["--output", str(second)])
+        assert first.read_bytes() == second.read_bytes()
 
     def test_list_prints_one_line_per_entry(self, tmp_path, pool, capsys):
         output = tmp_path / "x.yaml"

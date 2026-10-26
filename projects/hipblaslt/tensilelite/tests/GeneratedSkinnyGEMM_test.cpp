@@ -46,36 +46,70 @@ namespace
     constexpr int64_t mxBlock   = 32;
 
     // A generated solution and the K it serves: kLow < K <= kHigh and K a multiple of kMultiple.
+    // The useBeta variants read C, the others only serve beta == 0.
     struct GeneratedKernel
     {
         const char* name;
         int64_t     kLow;
         int64_t     kHigh;
         int64_t     kMultiple;
+        bool        useBeta;
     };
 
-    const std::array<GeneratedKernel, 5> generatedKernels = {{
+    // clang-format off
+    const std::array<GeneratedKernel, 10> generatedKernels = {{
         {"gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS2_PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA0",
          4096,
          8192,
-         4096},
+         4096,
+         false},
+        {"gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS2_PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA1",
+         4096,
+         8192,
+         4096,
+         true},
         {"gemm_BM1_TN1_LANES_K16_WAVES4_UP_ITERS0_PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA0",
          0,
          maxExtent,
-         1024},
+         1024,
+         false},
+        {"gemm_BM1_TN1_LANES_K16_WAVES4_UP_ITERS0_PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA1",
+         0,
+         maxExtent,
+         1024,
+         true},
         {"gemm_BM2_TN2_LANES_K16_WAVES4_UP_ITERS0_PARTIAL_STEPS1_PF1_GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA0",
          0,
          maxExtent,
-         1},
+         1,
+         false},
+        {"gemm_BM2_TN2_LANES_K16_WAVES4_UP_ITERS0_PARTIAL_STEPS1_PF1_GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA1",
+         0,
+         maxExtent,
+         1,
+         true},
         {"gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS2_PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_GRID_3D0_USE_BETA0",
          4096,
          8192,
-         4096},
+         4096,
+         false},
+        {"gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS2_PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_GRID_3D0_USE_BETA1",
+         4096,
+         8192,
+         4096,
+         true},
         {"gemm_BM1_TN2_LANES_K16_WAVES2_UP_ITERS3_PARTIAL_STEPS1_PF2_GROUP2_NUM_XCDS8_GRID_3D0_USE_BETA0",
          2048,
          3072,
-         1},
+         1,
+         false},
+        {"gemm_BM1_TN2_LANES_K16_WAVES2_UP_ITERS3_PARTIAL_STEPS1_PF2_GROUP2_NUM_XCDS8_GRID_3D0_USE_BETA1",
+         2048,
+         3072,
+         1,
+         true},
     }};
+    // clang-format on
 
     int64_t alignUp(int64_t value, int64_t multiple)
     {
@@ -97,7 +131,13 @@ namespace
         int64_t batch = 1;
         int64_t ldA   = 0;
         int64_t ldB   = 0;
+        int64_t ldC   = 0;
         int64_t ldD   = 0;
+
+        double alpha = 1.0;
+        double beta  = 0.0;
+        // C is D itself: the same buffer, so ldC must equal ldD.
+        bool aliasC = false;
 
         bool useBias       = false;
         bool activation    = false;
@@ -117,6 +157,7 @@ namespace
         spec.ldA = alignUp(k, 4) + 16;
         spec.ldB = alignUp(k, 4) + 4;
         spec.ldD = alignUp(m, 4) + 4;
+        spec.ldC = spec.ldD;
         return spec;
     }
 
@@ -131,7 +172,9 @@ namespace
     {
         std::ostringstream stream;
         stream << "m=" << spec.m << " n=" << spec.n << " k=" << spec.k << " batch=" << spec.batch
-               << " ldA=" << spec.ldA << " ldB=" << spec.ldB << " ldD=" << spec.ldD;
+               << " ldA=" << spec.ldA << " ldB=" << spec.ldB << " ldC=" << spec.ldC
+               << " ldD=" << spec.ldD << " alpha=" << spec.alpha << " beta=" << spec.beta
+               << " aliasC=" << spec.aliasC;
         return stream.str();
     }
 
@@ -146,6 +189,10 @@ namespace
         if(usesUnsupportedFeature(spec) || spec.batch != 1)
             return false;
         if(spec.ldA % 4 != 0 || spec.ldB % 4 != 0 || spec.ldD % 4 != 0)
+            return false;
+        if(!kernel.useBeta && spec.beta != 0.0)
+            return false;
+        if(kernel.useBeta && spec.ldC % 4 != 0)
             return false;
         if(spec.m > maxExtent || spec.n > maxWide)
             return false;
@@ -177,11 +224,11 @@ namespace
                                                 spec.ldA * spec.m,
                                                 spec.ldB,
                                                 spec.ldB * spec.n,
+                                                spec.ldC,
+                                                spec.ldC * spec.n,
                                                 spec.ldD,
                                                 spec.ldD * spec.n,
-                                                spec.ldD,
-                                                spec.ldD * spec.n,
-                                                0.0);
+                                                spec.beta);
         problem.setComputeInputTypeA(DataType::Float8);
         problem.setComputeInputTypeB(DataType::Float8);
         problem.setAlphaType(DataType::Float);
@@ -282,6 +329,7 @@ namespace
     // Host operands.
     constexpr uint8_t  nanByte      = 0x7F;
     constexpr uint16_t sentinel     = 0x5A5B;
+    constexpr uint16_t nanBf16      = 0x7FC0;
     constexpr int64_t  guardCount   = 64;
     constexpr int64_t  scaleRows    = 32;
     constexpr int64_t  scaleColumns = 8;
@@ -446,6 +494,39 @@ namespace
         return (spec.n - 1) * spec.ldD + spec.m;
     }
 
+    int64_t cElements(ProblemSpec const& spec)
+    {
+        return (spec.n - 1) * spec.ldC + spec.m;
+    }
+
+    // C holds multiples of 1/8 that bf16 represents exactly. With beta == 0 it is all NaN, so a
+    // kernel that reads it produces NaN; the padding and the guard keep the sentinel otherwise.
+    std::vector<uint16_t> makeC(std::mt19937_64& rng, ProblemSpec const& spec)
+    {
+        if(spec.beta == 0.0)
+            return std::vector<uint16_t>(cElements(spec) + guardCount, nanBf16);
+        std::vector<uint16_t> c(cElements(spec) + guardCount, sentinel);
+        for(int64_t j = 0; j < spec.n; j++)
+            for(int64_t i = 0; i < spec.m; i++)
+                c[j * spec.ldC + i] = truncateToBf16((static_cast<int>(rng() % 33) - 16) / 8.0f);
+        return c;
+    }
+
+    // alpha * A^T B + beta * C, in the column-major [n][m] layout of the reference.
+    void applyScalars(std::vector<float>&          expected,
+                      std::vector<uint16_t> const& c,
+                      ProblemSpec const&           spec)
+    {
+        for(int64_t j = 0; j < spec.n; j++)
+            for(int64_t i = 0; i < spec.m; i++)
+            {
+                double value = spec.alpha * expected[j * spec.m + i];
+                if(spec.beta != 0.0)
+                    value += spec.beta * bf16ToFloat(c[j * spec.ldC + i]);
+                expected[j * spec.m + i] = static_cast<float>(value);
+            }
+    }
+
     // Checks that the ld padding and the guard kept the sentinel and that D matches the
     // reference up to the truncation of the f32 result to bf16.
     void verifyD(std::vector<uint16_t> const& d,
@@ -547,8 +628,9 @@ namespace
     {
         ProblemSpec        spec;
         Operand            a;
-        Operand            b;
-        std::vector<float> expected;
+        Operand               b;
+        std::vector<uint16_t> c;
+        std::vector<float>    expected;
     };
 
     ProblemData makeData(ProblemSpec const& spec)
@@ -558,7 +640,9 @@ namespace
         data.spec     = spec;
         data.a        = makeOperand(rng, spec.m, spec.k, spec.ldA);
         data.b        = makeOperand(rng, spec.n, spec.k, spec.ldB);
+        data.c        = makeC(rng, spec);
         data.expected = referenceProduct(data.a, data.b);
+        applyScalars(data.expected, data.c, spec);
         return data;
     }
 
@@ -568,25 +652,30 @@ namespace
         Problem            problem = makeProblem(spec);
 
         std::vector<uint16_t> d(dElements(spec) + guardCount, sentinel);
+        if(spec.aliasC)
+            d = data.c;
         DeviceBuffer          deviceA(byteCount(data.a.image));
         DeviceBuffer          deviceB(byteCount(data.b.image));
         DeviceBuffer          deviceScaleA(byteCount(data.a.swizzled));
         DeviceBuffer          deviceScaleB(byteCount(data.b.swizzled));
+        DeviceBuffer          deviceC(byteCount(data.c));
         DeviceBuffer          deviceD(byteCount(d));
         deviceA.upload(data.a.image);
         deviceB.upload(data.b.image);
         deviceScaleA.upload(data.a.swizzled);
         deviceScaleB.upload(data.b.swizzled);
+        deviceC.upload(data.c);
         deviceD.upload(d);
 
         TensileLite::ContractionInputs inputs;
         inputs.a     = deviceA.get();
         inputs.b     = deviceB.get();
+        inputs.c     = spec.aliasC ? deviceD.get() : deviceC.get();
         inputs.d     = deviceD.get();
         inputs.mxsa  = deviceScaleA.get();
         inputs.mxsb  = deviceScaleB.get();
-        inputs.alpha = 1.0f;
-        inputs.beta  = 0.0f;
+        inputs.alpha = static_cast<float>(spec.alpha);
+        inputs.beta  = static_cast<float>(spec.beta);
 
         launch(loaded, solution, problem, inputs);
         deviceD.download(d);
@@ -618,14 +707,35 @@ TEST_F(GeneratedSkinnyGEMMTest, LibraryHoldsExactlyTheFixtureSolutions)
     EXPECT_EQ(names, expected);
 }
 
+enum class CLayout
+{
+    SameAsD, // ldC == ldD, separate buffers.
+    Padded, // ldC larger than ldD.
+    Aliased, // C is D.
+};
+
 struct NumericsCase
 {
     const char* name;
     int64_t     m;
     int64_t     n;
     int64_t     k;
+    double      alpha;
+    double      beta;
+    CLayout     cLayout;
     int64_t     acceptedCount;
 };
+
+static ProblemSpec makeNumericsSpec(NumericsCase const& param)
+{
+    ProblemSpec spec = makeSpec(param.m, param.n, param.k);
+    spec.alpha       = param.alpha;
+    spec.beta        = param.beta;
+    spec.aliasC      = param.cLayout == CLayout::Aliased;
+    if(param.cLayout == CLayout::Padded)
+        spec.ldC = spec.ldD + 8;
+    return spec;
+}
 
 class GeneratedSkinnyGEMMNumericsTest : public GeneratedSkinnyGEMMTest,
                                         public ::testing::WithParamInterface<NumericsCase>
@@ -635,7 +745,7 @@ class GeneratedSkinnyGEMMNumericsTest : public GeneratedSkinnyGEMMTest,
 TEST_P(GeneratedSkinnyGEMMNumericsTest, AcceptedSolutionsComputeD)
 {
     NumericsCase const& param = GetParam();
-    ProblemSpec         spec  = makeSpec(param.m, param.n, param.k);
+    ProblemSpec         spec  = makeNumericsSpec(param);
     SCOPED_TRACE(describe(spec));
 
     std::vector<std::string> accepted;
@@ -653,15 +763,35 @@ TEST_P(GeneratedSkinnyGEMMNumericsTest, AcceptedSolutionsComputeD)
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(GeneratedSkinnyGEMMProblems,
-                         GeneratedSkinnyGEMMNumericsTest,
-                         ::testing::Values(NumericsCase{"P1_m5000_n1_k8192", 5000, 1, 8192, 4},
-                                           NumericsCase{"P2_m1_n5000_k8192", 1, 5000, 8192, 4},
-                                           NumericsCase{"P3_m777_n3_k3000", 777, 3, 3000, 2},
-                                           NumericsCase{"P4_m3_n777_k3072", 3, 777, 3072, 3}),
-                         [](::testing::TestParamInfo<NumericsCase> const& info) {
-                             return std::string(info.param.name);
-                         });
+// The useBeta=0 solutions only serve beta == 0, so beta != 0 runs the useBeta=1 half of each shape.
+INSTANTIATE_TEST_SUITE_P(
+    GeneratedSkinnyGEMMProblems,
+    GeneratedSkinnyGEMMNumericsTest,
+    ::testing::Values(
+        NumericsCase{"P1_m5000_n1_k8192", 5000, 1, 8192, 1.0, 0.0, CLayout::SameAsD, 8},
+        NumericsCase{"P2_m1_n5000_k8192", 1, 5000, 8192, 1.0, 0.0, CLayout::SameAsD, 8},
+        NumericsCase{"P3_m777_n3_k3000", 777, 3, 3000, 1.0, 0.0, CLayout::SameAsD, 4},
+        NumericsCase{"P4_m3_n777_k3072", 3, 777, 3072, 1.0, 0.0, CLayout::SameAsD, 6},
+        NumericsCase{"P1_alpha0p75_beta0", 5000, 1, 8192, 0.75, 0.0, CLayout::SameAsD, 8},
+        NumericsCase{"P1_alpha2neg_beta0", 5000, 1, 8192, -2.0, 0.0, CLayout::SameAsD, 8},
+        NumericsCase{"P1_alpha1_beta1", 5000, 1, 8192, 1.0, 1.0, CLayout::SameAsD, 4},
+        NumericsCase{"P1_alpha1_betaNegHalf", 5000, 1, 8192, 1.0, -0.5, CLayout::SameAsD, 4},
+        NumericsCase{"P1_alpha0p75_beta1", 5000, 1, 8192, 0.75, 1.0, CLayout::SameAsD, 4},
+        NumericsCase{"P1_alpha0p75_betaNegHalf", 5000, 1, 8192, 0.75, -0.5, CLayout::SameAsD, 4},
+        NumericsCase{"P1_alpha2neg_beta1", 5000, 1, 8192, -2.0, 1.0, CLayout::SameAsD, 4},
+        NumericsCase{"P1_alpha2neg_betaNegHalf", 5000, 1, 8192, -2.0, -0.5, CLayout::SameAsD, 4},
+        NumericsCase{"P2_alpha0p75_betaNegHalf", 1, 5000, 8192, 0.75, -0.5, CLayout::SameAsD, 4},
+        NumericsCase{"P3_alpha2neg_betaNegHalf", 777, 3, 3000, -2.0, -0.5, CLayout::SameAsD, 2},
+        NumericsCase{"P4_alpha0p75_beta1", 3, 777, 3072, 0.75, 1.0, CLayout::SameAsD, 3},
+        NumericsCase{"P1_paddedC_beta0", 5000, 1, 8192, 0.75, 0.0, CLayout::Padded, 8},
+        NumericsCase{"P2_paddedC_beta1", 1, 5000, 8192, 0.75, 1.0, CLayout::Padded, 4},
+        NumericsCase{"P4_paddedC_betaNegHalf", 3, 777, 3072, -2.0, -0.5, CLayout::Padded, 3},
+        NumericsCase{"P1_aliasedC_beta1", 5000, 1, 8192, 0.75, 1.0, CLayout::Aliased, 4},
+        NumericsCase{"P2_aliasedC_betaNegHalf", 1, 5000, 8192, -2.0, -0.5, CLayout::Aliased, 4},
+        NumericsCase{"P3_aliasedC_beta1", 777, 3, 3000, 1.0, 1.0, CLayout::Aliased, 2}),
+    [](::testing::TestParamInfo<NumericsCase> const& info) {
+        return std::string(info.param.name);
+    });
 
 struct RejectionCase
 {
@@ -698,7 +828,19 @@ INSTANTIATE_TEST_SUITE_P(
         // The lower window boundaries are exclusive: S1 and S4 reject K=4096, S5 rejects K=2048.
         RejectionCase{"K4096", [](ProblemSpec& spec) { setK(spec, 4096); }},
         RejectionCase{"K2048", [](ProblemSpec& spec) { setK(spec, 2048); }},
-        RejectionCase{"Batch2", [](ProblemSpec& spec) { spec.batch = 2; }}),
+        RejectionCase{"Batch2", [](ProblemSpec& spec) { spec.batch = 2; }},
+        // beta != 0 rejects every useBeta=0 solution; alpha is not asserted.
+        RejectionCase{"Beta1", [](ProblemSpec& spec) { spec.beta = 1.0; }},
+        RejectionCase{"BetaNegHalf", [](ProblemSpec& spec) { spec.beta = -0.5; }},
+        RejectionCase{"Alpha", [](ProblemSpec& spec) { spec.alpha = -2.0; }},
+        RejectionCase{"PaddedLdc", [](ProblemSpec& spec) { spec.ldC = spec.ldD + 8; }},
+        // The C strides are asserted by the useBeta=1 solutions even when beta is 0.
+        RejectionCase{"LdcNotMultipleOf4", [](ProblemSpec& spec) { spec.ldC = 5003; }},
+        RejectionCase{"LdcNotMultipleOf4Beta1",
+                      [](ProblemSpec& spec) {
+                          spec.ldC  = 5003;
+                          spec.beta = 1.0;
+                      }}),
     [](::testing::TestParamInfo<RejectionCase> const& info) { return std::string(info.param.name); });
 
 TEST_F(GeneratedSkinnyGEMMTest, OutputAmaxDMatchesNoGeneratedSolution)
@@ -710,4 +852,46 @@ TEST_F(GeneratedSkinnyGEMMTest, OutputAmaxDMatchesNoGeneratedSolution)
         problem, *loadedLibrary().hardware, TensileLite::SolutionLibrarySearchType::DEFAULT);
     for(std::shared_ptr<Solution> const& solution : found)
         EXPECT_NE(solution->KernelName().rfind(kernelPrefix, 0), std::string::size_type(0)) << solution->KernelName();
+}
+
+namespace
+{
+    // The name of the solution the library picks by its own heuristic rows, empty for none.
+    std::string pickedKernel(ProblemSpec const& spec)
+    {
+        LoadedLibrary&                  loaded = loadedLibrary();
+        std::shared_ptr<Solution> const picked
+            = loaded.library->findBestSolution(makeProblem(spec), *loaded.hardware);
+        return picked ? picked->KernelName() : std::string();
+    }
+}
+
+// A Range table answers with the first row whose range matches, so a routed call with beta != 0
+// reaches the useBeta=0 solution, fails its predicate and gets no solution; hipBLASLt then falls
+// through to the next library.
+TEST_F(GeneratedSkinnyGEMMTest, RoutedRangesReachTheUseBetaZeroSolutionOnlyAtBetaZero)
+{
+    ProblemSpec spec = makeSpec(5000, 1, 8192);
+    EXPECT_EQ(pickedKernel(spec), generatedKernels[0].name);
+    spec.alpha = -2.0;
+    EXPECT_EQ(pickedKernel(spec), generatedKernels[0].name);
+    for(double beta : {1.0, -0.5})
+    {
+        spec.beta = beta;
+        EXPECT_EQ(pickedKernel(spec), "") << describe(spec);
+    }
+
+    spec = makeSpec(777, 3, 3000);
+    EXPECT_EQ(pickedKernel(spec), generatedKernels[8].name);
+    spec.beta = 1.0;
+    EXPECT_EQ(pickedKernel(spec), "") << describe(spec);
+}
+
+// The enumeration-only rows have an empty range, so no problem is routed to them.
+TEST_F(GeneratedSkinnyGEMMTest, UnroutedRangesPickNoGeneratedSolution)
+{
+    ProblemSpec spec = makeSpec(5000, 1, 1024);
+    EXPECT_EQ(pickedKernel(spec), "");
+    spec.beta = 1.0;
+    EXPECT_EQ(pickedKernel(spec), "");
 }
