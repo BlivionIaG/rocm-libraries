@@ -4066,6 +4066,11 @@ rocblaslt_status runContractionProblem(rocblaslt_handle                   handle
         auto solution = library->getSolutionByIndex(data->problem, *hardware, *solutionIndex);
         if(!solution)
             return rocblaslt_status_not_implemented;
+        if(solution->problemType.fusedA2A != data->problem.fusedA2A())
+        {
+            log_error(__func__, "Fused all-to-all mode of solution differs from the problem");
+            return rocblaslt_status_invalid_value;
+        }
         if(prob.workspaceSize < solution->requiredWorkspaceSize(data->problem, *hardware))
         {
             if(get_logger_layer_mode() & rocblaslt_layer_mode_log_info)
@@ -4400,6 +4405,11 @@ rocblaslt_status makeArgument(rocblaslt_handle             handle,
             if(!solution)
             {
                 log_error(__func__, "No solution for index", *solutionIndex);
+                return rocblaslt_status_invalid_value;
+            }
+            if(solution->problemType.fusedA2A != data->problem.fusedA2A())
+            {
+                log_error(__func__, "Fused all-to-all mode of solution differs from the problem");
                 return rocblaslt_status_invalid_value;
             }
 

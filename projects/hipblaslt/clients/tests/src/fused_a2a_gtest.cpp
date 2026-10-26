@@ -570,6 +570,28 @@ namespace
         }
     }
 
+    struct DeviceBuffer
+    {
+        explicit DeviceBuffer(size_t bytes)
+        {
+            if(bytes == 0 || hipMalloc(&ptr, bytes) != hipSuccess)
+                ptr = nullptr;
+            else if(hipMemset(ptr, 0, bytes) != hipSuccess)
+                ADD_FAILURE() << "hipMemset failed";
+        }
+
+        ~DeviceBuffer()
+        {
+            if(ptr)
+                (void)hipFree(ptr);
+        }
+
+        DeviceBuffer(const DeviceBuffer&)            = delete;
+        DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+        void* ptr = nullptr;
+    };
+
     /************************************************************************
      * Dispatch: the shape and layout requirements, checked where both the
      * communicator and D's layout are in hand.
@@ -790,6 +812,82 @@ namespace
         ASSERT_FALSE(all.empty());
         for(hipblasLtMatmulHeuristicResult_t& result : all)
             EXPECT_NE(hipblaslt_ext::getIndexFromAlgo(result.algo), fusedIndex);
+    }
+
+    TEST_F(FusedA2ADispatch_pre_checkin, MatmulRejectsAPlainAlgoForAFusedDescriptor)
+    {
+        transposeA();
+        makeD();
+
+        hipblasLtMatmulHeuristicResult_t plain    = {};
+        int                              returned = 0;
+        ASSERT_EQ(heuristic(&plain, &returned), HIPBLAS_STATUS_SUCCESS);
+        if(returned == 0)
+            GTEST_SKIP() << "no plain BF16 TN solution in the loaded library";
+
+        registerOneRank();
+        completeAndAttach();
+
+        DeviceBuffer a(kK * kM * 2), b(kK * kN * 2), d(kLdd * kN * 2), ws(plain.workspaceSize);
+        ASSERT_TRUE(a.ptr && b.ptr && d.ptr && (plain.workspaceSize == 0 || ws.ptr));
+        const float alpha = 1.f;
+        const float beta  = 0.f;
+        EXPECT_EQ(hipblasLtMatmul(handle,
+                                  matmulDesc,
+                                  &alpha,
+                                  a.ptr,
+                                  Adesc,
+                                  b.ptr,
+                                  Bdesc,
+                                  &beta,
+                                  d.ptr,
+                                  Ddesc,
+                                  d.ptr,
+                                  Ddesc,
+                                  &plain.algo,
+                                  ws.ptr,
+                                  plain.workspaceSize,
+                                  nullptr),
+                  HIPBLAS_STATUS_INVALID_VALUE);
+        EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+    }
+
+    TEST_F(FusedA2ADispatch_pre_checkin, ExtGemmRejectsAFusedAlgo)
+    {
+        transposeA();
+        registerOneRank();
+        completeAndAttach();
+        makeD();
+
+        hipblasLtMatmulHeuristicResult_t fusedResult = {};
+        int                              returned    = 0;
+        ASSERT_EQ(heuristic(&fusedResult, &returned), HIPBLAS_STATUS_SUCCESS);
+        if(returned == 0)
+            GTEST_SKIP() << "no fused BF16 TN solution in the loaded library";
+
+        DeviceBuffer a(kK * kM * 2), b(kK * kN * 2), d(kLdd * kN * 2);
+        ASSERT_TRUE(a.ptr && b.ptr && d.ptr);
+        const float                 alpha = 1.f;
+        const float                 beta  = 0.f;
+        hipblaslt_ext::GemmEpilogue epilogue;
+        hipblaslt_ext::GemmInputs   inputs;
+        inputs.setA(a.ptr);
+        inputs.setB(b.ptr);
+        inputs.setC(d.ptr);
+        inputs.setD(d.ptr);
+        inputs.setAlpha(&alpha);
+        inputs.setBeta(&beta);
+
+        hipblaslt_ext::Gemm gemm(handle,
+                                 HIPBLAS_OP_T,
+                                 HIPBLAS_OP_N,
+                                 HIP_R_16BF,
+                                 HIP_R_16BF,
+                                 HIP_R_16BF,
+                                 HIP_R_16BF,
+                                 HIPBLAS_COMPUTE_32F);
+        ASSERT_EQ(gemm.setProblem(kM, kN, kK, 1, epilogue, inputs), HIPBLAS_STATUS_SUCCESS);
+        EXPECT_EQ(gemm.initialize(fusedResult.algo, nullptr), HIPBLAS_STATUS_INVALID_VALUE);
     }
 
     TEST_F(FusedA2ADispatch_pre_checkin, RejectsMissingExtent)
