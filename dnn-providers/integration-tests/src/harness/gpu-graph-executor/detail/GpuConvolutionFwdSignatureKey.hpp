@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <functional>
 #include <ostream>
 
 #include <hipdnn_flatbuffers_sdk/data_objects/data_types_generated.h>
