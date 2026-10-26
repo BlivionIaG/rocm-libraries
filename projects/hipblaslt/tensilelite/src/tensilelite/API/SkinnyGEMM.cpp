@@ -106,12 +106,6 @@ struct SkinnyDims {
   int32_t chunkStride;
 };
 
-/// Multiplier and shift of LLVM's signed division by a positive constant.
-struct SignedMagic {
-  int32_t multiplier;
-  int32_t shift;
-};
-
 /// Loads that stay in flight at a point of the schedule, counted in issue
 /// order so that an in-order vmcnt wait can name them.
 struct SlotLoadPosition {
@@ -455,11 +449,6 @@ private:
 
 static constexpr int32_t outOfRange = -1;
 
-// The modifiers of a buffer load or store addressed with a voffset.
-static rocisa::MUBUFModifiers offen() {
-  return rocisa::MUBUFModifiers(true, 0);
-}
-
 static bool isScalar(RegisterRef ref) { return ref.kind == RegisterKind::sgpr; }
 
 // Returns whether value is a positive power of two.
@@ -475,105 +464,6 @@ static int32_t log2Exact(int32_t value) {
   while ((1 << log) < value)
     ++log;
   return log;
-}
-
-// Returns the magic number of the signed division by divisor >= 2, after
-// Hacker's Delight.
-static SignedMagic signedMagic(int32_t d) {
-  constexpr uint32_t two31 = 0x80000000u;
-  uint32_t ad = static_cast<uint32_t>(d);
-  uint32_t t = two31;
-  uint32_t anc = t - 1 - t % ad;
-  int32_t p = 31;
-  uint32_t q1 = two31 / anc;
-  uint32_t r1 = two31 - q1 * anc;
-  uint32_t q2 = two31 / ad;
-  uint32_t r2 = two31 - q2 * ad;
-  uint32_t delta = 0;
-  do {
-    ++p;
-    q1 *= 2;
-    r1 *= 2;
-    if (r1 >= anc) {
-      ++q1;
-      r1 -= anc;
-    }
-    q2 *= 2;
-    r2 *= 2;
-    if (r2 >= ad) {
-      ++q2;
-      r2 -= ad;
-    }
-    delta = ad - r2;
-  } while (q1 < delta || (q1 == delta && r1 == 0));
-  return {static_cast<int32_t>(q2 + 1), p - 32};
-}
-
-// 32-bit ALU shorthands that pick the SALU or VALU instruction from the kind
-// of dst, which must not be an AGPR. A VALU src must be a VGPR.
-static void shiftLeft(IRBuilder &builder, RegisterRef dst, RegisterRef src,
-                      int32_t amount) {
-  if (amount == 0) {
-    if (dst != src)
-      builder.movb32(dst, src);
-    return;
-  }
-  if (isScalar(dst))
-    builder.create<rocisa::SLShiftLeftB32>(dst.container(), amount,
-                                           src.container());
-  else
-    builder.create<rocisa::VLShiftLeftB32>(dst.container(), amount,
-                                           src.container());
-}
-
-static void shiftRight(IRBuilder &builder, RegisterRef dst, RegisterRef src,
-                       int32_t amount) {
-  if (amount == 0) {
-    if (dst != src)
-      builder.movb32(dst, src);
-    return;
-  }
-  if (isScalar(dst))
-    builder.create<rocisa::SLShiftRightB32>(dst.container(), amount,
-                                            src.container());
-  else
-    builder.create<rocisa::VLShiftRightB32>(dst.container(), amount,
-                                            src.container());
-}
-
-static void bitAnd(IRBuilder &builder, RegisterRef dst, RegisterRef src,
-                   int32_t mask) {
-  if (isScalar(dst))
-    builder.create<rocisa::SAndB32>(dst.container(), mask, src.container());
-  else
-    builder.create<rocisa::VAndB32>(dst.container(), mask, src.container());
-}
-
-// dst = src * factor, a shift when factor is a power of two.
-static void multiplyBy(IRBuilder &builder, RegisterRef dst, RegisterRef src,
-                       int32_t factor) {
-  if (isPowerOfTwo(factor)) {
-    shiftLeft(builder, dst, src, log2Exact(factor));
-    return;
-  }
-  builder.muli32(dst, src, factor);
-}
-
-// Emits quotient = dividend / divisor for a non-negative SGPR dividend and a
-// divisor >= 2 that is not a power of two, as LLVM expands the division.
-static void divideByConstant(IRBuilder &builder, RegisterRef quotient,
-                             RegisterRef dividend, int32_t divisor) {
-  SignedMagic magic = signedMagic(divisor);
-  RegisterRange sign = builder.allocateSgpr(1);
-  builder.create<rocisa::SMulHII32>(quotient.container(), dividend.container(),
-                                    magic.multiplier);
-  if (magic.multiplier < 0)
-    builder.addi32(quotient, quotient, dividend);
-  if (magic.shift > 0)
-    builder.create<rocisa::SAShiftRightI32>(quotient.container(), magic.shift,
-                                            quotient.container());
-  shiftRight(builder, sign.ref(), quotient, 31);
-  builder.addi32(quotient, quotient, sign.ref());
 }
 
 // Number of vector memory loads issued after the load at where; the count a
@@ -631,7 +521,7 @@ static void operandBytes(IRBuilder &builder, RegisterRef dst, RegisterRef cols,
 static void scaleBytes(IRBuilder &builder, RegisterRef dst, RegisterRef cols,
                        RegisterRef rowGroup) {
   builder.addi32(dst, cols, 31);
-  shiftRight(builder, dst, dst, 5);
+  builder.shrui32(dst, dst, 5);
   builder.muli32(dst, dst, rowGroup);
 }
 
@@ -639,22 +529,11 @@ static void scaleBytes(IRBuilder &builder, RegisterRef dst, RegisterRef cols,
 // (col mod 16) * 4, before the lane's role offset. Overwrites col.
 static void scaleRowOffset(IRBuilder &builder, RegisterRef dst, RegisterRef col,
                            RegisterRef rowGroup) {
-  shiftRight(builder, dst, col, 5);
+  builder.shrui32(dst, col, 5);
   builder.muli32(dst, dst, rowGroup);
-  bitAnd(builder, col, col, 15);
-  shiftLeft(builder, col, col, 2);
+  builder.andi32(col, 15, col);
+  builder.shli32(col, col, 2);
   builder.addi32(dst, dst, col);
-}
-
-// dst = SCC ? ifSet : otherwise for one register or an aligned pair.
-static void selectOnScc(IRBuilder &builder, RegisterRef dst, RegisterRef ifSet,
-                        RegisterRef otherwise) {
-  if (dst.count == 2)
-    builder.create<rocisa::SCSelectB64>(dst.container(), ifSet.container(),
-                                        otherwise.container());
-  else
-    builder.create<rocisa::SCSelectB32>(dst.container(), ifSet.container(),
-                                        otherwise.container());
 }
 
 SkinnyGEMMEmitter::SetupScalars::SetupScalars(IRBuilder &builder, bool grid3d)
@@ -804,26 +683,26 @@ void SkinnyGEMMEmitter::makeBufferSizes(const SetupScalars &scalars,
                                         const ResourceScalars &resources) {
   RegisterRange alignedK = sgpr();
   builder.addi32(alignedK.ref(), k, 3);
-  shiftRight(builder, alignedK.ref(), alignedK.ref(), 2);
-  shiftLeft(builder, alignedK.ref(), alignedK.ref(), 2);
+  builder.shrui32(alignedK.ref(), alignedK.ref(), 2);
+  builder.shli32(alignedK.ref(), alignedK.ref(), 2);
   operandBytes(builder, resources.aBytes.ref(), resources.m.ref(),
                resources.ldA.ref(), alignedK.ref());
   operandBytes(builder, resources.bBytes.ref(), resources.n.ref(),
                resources.ldB.ref(), alignedK.ref());
   // A row group of the scales holds k rounded up to 256 bytes.
   builder.addi32(scalars.rowGroup.ref(), k, 255);
-  shiftRight(builder, scalars.rowGroup.ref(), scalars.rowGroup.ref(), 8);
-  shiftLeft(builder, scalars.rowGroup.ref(), scalars.rowGroup.ref(), 8);
+  builder.shrui32(scalars.rowGroup.ref(), scalars.rowGroup.ref(), 8);
+  builder.shli32(scalars.rowGroup.ref(), scalars.rowGroup.ref(), 8);
   scaleBytes(builder, resources.sclABytes.ref(), resources.m.ref(),
              scalars.rowGroup.ref());
   scaleBytes(builder, resources.sclBBytes.ref(), resources.n.ref(),
              scalars.rowGroup.ref());
   // D holds ((n - 1) * ldD + m) bf16 elements, as (2n - 2) * ldD + 2m bytes.
   RegisterRef dBytes = dRsrc.ref(2);
-  shiftLeft(builder, dBytes, resources.n.ref(), 1);
+  builder.shli32(dBytes, resources.n.ref(), 1);
   builder.addi32(dBytes, dBytes, -2);
   builder.muli32(dBytes, dBytes, resources.ldD.ref());
-  shiftLeft(builder, alignedK.ref(), resources.m.ref(), 1);
+  builder.shli32(alignedK.ref(), resources.m.ref(), 1);
   builder.addi32(dBytes, dBytes, alignedK.ref());
   // The workspace holds splits * m * n f32 elements; the splits are the
   // blocks of the grid's z dimension, or ceilDiv(k, spk) in the 1-D launch.
@@ -838,7 +717,7 @@ void SkinnyGEMMEmitter::makeBufferSizes(const SetupScalars &scalars,
   RegisterRef wsBytes = wsRsrc.ref(2);
   builder.muli32(wsBytes, resources.m.ref(), splits);
   builder.muli32(wsBytes, wsBytes, resources.n.ref());
-  shiftLeft(builder, wsBytes, wsBytes, 2);
+  builder.shli32(wsBytes, wsBytes, 2);
   builder.muli32(mn.ref(), resources.m.ref(), resources.n.ref());
 }
 
@@ -849,39 +728,33 @@ void SkinnyGEMMEmitter::dispatchPaths(const SetupScalars &scalars,
                                       const ResourceScalars &resources) {
   builder.create<rocisa::SCmpLeU32>(resources.m.container(),
                                     resources.n.container());
-  selectOnScc(builder, sRsrc.ref(0, 2), resources.aPtr.ref(),
-              resources.bPtr.ref());
-  selectOnScc(builder, sRsrc.ref(2), resources.aBytes.ref(),
-              resources.bBytes.ref());
-  selectOnScc(builder, wRsrc.ref(0, 2), resources.bPtr.ref(),
-              resources.aPtr.ref());
-  selectOnScc(builder, wRsrc.ref(2), resources.bBytes.ref(),
-              resources.aBytes.ref());
-  selectOnScc(builder, sSclRsrc.ref(0, 2), resources.sclAPtr.ref(),
-              resources.sclBPtr.ref());
-  selectOnScc(builder, sSclRsrc.ref(2), resources.sclABytes.ref(),
-              resources.sclBBytes.ref());
-  selectOnScc(builder, wSclRsrc.ref(0, 2), resources.sclBPtr.ref(),
-              resources.sclAPtr.ref());
-  selectOnScc(builder, wSclRsrc.ref(2), resources.sclBBytes.ref(),
-              resources.sclABytes.ref());
-  selectOnScc(builder, scalars.ldS.ref(), resources.ldA.ref(),
-              resources.ldB.ref());
-  selectOnScc(builder, scalars.ldW.ref(), resources.ldB.ref(),
-              resources.ldA.ref());
-  builder.create<rocisa::SCSelectB32>(dStrideS.container(), 1,
-                                      resources.ldD.container());
-  builder.create<rocisa::SCSelectB32>(dStrideW.container(),
-                                      resources.ldD.container(), 1);
-  builder.create<rocisa::SCSelectB32>(wsStrideS.container(), 1,
-                                      resources.m.container());
-  builder.create<rocisa::SCSelectB32>(wsStrideW.container(),
-                                      resources.m.container(), 1);
-  builder.create<rocisa::SCSelectB32>(contigS.container(), 1, 0);
-  builder.create<rocisa::SMinU32>(
-      skinnyCols.container(), resources.m.container(), resources.n.container());
-  builder.create<rocisa::SMaxU32>(wideCols.container(), resources.m.container(),
-                                  resources.n.container());
+  builder.selectb64(sRsrc.ref(0, 2), resources.aPtr.ref(),
+                    resources.bPtr.ref());
+  builder.selectb32(sRsrc.ref(2), resources.aBytes.ref(),
+                    resources.bBytes.ref());
+  builder.selectb64(wRsrc.ref(0, 2), resources.bPtr.ref(),
+                    resources.aPtr.ref());
+  builder.selectb32(wRsrc.ref(2), resources.bBytes.ref(),
+                    resources.aBytes.ref());
+  builder.selectb64(sSclRsrc.ref(0, 2), resources.sclAPtr.ref(),
+                    resources.sclBPtr.ref());
+  builder.selectb32(sSclRsrc.ref(2), resources.sclABytes.ref(),
+                    resources.sclBBytes.ref());
+  builder.selectb64(wSclRsrc.ref(0, 2), resources.sclBPtr.ref(),
+                    resources.sclAPtr.ref());
+  builder.selectb32(wSclRsrc.ref(2), resources.sclBBytes.ref(),
+                    resources.sclABytes.ref());
+  builder.selectb32(scalars.ldS.ref(), resources.ldA.ref(),
+                    resources.ldB.ref());
+  builder.selectb32(scalars.ldW.ref(), resources.ldB.ref(),
+                    resources.ldA.ref());
+  builder.selectb32(dStrideS.ref(), 1, resources.ldD.ref());
+  builder.selectb32(dStrideW.ref(), resources.ldD.ref(), 1);
+  builder.selectb32(wsStrideS.ref(), 1, resources.m.ref());
+  builder.selectb32(wsStrideW.ref(), resources.m.ref(), 1);
+  builder.selectb32(contigS.ref(), 1, 0);
+  builder.minui32(skinnyCols.ref(), resources.m.ref(), resources.n.ref());
+  builder.maxui32(wideCols.ref(), resources.m.ref(), resources.n.ref());
   for (RegisterRange *rsrc : {&sRsrc, &wRsrc, &sSclRsrc, &wSclRsrc})
     builder.makeRsrc(rsrc->ref(), rsrc->ref(0, 2), rsrc->ref(2));
 }
@@ -904,8 +777,7 @@ void SkinnyGEMMEmitter::computeTile(const SetupScalars &scalars,
   // Only the last split can be shorter than spk.
   builder.muli32(ks, kz, spk.ref());
   builder.addi32(ke, ks, spk.ref());
-  builder.create<rocisa::SMinI32>(ke.container(), ke.container(),
-                                  k.container());
+  builder.minsi32(ke, ke, k.ref());
   // The steps need ke itself, so its iteration index goes to a temporary.
   std::optional<RegisterRange> endIterLocal;
   RegisterRef keIter = ke;
@@ -913,22 +785,19 @@ void SkinnyGEMMEmitter::computeTile(const SetupScalars &scalars,
     endIterLocal = sgpr();
     keIter = endIterLocal->ref();
   }
-  builder.create<rocisa::SAShiftRightI32>(keIter.container(), dims.log2Ki,
-                                          ke.container());
+  builder.shrsi32(keIter, ke, dims.log2Ki);
   builder.addi32(kBaseIter.ref(), ks, dims.ki - 1);
-  builder.create<rocisa::SAShiftRightI32>(kBaseIter.container(), dims.log2Ki,
-                                          kBaseIter.container());
+  builder.shrsi32(kBaseIter.ref(), kBaseIter.ref(), dims.log2Ki);
   builder.subi32(nIterFull.ref(), keIter, kBaseIter.ref());
-  builder.create<rocisa::SMaxI32>(nIterFull.container(), nIterFull.container(),
-                                  0);
+  builder.maxsi32(nIterFull.ref(), nIterFull.ref(), 0);
   if (startIter)
-    shiftRight(builder, startIter->ref(), ks, dims.log2Ki);
+    builder.shrui32(startIter->ref(), ks, dims.log2Ki);
   if (vecOff) {
     // The head step owns entry 0 of the up-front vector when the split starts
     // inside an iteration.
     RegisterRange misaligned = sgpr();
-    bitAnd(builder, misaligned.ref(), ks, dims.ki - 1);
-    builder.create<rocisa::SCSelectB32>(vecOff->container(), 1, 0);
+    builder.andi32(misaligned.ref(), dims.ki - 1, ks);
+    builder.selectb32(vecOff->ref(), 1, 0);
   }
   if (fitRot) {
     std::optional<RegisterRange> computed;
@@ -941,10 +810,9 @@ void SkinnyGEMMEmitter::computeTile(const SetupScalars &scalars,
     // so the physical iteration wraps once without a division.
     builder.create<rocisa::SCmpLtU32>(rotation->container(),
                                       nIterFull.container());
-    builder.create<rocisa::SCSelectB32>(fitRot->container(),
-                                        rotation->container(), 0);
+    builder.selectb32(fitRot->ref(), *rotation, 0);
   }
-  multiplyBy(builder, s0.ref(), ty, dims.bm);
+  builder.muli32(s0.ref(), ty, dims.bm);
   if (dims.grid3d && dims.xcdRun > 1)
     groupTilesPerXcd(scalars);
 }
@@ -959,18 +827,17 @@ void SkinnyGEMMEmitter::groupTilesPerXcd(const SetupScalars &scalars) {
   int32_t span = xcds * dims.xcdRun;
   RegisterRange logical = sgpr();
   RegisterRange term = sgpr();
-  shiftRight(builder, logical.ref(), tile.tx, log2Exact(xcds));
-  bitAnd(builder, logical.ref(), logical.ref(), dims.xcdRun - 1);
-  bitAnd(builder, term.ref(), tile.tx, xcds - 1);
-  shiftLeft(builder, term.ref(), term.ref(), log2Exact(dims.xcdRun));
+  builder.shrui32(logical.ref(), tile.tx, log2Exact(xcds));
+  builder.andi32(logical.ref(), dims.xcdRun - 1, logical.ref());
+  builder.andi32(term.ref(), xcds - 1, tile.tx);
+  builder.shli32(term.ref(), term.ref(), log2Exact(dims.xcdRun));
   builder.addi32(logical.ref(), logical.ref(), term.ref());
-  bitAnd(builder, term.ref(), tile.tx, -span);
+  builder.andi32(term.ref(), -span, tile.tx);
   builder.addi32(logical.ref(), logical.ref(), term.ref());
-  bitAnd(builder, term.ref(), scalars.blocksX.ref(), -span);
+  builder.andi32(term.ref(), -span, scalars.blocksX.ref());
   // SCC must survive from the compare to the select.
   builder.create<rocisa::SCmpLtU32>(tile.tx.container(), term.container());
-  builder.create<rocisa::SCSelectB32>(tile.tx.container(), logical.container(),
-                                      tile.tx.container());
+  builder.selectb32(tile.tx, logical.ref(), tile.tx);
 }
 
 // rot = (key + key / 16) mod NI with key the linear block id and NI =
@@ -991,7 +858,7 @@ void SkinnyGEMMEmitter::computeRotation(const SetupScalars &scalars,
   if (dims.upIters == 0) {
     ni = sgpr();
     builder.addi32(ni->ref(), spk.ref(), dims.ki - 1);
-    shiftRight(builder, ni->ref(), ni->ref(), dims.log2Ki);
+    builder.shrui32(ni->ref(), ni->ref(), dims.log2Ki);
   }
   blockRotation(rot, key.ref(),
                 ni ? std::optional<RegisterRef>(ni->ref()) : std::nullopt);
@@ -1001,7 +868,7 @@ void SkinnyGEMMEmitter::computeRotation(const SetupScalars &scalars,
 void SkinnyGEMMEmitter::blockRotation(RegisterRef rot, RegisterRef key,
                                       std::optional<RegisterRef> ni) {
   RegisterRange sum = sgpr();
-  shiftRight(builder, sum.ref(), key, 4);
+  builder.shrui32(sum.ref(), key, 4);
   builder.addi32(sum.ref(), sum.ref(), key);
   if (ni) {
     RegisterRange quotient = sgpr();
@@ -1011,12 +878,11 @@ void SkinnyGEMMEmitter::blockRotation(RegisterRef rot, RegisterRef key,
     return;
   }
   if (isPowerOfTwo(dims.upIters)) {
-    builder.create<rocisa::SAndB32>(rot.container(), sum.container(),
-                                    dims.upIters - 1);
+    builder.andi32(rot, sum.ref(), dims.upIters - 1);
     return;
   }
   RegisterRange quotient = sgpr();
-  divideByConstant(builder, quotient.ref(), sum.ref(), dims.upIters);
+  builder.divsi32(quotient.ref(), sum.ref(), dims.upIters, /*useIEEE=*/true);
   builder.muli32(quotient.ref(), quotient.ref(), dims.upIters);
   builder.subi32(rot, sum.ref(), quotient.ref());
 }
@@ -1025,8 +891,8 @@ void SkinnyGEMMEmitter::blockRotation(RegisterRef rot, RegisterRef key,
 // * TN. The slot wave * CG + cg is the thread id divided by LANES_K.
 void SkinnyGEMMEmitter::computeLaneWideBase(RegisterRef dst) {
   RegisterRef tid = kernel.workitemId().ref();
-  shiftRight(builder, dst, tid, dims.log2LanesK);
-  multiplyBy(builder, dst, dst, dims.tn);
+  builder.shrui32(dst, tid, dims.log2LanesK);
+  builder.muli32(dst, dst, dims.tn);
 }
 
 // dst += tx * BN.
@@ -1045,14 +911,14 @@ void SkinnyGEMMEmitter::computeAddresses(RegisterRef klv, RegisterRef lane,
     // suffices.
     RegisterRef a0 = addresses.ref();
     RegisterRange term = vgpr();
-    bitAnd(builder, a0, klv, dims.subgroupLanes - 1);
-    shiftRight(builder, a0, a0, 1);
-    multiplyBy(builder, a0, a0, 4 * dims.roleSlots);
-    shiftRight(builder, term.ref(), klv, 3);
-    multiplyBy(builder, term.ref(), term.ref(), 32 * dims.roleSlots);
+    builder.andi32(a0, dims.subgroupLanes - 1, klv);
+    builder.shrui32(a0, a0, 1);
+    builder.muli32(a0, a0, 4 * dims.roleSlots);
+    builder.shrui32(term.ref(), klv, 3);
+    builder.muli32(term.ref(), term.ref(), 32 * dims.roleSlots);
     builder.addi32(a0, a0, term.ref());
-    shiftRight(builder, term.ref(), tid, 6);
-    shiftLeft(builder, term.ref(), term.ref(), 2);
+    builder.shrui32(term.ref(), tid, 6);
+    builder.shli32(term.ref(), term.ref(), 2);
     builder.addi32(a0, a0, term.ref());
     return;
   }
@@ -1062,20 +928,20 @@ void SkinnyGEMMEmitter::computeAddresses(RegisterRef klv, RegisterRef lane,
   RegisterRef a1 = addresses.ref(1);
   RegisterRange term = vgpr();
   // The block pair of the lane in its subgroup, times CG.
-  bitAnd(builder, a0, klv, dims.subgroupLanes - 1);
-  shiftRight(builder, a0, a0, 1);
-  shiftLeft(builder, a0, a0, dims.log2ColumnGroups);
+  builder.andi32(a0, dims.subgroupLanes - 1, klv);
+  builder.shrui32(a0, a0, 1);
+  builder.shli32(a0, a0, dims.log2ColumnGroups);
   if (dims.lanesK > 8) {
-    shiftRight(builder, term.ref(), klv, 3);
-    shiftLeft(builder, term.ref(), term.ref(),
-              dims.log2Subgroup + dims.log2ColumnGroups);
+    builder.shrui32(term.ref(), klv, 3);
+    builder.shli32(term.ref(), term.ref(),
+                   dims.log2Subgroup + dims.log2ColumnGroups);
     builder.addi32(a0, a0, term.ref());
   }
   if (dims.lanesK < 64) {
-    shiftRight(builder, term.ref(), lane, dims.log2LanesK);
+    builder.shrui32(term.ref(), lane, dims.log2LanesK);
     builder.addi32(a0, a0, term.ref());
   }
-  shiftLeft(builder, a0, a0, 2);
+  builder.shli32(a0, a0, 2);
   builder.addi32(a1, a0, dims.halfSubgroup * dims.columnGroups * 4);
 }
 
@@ -1084,39 +950,28 @@ void SkinnyGEMMEmitter::computeAddresses(RegisterRef klv, RegisterRef lane,
 RegisterRange SkinnyGEMMEmitter::computeLaneBytes(RegisterRef klv) {
   RegisterRange laneBytes = vgpr();
   if (dims.lanesK == dims.subgroupLanes) {
-    shiftLeft(builder, laneBytes.ref(), klv, 4);
+    builder.shli32(laneBytes.ref(), klv, 4);
     return laneBytes;
   }
   RegisterRange inSubgroup = vgpr();
-  shiftRight(builder, laneBytes.ref(), klv, dims.log2Subgroup);
-  shiftLeft(builder, laneBytes.ref(), laneBytes.ref(), dims.log2Subgroup + 6);
-  bitAnd(builder, inSubgroup.ref(), klv, dims.subgroupLanes - 1);
-  shiftLeft(builder, inSubgroup.ref(), inSubgroup.ref(), 4);
+  builder.shrui32(laneBytes.ref(), klv, dims.log2Subgroup);
+  builder.shli32(laneBytes.ref(), laneBytes.ref(), dims.log2Subgroup + 6);
+  builder.andi32(inSubgroup.ref(), dims.subgroupLanes - 1, klv);
+  builder.shli32(inSubgroup.ref(), inSubgroup.ref(), 4);
   builder.addi32(laneBytes.ref(), laneBytes.ref(), inSubgroup.ref());
   return laneBytes;
 }
 
 // The slot roleJ = id / R of the thread's scale load role, where R = roleSlots
-// is not a power of two for some block sizes, so the division is LLVM's
-// expansion of the signed division by a constant.
+// is not a power of two for some block sizes, so the division is the builder's
+// division by a constant.
 RegisterRange SkinnyGEMMEmitter::computeRoleJ(RegisterRef tid) {
   RegisterRange roleJ = vgpr();
   if (isPowerOfTwo(dims.roleSlots)) {
-    shiftRight(builder, roleJ.ref(), tid, log2Exact(dims.roleSlots));
+    builder.shrui32(roleJ.ref(), tid, log2Exact(dims.roleSlots));
     return roleJ;
   }
-  SignedMagic magic = signedMagic(dims.roleSlots);
-  RegisterRange sign = vgpr();
-  builder.movb32(roleJ.ref(), magic.multiplier);
-  builder.create<rocisa::VMulHII32>(roleJ.container(), tid.container(),
-                                    roleJ.container());
-  if (magic.multiplier < 0)
-    builder.addi32(roleJ.ref(), roleJ.ref(), tid);
-  if (magic.shift > 0)
-    builder.create<rocisa::VAShiftRightI32>(roleJ.container(), magic.shift,
-                                            roleJ.container(), "");
-  shiftRight(builder, sign.ref(), roleJ.ref(), 31);
-  builder.addi32(roleJ.ref(), roleJ.ref(), sign.ref());
+  builder.divsi32(roleJ.ref(), tid, dims.roleSlots, /*useIEEE=*/true);
   return roleJ;
 }
 
@@ -1132,21 +987,21 @@ RegisterRange SkinnyGEMMEmitter::computeScaleOffset(
     roleJ = sharedRoleJ->ref();
   else if (dims.columnGroups > 1) {
     roleStorage = vgpr();
-    shiftRight(builder, roleStorage->ref(), lane, dims.log2ColumnGroups);
+    builder.shrui32(roleStorage->ref(), lane, dims.log2ColumnGroups);
     roleJ = roleStorage->ref();
   }
   RegisterRange sclOff = vgpr();
   RegisterRange term = vgpr();
-  bitAnd(builder, sclOff.ref(), roleJ, dims.halfSubgroup - 1);
-  shiftLeft(builder, sclOff.ref(), sclOff.ref(), 6);
+  builder.andi32(sclOff.ref(), dims.halfSubgroup - 1, roleJ);
+  builder.shli32(sclOff.ref(), sclOff.ref(), 6);
   if (dims.lanesK > dims.subgroupLanes) {
-    shiftRight(builder, term.ref(), roleJ, dims.log2Subgroup);
-    shiftLeft(builder, term.ref(), term.ref(), dims.log2Subgroup + 6);
+    builder.shrui32(term.ref(), roleJ, dims.log2Subgroup);
+    builder.shli32(term.ref(), term.ref(), dims.log2Subgroup + 6);
     builder.addi32(sclOff.ref(), sclOff.ref(), term.ref());
   }
-  bitAnd(builder, term.ref(), roleJ, dims.subgroupLanes - 1);
-  shiftRight(builder, term.ref(), term.ref(), dims.log2Half);
-  shiftLeft(builder, term.ref(), term.ref(), dims.log2Subgroup + 5);
+  builder.andi32(term.ref(), dims.subgroupLanes - 1, roleJ);
+  builder.shrui32(term.ref(), term.ref(), dims.log2Half);
+  builder.shli32(term.ref(), term.ref(), dims.log2Subgroup + 5);
   builder.addi32(sclOff.ref(), sclOff.ref(), term.ref());
   return sclOff;
 }
@@ -1160,27 +1015,27 @@ void SkinnyGEMMEmitter::computeWideLoadSlot(
   if (sharedRoleJ) {
     // slot = tid mod R given roleJ = tid / R.
     if (isPowerOfTwo(dims.roleSlots))
-      bitAnd(builder, slot, tid, dims.roleSlots - 1);
+      builder.andi32(slot, dims.roleSlots - 1, tid);
     else {
       builder.muli32(slot, sharedRoleJ->ref(), dims.roleSlots);
       builder.subi32(slot, tid, slot);
     }
-    multiplyBy(builder, slot, slot, dims.tn);
+    builder.muli32(slot, slot, dims.tn);
     return;
   }
   if (dims.waves > 1) {
-    shiftRight(builder, slot, tid, 6);
-    shiftLeft(builder, slot, slot, dims.log2ColumnGroups);
+    builder.shrui32(slot, tid, 6);
+    builder.shli32(slot, slot, dims.log2ColumnGroups);
   }
   if (dims.columnGroups > 1) {
     RegisterRange inDomain = vgpr();
-    bitAnd(builder, inDomain.ref(), lane, dims.columnGroups - 1);
+    builder.andi32(inDomain.ref(), dims.columnGroups - 1, lane);
     if (dims.waves > 1)
       builder.addi32(slot, slot, inDomain.ref());
     else
       builder.movb32(slot, inDomain.ref());
   }
-  multiplyBy(builder, slot, slot, dims.tn);
+  builder.muli32(slot, slot, dims.tn);
 }
 
 SkinnyGEMMEmitter::LaneValues SkinnyGEMMEmitter::computeLaneValues() {
@@ -1191,14 +1046,14 @@ SkinnyGEMMEmitter::LaneValues SkinnyGEMMEmitter::computeLaneValues() {
   RegisterRef lane = tid;
   if (dims.waves > 1) {
     laneStorage = vgpr();
-    bitAnd(builder, laneStorage->ref(), tid, 63);
+    builder.andi32(laneStorage->ref(), 63, tid);
     lane = laneStorage->ref();
   }
   std::optional<RegisterRange> klStorage;
   RegisterRef klv = lane;
   if (dims.lanesK < 64) {
     klStorage = vgpr();
-    bitAnd(builder, klStorage->ref(), tid, dims.lanesK - 1);
+    builder.andi32(klStorage->ref(), dims.lanesK - 1, tid);
     klv = klStorage->ref();
   }
   std::optional<RegisterRange> w0Lane;
@@ -1218,7 +1073,7 @@ SkinnyGEMMEmitter::LaneValues SkinnyGEMMEmitter::computeLaneValues() {
   std::optional<RegisterRange> roleJ;
   if (dims.scalesShared) {
     roleJ = computeRoleJ(tid);
-    shiftLeft(builder, ldsStage->ref(), tid, 2);
+    builder.shli32(ldsStage->ref(), tid, 2);
   }
   RegisterRange sclOff = computeScaleOffset(lane, roleJ);
   std::optional<RegisterRange> w0Load;
@@ -1233,7 +1088,7 @@ SkinnyGEMMEmitter::LaneValues SkinnyGEMMEmitter::computeLaneValues() {
   }
   // v0 keeps kl for the epilogue; every use of the thread id is done.
   if (dims.waves > 1 || dims.lanesK < 64)
-    bitAnd(builder, tid, tid, dims.lanesK - 1);
+    builder.andi32(tid, dims.lanesK - 1, tid);
   return LaneValues{std::move(laneBytes), std::move(sclOff), std::move(w0Load),
                     std::move(w0Lane)};
 }
@@ -1274,7 +1129,7 @@ void SkinnyGEMMEmitter::fillScaleBases(const SetupScalars &scalars,
                                        const LaneValues &lane,
                                        RegisterRef w0Load) {
   if (scaleGroup)
-    bitAnd(builder, scaleGroup->ref(), lane.sclOff.ref(), -256);
+    builder.andi32(scaleGroup->ref(), -256, lane.sclOff.ref());
   for (int32_t r = 0; r < dims.bm; ++r) {
     RegisterRange col = sgpr();
     RegisterRange row = sgpr();
@@ -1321,8 +1176,8 @@ void SkinnyGEMMEmitter::selectorValue(RegisterRef dst, RegisterRef col) {
     value = sgpr();
     work = value->ref();
   }
-  shiftRight(builder, work, col, 4);
-  bitAnd(builder, work, work, 1);
+  builder.shrui32(work, col, 4);
+  builder.andi32(work, 1, work);
   builder.muli32(work, work, selectorMaskStep);
   builder.addi32(work, work, selectorBase);
   if (value)
@@ -1388,7 +1243,7 @@ void SkinnyGEMMEmitter::issueUpFrontScales() {
   RegisterRef baseOffset = chunkBase.ref(0);
   if (startIter) {
     headBase = sgpr();
-    shiftLeft(builder, headBase->ref(), baseIter, dims.log2Ki);
+    builder.shli32(headBase->ref(), baseIter, dims.log2Ki);
     baseOffset = headBase->ref();
   } else
     ensureChunkBase(0);
@@ -1401,7 +1256,7 @@ void SkinnyGEMMEmitter::issueUpFrontScales() {
     }
     if (entry == 1) {
       builder.addi32(soffset, baseIter, 1);
-      shiftLeft(builder, soffset, soffset, dims.log2Ki);
+      builder.shli32(soffset, soffset, dims.log2Ki);
     } else if (entry > 1)
       builder.addi32(soffset, baseOffset, entry * dims.ki);
     RegisterRef raw = scaleVector->ref(entry * dims.columns, dims.columns);
@@ -1479,9 +1334,8 @@ void SkinnyGEMMEmitter::stageScalesInLds() {
                                            kernel.target().maxVmcnt())});
     LdsAddress address =
         ldsAddress(builder, ldsStage->ref(), index * dims.waves * 256, scratch);
-    builder.create<rocisa::DSStoreB32>(address.base.container(),
-                                       scaleVector->sub(index),
-                                       rocisa::DSModifiers(1, address.offset));
+    builder.storeDs(address.base, scaleVector->ref(index), MemoryWidth::b32,
+                    address.offset);
   }
   builder.createWaitCnt(WaitCounts{.lds = 0});
   builder.create<rocisa::SBarrier>();
@@ -1497,13 +1351,10 @@ void SkinnyGEMMEmitter::readSharedEntry(int32_t entry) {
   for (int32_t c = 0; c < dims.columns; ++c) {
     int32_t offset = (entry * dims.columns + c) * dims.waves * 256;
     LdsAddress first = ldsAddress(builder, addresses.ref(), offset, scratch);
-    builder.create<rocisa::DSLoadB32>(lo.slice(c).container(),
-                                      first.base.container(),
-                                      rocisa::DSModifiers(1, first.offset));
+    builder.loadDs(lo.slice(c), first.base, MemoryWidth::b32, first.offset);
     LdsAddress second =
         ldsAddress(builder, addresses.ref(), offset + hiDelta, scratch);
-    builder.create<rocisa::DSLoadB32>(hi.sub(c), second.base.container(),
-                                      rocisa::DSModifiers(1, second.offset));
+    builder.loadDs(hi.ref(c), second.base, MemoryWidth::b32, second.offset);
   }
   permSlotScales(hi.ref(), lo, lo);
 }
@@ -1522,11 +1373,9 @@ SkinnyGEMMEmitter::selectScales(const SlotContext &context) {
     builder.create<rocisa::SCSelectB64>(std::make_shared<rocisa::VCC>(), -1, 0);
     for (int32_t c = 0; c < dims.columns; ++c) {
       // The first select reads entry 0 itself instead of a copy of it.
-      std::shared_ptr<rocisa::RegisterContainer> current =
-          entry == 1 ? scaleVector->sub(c) : packed.sub(c);
-      builder.create<rocisa::VCndMaskB32>(
-          packed.sub(c), current, scaleVector->sub(entry * dims.columns + c),
-          std::make_shared<rocisa::VCC>());
+      RegisterRef current = entry == 1 ? scaleVector->ref(c) : packed.ref(c);
+      builder.selectb32(packed.ref(c),
+                        scaleVector->ref(entry * dims.columns + c), current);
     }
   }
   return packed;
@@ -1591,15 +1440,14 @@ void SkinnyGEMMEmitter::wrapIteration(RegisterRef dst, RegisterRef sum) {
   RegisterRange wrapped = sgpr();
   builder.subi32(wrapped.ref(), sum, nIterFull.ref());
   builder.create<rocisa::SCmpGeU32>(sum.container(), nIterFull.container());
-  builder.create<rocisa::SCSelectB32>(dst.container(), wrapped.container(),
-                                      sum.container());
+  builder.selectb32(dst, wrapped.ref(), sum);
 }
 
 // chunkBase[u] = (kBaseIter << log2KI) + u * 16 * S, the part of the chunk
 // soffsets that does not depend on the iteration.
 void SkinnyGEMMEmitter::ensureChunkBase(int32_t chunk) {
   if (!chunkBaseReady[0]) {
-    shiftLeft(builder, chunkBase.ref(0), kBaseIter.ref(), dims.log2Ki);
+    builder.shli32(chunkBase.ref(0), kBaseIter.ref(), dims.log2Ki);
     chunkBaseReady[0] = true;
   }
   if (chunk == 0 || chunkBaseReady[chunk])
@@ -1625,16 +1473,13 @@ void SkinnyGEMMEmitter::issueScales(RegisterRef raw, RegisterRef soffset,
     steered = vgpr();
   for (int32_t c = 0; c < dims.columns; ++c) {
     RegisterRef dst = raw.slice(c);
-    std::shared_ptr<rocisa::RegisterContainer> voffset = sBase.sub(c);
+    RegisterRef voffset = sBase.ref(c);
     if (neg) {
-      builder.create<rocisa::VOrB32>(steered->container(), voffset,
-                                     neg->container());
-      voffset = steered->container();
+      builder.ori32(steered->ref(), voffset, *neg);
+      voffset = steered->ref();
     }
     RegisterRef rsrc = c < dims.bm ? sSclRsrc.ref() : wSclRsrc.ref();
-    builder.create<rocisa::BufferLoadB32>(dst.container(), voffset,
-                                          rsrc.container(), soffset.container(),
-                                          offen());
+    builder.loadBuffer(dst, rsrc, voffset, soffset, MemoryWidth::b32);
     if (recordLoads)
       prologueLoads.push_back(dst);
   }
@@ -1651,15 +1496,12 @@ void SkinnyGEMMEmitter::issueChunk(int32_t slot, int32_t chunk,
     steered = vgpr();
   for (int32_t c = 0; c < dims.columns; ++c) {
     RegisterRef dst = dataChunk(slot, chunk, c);
-    std::shared_ptr<rocisa::RegisterContainer> voffset = dBase.sub(c);
+    RegisterRef voffset = dBase.ref(c);
     if (neg) {
-      builder.create<rocisa::VOrB32>(steered->container(), voffset,
-                                     neg->container());
-      voffset = steered->container();
+      builder.ori32(steered->ref(), voffset, *neg);
+      voffset = steered->ref();
     }
-    builder.create<rocisa::BufferLoadB128>(dst.container(), voffset,
-                                           dataRsrc(c).container(),
-                                           soffset.container(), offen());
+    builder.loadBuffer(dst, dataRsrc(c), voffset, soffset, MemoryWidth::b128);
     if (recordLoads)
       prologueLoads.push_back(dst);
   }
@@ -1670,7 +1512,7 @@ void SkinnyGEMMEmitter::issueChunk(int32_t slot, int32_t chunk,
 void SkinnyGEMMEmitter::refillOffset(const SlotContext &context,
                                      RegisterRef soffset) {
   builder.addi32(soffset, kBaseIter.ref(), *context.refillIteration);
-  shiftLeft(builder, soffset, soffset, dims.log2Ki);
+  builder.shli32(soffset, soffset, dims.log2Ki);
 }
 
 // Computes the offset of the refill iteration and issues its ring scales;
@@ -1696,7 +1538,7 @@ void SkinnyGEMMEmitter::refillChunk(const SlotContext &context, int32_t chunk,
     ensureChunkBase(chunk);
     RegisterRef iteration = *context.refillIteration;
     if (chunk == 1)
-      shiftLeft(builder, iteration, iteration, dims.log2Ki);
+      builder.shli32(iteration, iteration, dims.log2Ki);
     builder.addi32(chunkOffset.ref(), chunkBase.ref(chunk), iteration);
   } else
     builder.addi32(chunkOffset.ref(), soffset, chunk * dims.chunkStride);
@@ -1747,10 +1589,10 @@ void SkinnyGEMMEmitter::decodeScales(RegisterRef dst, RegisterRef packed,
   for (int32_t c = 0; c < dims.columns; ++c) {
     RegisterRef scale = dst.slice(c);
     if (chunk < SkinnyDims::chunks - 1)
-      shiftLeft(builder, scale, packed.slice(c), 23 - 8 * chunk);
+      builder.shli32(scale, packed.slice(c), 23 - 8 * chunk);
     else
-      shiftRight(builder, scale, packed.slice(c), 1);
-    bitAnd(builder, scale, scale, exponentMask);
+      builder.shrui32(scale, packed.slice(c), 1);
+    builder.andi32(scale, exponentMask, scale);
   }
 }
 
@@ -1972,17 +1814,15 @@ void SkinnyGEMMEmitter::runPrefetchedLoop() {
     builder.addi32(steadyEnd.ref(), nIterFull.ref(), -1);
   else if (isPowerOfTwo(pf)) {
     int32_t log2Pf = log2Exact(pf);
-    builder.create<rocisa::SAShiftRightI32>(steadyEnd.container(), log2Pf,
-                                            nIterFull.container());
-    shiftLeft(builder, steadyEnd.ref(), steadyEnd.ref(), log2Pf);
+    builder.shrsi32(steadyEnd.ref(), nIterFull.ref(), log2Pf);
+    builder.shli32(steadyEnd.ref(), steadyEnd.ref(), log2Pf);
     builder.addi32(steadyEnd.ref(), steadyEnd.ref(), -pf);
   } else {
-    divideByConstant(builder, steadyEnd.ref(), nIterFull.ref(), pf);
+    builder.divsi32(steadyEnd.ref(), nIterFull.ref(), pf, /*useIEEE=*/true);
     builder.muli32(steadyEnd.ref(), steadyEnd.ref(), pf);
     builder.addi32(steadyEnd.ref(), steadyEnd.ref(), -pf);
   }
-  builder.create<rocisa::SMaxI32>(steadyEnd.container(), steadyEnd.container(),
-                                  0);
+  builder.maxsi32(steadyEnd.ref(), steadyEnd.ref(), 0);
   if (dims.upIters == 1)
     decodeHoistedScales();
   emitSteadyLoop(steadyEnd.ref());
@@ -2004,16 +1844,14 @@ void SkinnyGEMMEmitter::emitPrologue() {
   if (dims.prefetch > 1) {
     lastIteration = sgpr();
     builder.addi32(lastIteration->ref(), nIterFull.ref(), -1);
-    builder.create<rocisa::SMaxI32>(lastIteration->container(),
-                                    lastIteration->container(), 0);
+    builder.maxsi32(lastIteration->ref(), lastIteration->ref(), 0);
   }
   // LLVM hoists the chunk bases out of the prologue from PF = 4 on.
   bool hoisted = dims.prefetch >= 4;
   for (int32_t slot = 0; slot < dims.prefetch; ++slot) {
     RegisterRange physical = sgpr();
     if (slot > 0) {
-      builder.create<rocisa::SMinU32>(physical.container(),
-                                      lastIteration->container(), slot);
+      builder.minui32(physical.ref(), lastIteration->ref(), slot);
       if (fitRot)
         builder.addi32(physical.ref(), physical.ref(), fitRot->ref());
       wrapIteration(physical.ref(), physical.ref());
@@ -2025,8 +1863,7 @@ void SkinnyGEMMEmitter::emitPrologue() {
       RegisterRange wrapped = sgpr();
       builder.subi32(wrapped.ref(), 0, nIterFull.ref());
       builder.create<rocisa::SCmpLeU32>(nIterFull.container(), 0);
-      builder.create<rocisa::SCSelectB32>(physical.container(),
-                                          wrapped.container(), 0);
+      builder.selectb32(physical.ref(), wrapped.ref(), 0);
     }
     SlotContext context{slot, 0, physical.ref(), hoisted};
     RegisterRange soffset = sgpr();
@@ -2164,25 +2001,22 @@ optionalRef(const std::optional<RegisterRange> &range) {
 static void signOfSum(IRBuilder &builder, RegisterRef dst, RegisterRef src,
                       int32_t delta) {
   builder.addi32(dst, src, delta);
-  builder.create<rocisa::VAShiftRightI32>(dst.container(), 31, dst.container(),
-                                          "");
+  builder.shrsi32(dst, dst, 31);
 }
 
 // dst = -1 when delta - src is negative, else 0.
 static void signOfDifference(IRBuilder &builder, RegisterRef dst, int32_t delta,
                              RegisterRef src) {
   builder.subi32(dst, delta, src);
-  builder.create<rocisa::VAShiftRightI32>(dst.container(), 31, dst.container(),
-                                          "");
+  builder.shrsi32(dst, dst, 31);
 }
 
 // dst = 8 * clamp(src, 0, 3), the shift in bits of a mask of whole bytes.
 static void clampedBitShift(IRBuilder &builder, RegisterRef dst,
                             RegisterRef src) {
-  builder.create<rocisa::VMaxI32>(dst.container(), 0, src.container());
-  builder.create<rocisa::VMinI32>(dst.container(), maxMaskBytes,
-                                  dst.container());
-  shiftLeft(builder, dst, dst, 3);
+  builder.maxsi32(dst, 0, src);
+  builder.minsi32(dst, maxMaskBytes, dst);
+  builder.shli32(dst, dst, 3);
 }
 
 // Loads the raw scale dword of every column of the iteration at soffset into
@@ -2195,8 +2029,7 @@ void SkinnyGEMMEmitter::issueScalesWithinK(RegisterRef raw, RegisterRef soffset,
   RegisterRange neg = vgpr();
   builder.subi32(neg.ref(), kAvail, scaleGroup->ref());
   builder.addi32(neg.ref(), neg.ref(), -1);
-  builder.create<rocisa::VAShiftRightI32>(neg.container(), 31, neg.container(),
-                                          "");
+  builder.shrsi32(neg.ref(), neg.ref(), 31);
   issueScales(raw, soffset, neg.ref());
 }
 
@@ -2205,11 +2038,11 @@ void SkinnyGEMMEmitter::issueScalesWithinK(RegisterRef raw, RegisterRef soffset,
 // column holds it.
 void SkinnyGEMMEmitter::straddlesInChunk(RegisterRef dst, RegisterRef bound) {
   RegisterRange misaligned = sgpr();
-  shiftRight(builder, dst, bound, log2Exact(dims.chunkStride));
-  bitAnd(builder, dst, dst, SkinnyDims::chunks - 1);
-  builder.create<rocisa::SLShiftLeftB32>(dst.container(), dst.container(), 1);
-  bitAnd(builder, misaligned.ref(), bound, partBytes - 1);
-  builder.create<rocisa::SCSelectB32>(dst.container(), dst.container(), 0);
+  builder.shrui32(dst, bound, log2Exact(dims.chunkStride));
+  builder.andi32(dst, SkinnyDims::chunks - 1, dst);
+  builder.shli32(dst, 1, dst);
+  builder.andi32(misaligned.ref(), partBytes - 1, bound);
+  builder.selectb32(dst, dst, 0);
 }
 
 // The PF = 0 loop released its raw scales, and the step takes their registers
@@ -2225,7 +2058,7 @@ void SkinnyGEMMEmitter::allocateStepRawScales() {
 void SkinnyGEMMEmitter::runTailStep() {
   std::shared_ptr<rocisa::Label> stepEnd = builder.createLabel("step_end");
   RegisterRange hi = sgpr();
-  bitAnd(builder, hi.ref(), splitEnd->ref(), dims.ki - 1);
+  builder.andi32(hi.ref(), dims.ki - 1, splitEnd->ref());
   builder.create<rocisa::SCBranchSCC0>(stepEnd->getLabelName());
   RegisterRange iterOff = sgpr();
   builder.subi32(iterOff.ref(), splitEnd->ref(), hi.ref());
@@ -2238,7 +2071,7 @@ void SkinnyGEMMEmitter::runTailStep() {
   std::optional<RegisterRange> vectorIndex;
   if (dims.upIters >= 2) {
     vectorIndex = sgpr();
-    shiftRight(builder, vectorIndex->ref(), iterOff.ref(), dims.log2Ki);
+    builder.shrui32(vectorIndex->ref(), iterOff.ref(), dims.log2Ki);
     builder.subi32(vectorIndex->ref(), vectorIndex->ref(), kBaseIter.ref());
   }
   // v0 holds the lane's index in its cluster after the setup.
@@ -2271,18 +2104,18 @@ void SkinnyGEMMEmitter::runHeadAndTailSteps() {
   RegisterRange j = sgpr();
   RegisterRange end = sgpr();
   RegisterRange coverage = sgpr();
-  shiftRight(builder, endIter.ref(), splitEnd->ref(), dims.log2Ki);
+  builder.shrui32(endIter.ref(), splitEnd->ref(), dims.log2Ki);
   // j starts at the head, or past it when the split starts on an iteration.
-  bitAnd(builder, coverage.ref(), splitStart->ref(), dims.ki - 1);
-  builder.create<rocisa::SCSelectB32>(j.container(), 0, 1);
-  bitAnd(builder, coverage.ref(), splitEnd->ref(), dims.ki - 1);
-  builder.create<rocisa::SCSelectB32>(end.container(), 2, 1);
+  builder.andi32(coverage.ref(), dims.ki - 1, splitStart->ref());
+  builder.selectb32(j.ref(), 0, 1);
+  builder.andi32(coverage.ref(), dims.ki - 1, splitEnd->ref());
+  builder.selectb32(end.ref(), 2, 1);
   // coverage is 0 exactly when there is a head and it holds ke too.
   builder.create<rocisa::SCmpEQU32>(startIter->container(),
                                     endIter.container());
-  builder.create<rocisa::SCSelectB32>(coverage.container(), j.container(), 1);
+  builder.selectb32(coverage.ref(), j.ref(), 1);
   builder.create<rocisa::SCmpEQU32>(coverage.container(), 0);
-  builder.create<rocisa::SCSelectB32>(end.container(), 1, end.container());
+  builder.selectb32(end.ref(), 1, end.ref());
   coverage.release();
   allocateStepRawScales();
   RegisterRange laneBytes = computeLaneBytes(kernel.workitemId().ref());
@@ -2298,13 +2131,12 @@ void SkinnyGEMMEmitter::runHeadAndTailSteps() {
     RegisterRange lo = sgpr();
     RegisterRange hi = sgpr();
     builder.create<rocisa::SCmpEQU32>(j.container(), 0);
-    builder.create<rocisa::SCSelectB32>(
-        iter.container(), startIter->container(), endIter.container());
-    shiftLeft(builder, iterOff.ref(), iter.ref(), dims.log2Ki);
+    builder.selectb32(iter.ref(), startIter->ref(), endIter.ref());
+    builder.shli32(iterOff.ref(), iter.ref(), dims.log2Ki);
     builder.subi32(lo.ref(), splitStart->ref(), iterOff.ref());
-    builder.create<rocisa::SMaxI32>(lo.container(), lo.container(), 0);
+    builder.maxsi32(lo.ref(), lo.ref(), 0);
     builder.subi32(hi.ref(), splitEnd->ref(), iterOff.ref());
-    builder.create<rocisa::SMinI32>(hi.container(), hi.container(), dims.ki);
+    builder.minsi32(hi.ref(), hi.ref(), dims.ki);
     std::optional<RegisterRange> kAvail;
     if (dims.upIters == 0) {
       kAvail = sgpr();
@@ -2344,9 +2176,7 @@ void SkinnyGEMMEmitter::loadPartialStep(const PartialStep &step) {
   if (step.lo) {
     RegisterRange loChunks = sgpr();
     straddlesInChunk(loChunks.ref(), *step.lo);
-    builder.create<rocisa::SOrB32>(partialChunks.container(),
-                                   partialChunks.container(),
-                                   loChunks.container());
+    builder.ori32(partialChunks.ref(), partialChunks.ref(), loChunks.ref());
   }
   for (int32_t chunk = 0; chunk < SkinnyDims::chunks; ++chunk)
     loadStepChunk(step, chunk, partialChunks.ref());
@@ -2420,8 +2250,7 @@ void SkinnyGEMMEmitter::loadStepChunk(const PartialStep &step, int32_t chunk,
     if (laneLo) {
       RegisterRange belowLo = vgpr();
       signOfDifference(builder, belowLo.ref(), partBytes - 1, laneLo->ref());
-      builder.create<rocisa::VOrB32>(neg.container(), neg.container(),
-                                     belowLo.container());
+      builder.ori32(neg.ref(), neg.ref(), belowLo.ref());
     }
     issueChunk(0, chunk, soffset, neg.ref());
   }
@@ -2465,8 +2294,7 @@ void SkinnyGEMMEmitter::loadTailDwords(int32_t chunk, RegisterRef soffset,
     signOfSum(builder, steer.ref(), laneRem, -(start + 1));
     if (laneLo) {
       signOfDifference(builder, mask.ref(), start + dwordBytes - 1, *laneLo);
-      builder.create<rocisa::VOrB32>(steer.container(), steer.container(),
-                                     mask.container());
+      builder.ori32(steer.ref(), steer.ref(), mask.ref());
     }
     // Clear the bytes of the dword below lo and at or after hi.
     if (laneLo) {
@@ -2476,17 +2304,14 @@ void SkinnyGEMMEmitter::loadTailDwords(int32_t chunk, RegisterRef soffset,
         below = mask.ref();
       }
       clampedBitShift(builder, mask.ref(), below);
-      builder.create<rocisa::VLShiftLeftB32>(mask.container(), mask.container(),
-                                             -1);
+      builder.shli32(mask.ref(), -1, mask.ref());
     }
     RegisterRef hiMask = laneLo ? hiTemp->ref() : mask.ref();
     builder.subi32(hiMask, start + dwordBytes, laneRem);
     clampedBitShift(builder, hiMask, hiMask);
-    builder.create<rocisa::VLShiftRightB32>(hiMask.container(),
-                                            hiMask.container(), -1);
+    builder.shrui32(hiMask, -1, hiMask);
     if (laneLo)
-      builder.create<rocisa::VAndB32>(mask.container(), mask.container(),
-                                      hiMask.container());
+      builder.andi32(mask.ref(), mask.ref(), hiMask);
     std::optional<RegisterRange> dwordOffset;
     RegisterRef dwordSoffset = soffset;
     if (d > 0) {
@@ -2507,14 +2332,10 @@ void SkinnyGEMMEmitter::loadMaskedDword(int32_t chunk, int32_t column,
                                         RegisterRef steer, RegisterRef soffset,
                                         RegisterRef mask) {
   RegisterRef dst = dataChunk(0, chunk, column).slice(dword);
-  builder.create<rocisa::VOrB32>(voffset.container(), dBase.sub(column),
-                                 steer.container());
-  builder.create<rocisa::BufferLoadB32>(dst.container(), voffset.container(),
-                                        dataRsrc(column).container(),
-                                        soffset.container(), offen());
+  builder.ori32(voffset, dBase.ref(column), steer);
+  builder.loadBuffer(dst, dataRsrc(column), voffset, soffset, MemoryWidth::b32);
   waitForVectorLoads(0);
-  builder.create<rocisa::VAndB32>(dst.container(), dst.container(),
-                                  mask.container());
+  builder.andi32(dst, dst, mask);
 }
 
 // Persistent tile loop.
@@ -2535,10 +2356,10 @@ static void remainderByLiteral(IRBuilder &builder, RegisterRef dst,
                                RegisterRef src, RegisterRef quotient,
                                int32_t divisor) {
   if (isPowerOfTwo(divisor)) {
-    bitAnd(builder, dst, src, divisor - 1);
+    builder.andi32(dst, divisor - 1, src);
     return;
   }
-  multiplyBy(builder, dst, quotient, divisor);
+  builder.muli32(dst, quotient, divisor);
   builder.subi32(dst, src, dst);
 }
 
@@ -2547,12 +2368,12 @@ static void ceilDivByLiteral(IRBuilder &builder, RegisterRef dst,
                              RegisterRef src, int32_t divisor) {
   if (isPowerOfTwo(divisor)) {
     builder.addi32(dst, src, divisor - 1);
-    shiftRight(builder, dst, dst, log2Exact(divisor));
+    builder.shrui32(dst, dst, log2Exact(divisor));
     return;
   }
   RegisterRange sum = builder.allocateSgpr(1);
   builder.addi32(sum.ref(), src, divisor - 1);
-  divideByConstant(builder, dst, sum.ref(), divisor);
+  builder.divsi32(dst, sum.ref(), divisor, /*useIEEE=*/true);
 }
 
 // The values that every tile shares. The rotation keys on the block id in the
@@ -2574,7 +2395,7 @@ SkinnyGEMMEmitter::computeTileLoop(SetupScalars &scalars) {
   if (needsNi) {
     RegisterRange ni = sgpr();
     builder.addi32(ni.ref(), spk.ref(), dims.ki - 1);
-    shiftRight(builder, ni.ref(), ni.ref(), dims.log2Ki);
+    builder.shrui32(ni.ref(), ni.ref(), dims.log2Ki);
     loop.ni = std::move(ni);
   }
   if (!dims.reordered && dims.upIters != 1) {
@@ -2594,10 +2415,11 @@ SkinnyGEMMEmitter::computeTileLoop(SetupScalars &scalars) {
     RegisterRange last = sgpr();
     builder.addi32(last.ref(), loop.numTiles.ref(), -1);
     if (isPowerOfTwo(dims.numXcds))
-      bitAnd(builder, loop.tall->ref(), last.ref(), dims.numXcds - 1);
+      builder.andi32(loop.tall->ref(), dims.numXcds - 1, last.ref());
     else {
       RegisterRange quotient = sgpr();
-      divideByConstant(builder, quotient.ref(), last.ref(), dims.numXcds);
+      builder.divsi32(quotient.ref(), last.ref(), dims.numXcds,
+                      /*useIEEE=*/true);
       remainderByLiteral(builder, loop.tall->ref(), last.ref(), quotient.ref(),
                          dims.numXcds);
     }
@@ -2606,7 +2428,7 @@ SkinnyGEMMEmitter::computeTileLoop(SetupScalars &scalars) {
   if (dims.group != 1) {
     loop.tilesY = std::move(tilesY);
     loop.bandSize = sgpr();
-    multiplyBy(builder, loop.bandSize->ref(), loop.tilesX.ref(), dims.group);
+    builder.muli32(loop.bandSize->ref(), loop.tilesX.ref(), dims.group);
   }
   return loop;
 }
@@ -2688,13 +2510,12 @@ void SkinnyGEMMEmitter::decodeTile(const TileLoop &loop) {
     RegisterRange xcd = sgpr();
     RegisterRange shortage = sgpr();
     if (isPowerOfTwo(dims.numXcds))
-      shiftRight(builder, local.ref(), blockId, log2Exact(dims.numXcds));
+      builder.shrui32(local.ref(), blockId, log2Exact(dims.numXcds));
     else
-      divideByConstant(builder, local.ref(), blockId, dims.numXcds);
+      builder.divsi32(local.ref(), blockId, dims.numXcds, /*useIEEE=*/true);
     remainderByLiteral(builder, xcd.ref(), blockId, local.ref(), dims.numXcds);
     builder.subi32(shortage.ref(), xcd.ref(), loop.tall->ref());
-    builder.create<rocisa::SMaxI32>(shortage.container(), shortage.container(),
-                                    0);
+    builder.maxsi32(shortage.ref(), shortage.ref(), 0);
     builder.muli32(logical, xcd.ref(), loop.perXcd->ref());
     builder.addi32(logical, logical, local.ref());
     builder.subi32(logical, logical, shortage.ref());
@@ -2714,10 +2535,9 @@ void SkinnyGEMMEmitter::decodeTile(const TileLoop &loop) {
                     /*useIEEE=*/true);
     builder.muli32(inBand.ref(), band.ref(), loop.bandSize->ref());
     builder.subi32(inBand.ref(), pos.ref(), inBand.ref());
-    multiplyBy(builder, firstTy.ref(), band.ref(), dims.group);
+    builder.muli32(firstTy.ref(), band.ref(), dims.group);
     builder.subi32(rows.ref(), loop.tilesY->ref(), firstTy.ref());
-    builder.create<rocisa::SMinI32>(rows.container(), rows.container(),
-                                    dims.group);
+    builder.minsi32(rows.ref(), rows.ref(), dims.group);
     builder.divsi32(tile.tx, inBand.ref(), rows.ref(), /*useIEEE=*/true);
     builder.muli32(tile.ty, tile.tx, rows.ref());
     builder.subi32(tile.ty, inBand.ref(), tile.ty);
@@ -2938,14 +2758,13 @@ void SkinnyGEMMEmitter::computeTileFull(RegisterRef tileFull) {
   RegisterRange skinnyIn = sgpr();
   RegisterRange wideIn = sgpr();
   builder.addi32(skinnyEnd.ref(), tile.ty, 1);
-  multiplyBy(builder, skinnyEnd.ref(), skinnyEnd.ref(), dims.bm);
+  builder.muli32(skinnyEnd.ref(), skinnyEnd.ref(), dims.bm);
   builder.addi32(wideEnd.ref(), tile.tx, 1);
-  multiplyBy(builder, wideEnd.ref(), wideEnd.ref(), dims.tileWide);
+  builder.muli32(wideEnd.ref(), wideEnd.ref(), dims.tileWide);
   builder.cmpi32(Predicate::ule, skinnyIn.ref(), skinnyEnd.ref(),
                  skinnyCols.ref());
   builder.cmpi32(Predicate::ule, wideIn.ref(), wideEnd.ref(), wideCols.ref());
-  builder.create<rocisa::SAndB32>(tileFull.container(), skinnyIn.container(),
-                                  wideIn.container());
+  builder.andi32(tileFull, skinnyIn.ref(), wideIn.ref());
 }
 
 // Stores the tile into target: through the vector stores when the tile lies
@@ -3009,22 +2828,22 @@ void SkinnyGEMMEmitter::computeOffset(const EpilogueState &state,
     uniform = scalars.offset.ref();
     builder.movb32(uniform, scalars.base.ref());
     if (r != 0) {
-      multiplyBy(builder, scalars.scratch.ref(), target.strideS, r);
+      builder.muli32(scalars.scratch.ref(), target.strideS, r);
       builder.addi32(uniform, uniform, scalars.scratch.ref());
     }
     if (t != 0) {
-      multiplyBy(builder, scalars.scratch.ref(), target.strideW, t);
+      builder.muli32(scalars.scratch.ref(), target.strideW, t);
       builder.addi32(uniform, uniform, scalars.scratch.ref());
     }
   }
   if (state.wBase) {
     builder.addi32(state.off, uniform, *state.wBase);
-    shiftLeft(builder, state.off, state.off, log2Element);
+    builder.shli32(state.off, state.off, log2Element);
     return;
   }
   // The offset is uniform: shift it in the SALU and copy it to the VGPR.
   RegisterRef shifted = scalars.scratch.ref();
-  shiftLeft(builder, shifted, uniform, log2Element);
+  builder.shli32(shifted, uniform, log2Element);
   builder.movb32(state.off, shifted);
 }
 
@@ -3037,21 +2856,15 @@ void SkinnyGEMMEmitter::storeMasked(const EpilogueState &state,
     for (int32_t t = 0; t < dims.tn; ++t) {
       RegisterRef value = state.red.slice(redIndex(state.layout, r, t));
       if (target.bf16)
-        shiftRight(builder, value, value, 16);
+        builder.shrui32(value, value, 16);
       computeOffset(state, target, scalars, r, t);
-      builder.create<rocisa::SAndB64>(mask.container(), sValid.sub(2 * r, 2),
-                                      wValid.sub(2 * t, 2));
-      builder.create<rocisa::SAndB64>(mask.container(), mask.container(),
-                                      state.leader.container());
+      builder.andi64(mask.ref(), sValid.ref(2 * r, 2), wValid.ref(2 * t, 2));
+      builder.andi64(mask.ref(), mask.ref(), state.leader);
       builder.selectb32(state.off, mask.ref(), state.off, outOfRange);
       if (target.bf16)
-        builder.create<rocisa::BufferStoreB16>(
-            value.container(), state.off.container(), target.rsrc.container(),
-            0, offen());
+        builder.storeBuffer(value, target.rsrc, state.off, 0, MemoryWidth::b16);
       else
-        builder.create<rocisa::BufferStoreB32>(
-            value.container(), state.off.container(), target.rsrc.container(),
-            0, offen());
+        builder.storeBuffer(value, target.rsrc, state.off, 0, MemoryWidth::b32);
     }
   }
 }
@@ -3089,7 +2902,7 @@ void SkinnyGEMMEmitter::storeChunk(const EpilogueState &state,
     dwords = elements / 2;
     for (int32_t j = 0; j < elements; ++j) {
       RegisterRef value = state.red.slice(start + j);
-      shiftRight(builder, value, value, 16);
+      builder.shrui32(value, value, 16);
     }
     for (int32_t k = 0; k < dwords; ++k)
       builder.create<rocisa::VPackF16toB32>(
@@ -3097,21 +2910,17 @@ void SkinnyGEMMEmitter::storeChunk(const EpilogueState &state,
           state.red.slice(start + 2 * k).container(),
           state.red.slice(start + 2 * k + 1).container());
   }
-  std::shared_ptr<rocisa::RegisterContainer> data =
-      state.red.slice(start, dwords).container();
+  RegisterRef data = state.red.slice(start, dwords);
   RegisterRef off = state.off;
   switch (dwords) {
   case 1:
-    builder.create<rocisa::BufferStoreB32>(data, off.container(),
-                                           target.rsrc.container(), 0, offen());
+    builder.storeBuffer(data, target.rsrc, off, 0, MemoryWidth::b32);
     return;
   case 2:
-    builder.create<rocisa::BufferStoreB64>(data, off.container(),
-                                           target.rsrc.container(), 0, offen());
+    builder.storeBuffer(data, target.rsrc, off, 0, MemoryWidth::b64);
     return;
   default:
-    builder.create<rocisa::BufferStoreB128>(
-        data, off.container(), target.rsrc.container(), 0, offen());
+    builder.storeBuffer(data, target.rsrc, off, 0, MemoryWidth::b128);
   }
 }
 
@@ -3164,7 +2973,7 @@ private:
     // The block is (256, 1, 1), so the packed y and z fields of v0 are zero and
     // no mask is needed.
     RegisterRef tid = kernel.workitemId().ref();
-    shiftLeft(builder, tmp.ref(), kernel.workgroupIdX().ref(), 8);
+    builder.shli32(tmp.ref(), kernel.workgroupIdX().ref(), 8);
     builder.addi32(row.ref(), tmp, tid);
     // Scalar loads return out of order, so only lgkmcnt(0) guarantees any of
     // the six arguments.
@@ -3174,21 +2983,20 @@ private:
     builder.subi32(tmp.ref(), m, 1);
     // Both operands are below 2^31 because m <= 2^20 and i < m + 256, so the
     // signed min equals the unsigned one; rocisa has no v_min_u32.
-    builder.create<rocisa::VMinI32>(row.container(), tmp.container(),
-                                    row.container());
+    builder.minsi32(row.ref(), tmp.ref(), row.ref());
   }
 
   // Descriptors of ws (wsBytes) and D (dBytes), which bound the accesses.
   void makeResources() {
-    shiftLeft(builder, rowBytes.ref(), m.ref(), 2);
+    builder.shli32(rowBytes.ref(), m.ref(), 2);
     builder.muli32(sliceBytes.ref(), n, rowBytes);
     builder.muli32(wsRsrc.ref(2), splits, sliceBytes);
     // dBytes = ((n - 1) * ldD + m) * 2, as (2n - 2) * ldD + 2m.
     RegisterRef dBytes = dRsrc.ref(2);
-    shiftLeft(builder, dBytes, n.ref(), 1);
+    builder.shli32(dBytes, n.ref(), 1);
     builder.addi32(dBytes, dBytes, -2);
     builder.muli32(dBytes, dBytes, ldD);
-    shiftLeft(builder, tmp.ref(), m.ref(), 1);
+    builder.shli32(tmp.ref(), m.ref(), 1);
     builder.addi32(dBytes, dBytes, tmp);
     builder.makeRsrc(wsRsrc.ref(), wsRsrc.ref(0, 2), wsRsrc.ref(2));
     builder.makeRsrc(dRsrc.ref(), dRsrc.ref(0, 2), dBytes);
@@ -3199,7 +3007,7 @@ private:
   void sumSplits() {
     // The row register is dead after base, so it holds the sum.
     RegisterRef sum = row.ref();
-    shiftLeft(builder, row.ref(), row.ref(), 2);
+    builder.shli32(row.ref(), row.ref(), 2);
     builder.muli32(tmp.ref(), kernel.workgroupIdY(), rowBytes);
     builder.addi32(base.ref(), tmp, row);
     builder.movb32(split.ref(), 0);
@@ -3208,8 +3016,8 @@ private:
     builder.insert(loop);
     builder.muli32(tmp.ref(), split, sliceBytes);
     builder.addi32(value.ref(), tmp, base);
-    builder.create<rocisa::BufferLoadB32>(value.container(), value.container(),
-                                          wsRsrc.container(), 0, offen());
+    builder.loadBuffer(value.ref(), wsRsrc.ref(), value.ref(), 0,
+                       MemoryWidth::b32);
     // The load is the newest vector memory operation, so nothing is issued
     // after it and vmcnt waits down to 0.
     builder.createWaitCnt(WaitCounts{.vectorLoads = 0});
@@ -3226,7 +3034,7 @@ private:
     RegisterRef tid = kernel.workitemId().ref();
     RegisterRef blockX = kernel.workgroupIdX().ref();
     // truncf keeps the top 16 bits instead of rounding to nearest.
-    shiftRight(builder, sum, sum, 16);
+    builder.shrui32(sum, sum, 16);
     std::shared_ptr<rocisa::Label> skip = builder.createLabel("skip");
     builder.create<rocisa::SAndSaveExecB64>(savedExec.container(),
                                             std::make_shared<rocisa::VCC>());
@@ -3234,14 +3042,13 @@ private:
     // dOff = (j * ldD + i) * 2, recomputed from the thread id; the load
     // address register is dead.
     RegisterRef dOff = value.ref();
-    shiftLeft(builder, dOff, tid, 1);
-    shiftLeft(builder, tmp.ref(), blockX, 9);
+    builder.shli32(dOff, tid, 1);
+    builder.shli32(tmp.ref(), blockX, 9);
     builder.addi32(dOff, tmp, dOff);
     builder.muli32(tmp.ref(), kernel.workgroupIdY(), ldD);
-    shiftLeft(builder, tmp.ref(), tmp.ref(), 1);
+    builder.shli32(tmp.ref(), tmp.ref(), 1);
     builder.addi32(dOff, tmp, dOff);
-    builder.create<rocisa::BufferStoreB16>(sum.container(), dOff.container(),
-                                           dRsrc.container(), 0, offen());
+    builder.storeBuffer(sum, dRsrc.ref(), dOff, 0, MemoryWidth::b16);
     builder.insert(skip);
     builder.create<rocisa::SMovB64>(std::make_shared<rocisa::EXEC>(),
                                     savedExec.container());
