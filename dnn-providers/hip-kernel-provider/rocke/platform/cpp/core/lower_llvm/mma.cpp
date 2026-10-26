@@ -635,7 +635,7 @@ static void _emit_wmma_scale(rocke_lower_t* L, const rocke_op_t* op)
                       op_name,
                       gfx ? gfx : "(unknown)");
     }
-    if(L->flavor != ROCKE_LLVM_FLAVOR_LLVM23)
+    if(!rocke_ll_profile_has(L->flavor, ROCKE_LL_CAP_LLVM23_TARGET_OPS))
     {
         rocke_ll_fail(L,
                       ROCKE_ERR_NOTIMPL,
@@ -1418,7 +1418,7 @@ static void _op_tile_mfma_scale_f32_16x16x128_f8f6f4(rocke_lower_t* L, const roc
     {
         b_packed = rocke_ll_operand(L, b);
     }
-    if(L->flavor == ROCKE_LLVM_FLAVOR_LLVM23)
+    if(rocke_ll_profile_has(L->flavor, ROCKE_LL_CAP_SCALED_MFMA_9_ARG))
     {
         rocke_ll_emitf(L,
                        "  %s = call <4 x float> "

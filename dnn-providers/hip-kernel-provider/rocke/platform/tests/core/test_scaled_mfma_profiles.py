@@ -37,6 +37,7 @@ _EXPECTED_BY_FLAVOR = {
     "llvm20": (_LLVM20_22_DECL, _LLVM20_22_CALL),
     "llvm22": (_LLVM20_22_DECL, _LLVM20_22_CALL),
     "llvm23": (_LLVM23_DECL, _LLVM23_CALL),
+    "llvm24": (_LLVM23_DECL, _LLVM23_CALL),
 }
 
 
@@ -53,7 +54,7 @@ def _scaled_mfma_kernel() -> KernelDef:
     return builder.kernel
 
 
-class TestScaledMfmaLLVM23(unittest.TestCase):
+class TestScaledMfmaProfiles(unittest.TestCase):
     def test_flavor_specific_declaration_and_call_shape(self):
         kernel = _scaled_mfma_kernel()
         for flavor, (declaration, call) in _EXPECTED_BY_FLAVOR.items():
