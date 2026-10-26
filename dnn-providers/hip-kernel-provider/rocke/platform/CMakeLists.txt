@@ -374,6 +374,7 @@ if(ROCKE_INSTALL_TESTS)
     # Excludes: C/C++ parity emitters (compiled against rocke_core at build time),
     # the differential harness (needs compiler + source), the WaveScope sidecar
     # and LDS analyzer tests (load tools from the adjacent dsl_docs source tree),
+    # the MMA catalog cross-check unit tests (load tools/ from the source tree),
     # and the arch-domain artifact unit tests. The latter remain source-only
     # units, while the full regeneration sweep is installed below as its own
     # CTest with an independent timeout and resource policy.
@@ -398,6 +399,7 @@ if(ROCKE_INSTALL_TESTS)
               PATTERN "test_wavescope_sidecar.py" EXCLUDE
               PATTERN "test_lds_analyzer.py" EXCLUDE
               PATTERN "test_arch_domain_artifact.py" EXCLUDE
+              PATTERN "test_check_mma_catalog.py" EXCLUDE
               # Configures source CMake modules; not an installed runtime test.
               PATTERN "test_gpu_references.py" EXCLUDE)
 
