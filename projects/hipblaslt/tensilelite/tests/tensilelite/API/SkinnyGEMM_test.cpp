@@ -188,7 +188,7 @@ static std::string lgkmcnt(int32_t count) {
   return "s_waitcnt lgkmcnt(" + std::to_string(count) + ")";
 }
 
-// The kernel declares the reference's kernargs, hidden arguments and ids.
+// The kernel declares the reference's kernargs, the workgroup counts and ids.
 TEST(SkinnyGEMM, AssemblyHasTheReferenceAbi) {
   std::string assembly = emitted(config(1, 1, 16, 2, 1));
   SCOPED_TRACE("assembly:\n" + assembly);
@@ -196,26 +196,50 @@ TEST(SkinnyGEMM, AssemblyHasTheReferenceAbi) {
       assembly,
       {".name: gemm_BM1_TN1_LANES_K16_WAVES2_UP_ITERS0_PARTIAL_STEPS0_PF1_"
        "GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA0",
-       ".kernarg_segment_size: 120", ".group_segment_fixed_size: 0",
+       ".kernarg_segment_size: 112", ".group_segment_fixed_size: 0",
        ".max_flat_workgroup_size: 128"});
-  // The pointers, the scalars and the hidden arguments of the reference.
-  expectLinesInOrder(
-      assembly,
-      {".name: D",       ".offset: 0",  ".name: A",       ".offset: 8",
-       ".name: B",       ".offset: 16", ".name: scalesA", ".offset: 24",
-       ".name: scalesB", ".offset: 32", ".name: ws",      ".offset: 40",
-       ".name: C",       ".offset: 48", ".name: ldD",     ".offset: 56",
-       ".name: ldA",     ".offset: 60", ".name: ldB",     ".offset: 64",
-       ".name: m",       ".offset: 68", ".name: n",       ".offset: 72",
-       ".name: k",       ".offset: 76", ".name: spk",     ".offset: 80",
-       ".name: ldC",     ".offset: 84", ".name: alpha",   ".offset: 88",
-       ".name: beta",    ".offset: 92"});
-  expectLinesInOrder(assembly, {".offset: 96", "hidden_group_size_x",
-                                ".offset: 100", "hidden_group_size_y",
-                                ".offset: 104", "hidden_group_size_z",
-                                ".offset: 108", "hidden_block_count_x",
-                                ".offset: 112", "hidden_block_count_y",
-                                ".offset: 116", "hidden_block_count_z"});
+  // The pointers, the scalars and the workgroup counts of the reference.
+  expectLinesInOrder(assembly, {".name: D",
+                                ".offset: 0",
+                                ".name: A",
+                                ".offset: 8",
+                                ".name: B",
+                                ".offset: 16",
+                                ".name: scalesA",
+                                ".offset: 24",
+                                ".name: scalesB",
+                                ".offset: 32",
+                                ".name: ws",
+                                ".offset: 40",
+                                ".name: C",
+                                ".offset: 48",
+                                ".name: ldD",
+                                ".offset: 56",
+                                ".name: ldA",
+                                ".offset: 60",
+                                ".name: ldB",
+                                ".offset: 64",
+                                ".name: m",
+                                ".offset: 68",
+                                ".name: n",
+                                ".offset: 72",
+                                ".name: k",
+                                ".offset: 76",
+                                ".name: spk",
+                                ".offset: 80",
+                                ".name: ldC",
+                                ".offset: 84",
+                                ".name: alpha",
+                                ".offset: 88",
+                                ".name: beta",
+                                ".offset: 92",
+                                ".name: numWorkGroupsX",
+                                ".offset: 96",
+                                ".name: numWorkGroupsY",
+                                ".offset: 100",
+                                ".name: numWorkGroupsZ",
+                                ".offset: 104"});
+  EXPECT_EQ(assembly.find("hidden_"), std::string::npos);
   EXPECT_NE(assembly.find(".amdhsa_system_sgpr_workgroup_id_y 1"),
             std::string::npos);
   EXPECT_NE(assembly.find(".amdhsa_system_sgpr_workgroup_id_z 1"),
@@ -873,8 +897,8 @@ static SkinnyGEMMConfig persistentConfig(SkinnyGEMMConfig base,
   return base;
 }
 
-// The persistent kernel only enables the workgroup id x and reads only the
-// block count x of the hidden arguments, which is the number of blocks.
+// The persistent kernel only enables the workgroup id x and reads only
+// numWorkGroupsX, which is the number of blocks.
 TEST(SkinnyGEMM, PersistentLaunchAbi) {
   std::string assembly = emitted(persistentConfig(config(1, 1, 16, 1, 1)));
   SCOPED_TRACE("assembly:\n" + assembly);
@@ -882,10 +906,10 @@ TEST(SkinnyGEMM, PersistentLaunchAbi) {
             std::string::npos);
   EXPECT_EQ(assembly.find("workgroup_id_y"), std::string::npos);
   EXPECT_EQ(assembly.find("workgroup_id_z"), std::string::npos);
-  EXPECT_NE(assembly.find(".kernarg_segment_size: 120"), std::string::npos);
-  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 108"), 1);
-  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 112"), 0);
-  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 116"), 0);
+  EXPECT_NE(assembly.find(".kernarg_segment_size: 112"), std::string::npos);
+  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 96"), 1);
+  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 100"), 0);
+  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 104"), 0);
   // The kernel loads alpha but not C, ldC or beta.
   EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 88"), 1);
   EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 84"), 0);
@@ -1074,15 +1098,29 @@ TEST(SkinnyGEMM, BetaVariantSharesTheAbi) {
       assembly,
       {".name: gemm_BM1_TN1_LANES_K16_WAVES2_UP_ITERS0_PARTIAL_STEPS0_PF1_"
        "GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA1",
-       ".kernarg_segment_size: 120", ".group_segment_fixed_size: 0",
+       ".kernarg_segment_size: 112", ".group_segment_fixed_size: 0",
        ".max_flat_workgroup_size: 128"});
-  expectLinesInOrder(
-      assembly, {".name: D", ".offset: 0", ".name: ws", ".offset: 40",
-                 ".name: C", ".offset: 48", ".name: ldD", ".offset: 56",
-                 ".name: spk", ".offset: 80", ".name: ldC", ".offset: 84",
-                 ".name: alpha", ".offset: 88", ".name: beta", ".offset: 92"});
-  expectLinesInOrder(assembly, {".offset: 96", "hidden_group_size_x",
-                                ".offset: 116", "hidden_block_count_z"});
+  expectLinesInOrder(assembly, {".name: D",
+                                ".offset: 0",
+                                ".name: ws",
+                                ".offset: 40",
+                                ".name: C",
+                                ".offset: 48",
+                                ".name: ldD",
+                                ".offset: 56",
+                                ".name: spk",
+                                ".offset: 80",
+                                ".name: ldC",
+                                ".offset: 84",
+                                ".name: alpha",
+                                ".offset: 88",
+                                ".name: beta",
+                                ".offset: 92",
+                                ".name: numWorkGroupsX",
+                                ".offset: 96",
+                                ".name: numWorkGroupsZ",
+                                ".offset: 104"});
+  EXPECT_EQ(assembly.find("hidden_"), std::string::npos);
 }
 
 // Returns the text of assembly from the first occurrence of from to the first
@@ -1281,7 +1319,7 @@ TEST(SplitKReduce, EmitsTheReferenceSchedule) {
                                 "s_endpgm"});
 }
 
-// The reduce kernel declares the reference's hidden arguments.
+// The reduce kernel declares the reference's arguments and no hidden ones.
 TEST(SplitKReduce, DeclaresTheReferenceArguments) {
   std::string assembly = emitSplitKReduce(Target::get("gfx950"));
   SCOPED_TRACE("assembly:\n" + assembly);
@@ -1289,7 +1327,7 @@ TEST(SplitKReduce, DeclaresTheReferenceArguments) {
             std::string::npos);
   EXPECT_EQ(assembly.find("workgroup_id_z 1"), std::string::npos);
   expectLinesInOrder(assembly,
-                     {".name: splitk_reduce", ".kernarg_segment_size: 80",
+                     {".name: splitk_reduce", ".kernarg_segment_size: 56",
                       ".max_flat_workgroup_size: 256"});
   expectLinesInOrder(
       assembly, {".name: D",      ".offset: 0",  ".name: ws",   ".offset: 8",
@@ -1297,10 +1335,56 @@ TEST(SplitKReduce, DeclaresTheReferenceArguments) {
                  ".name: m",      ".offset: 28", ".name: n",    ".offset: 32",
                  ".name: splits", ".offset: 36", ".name: ldC",  ".offset: 40",
                  ".name: alpha",  ".offset: 44", ".name: beta", ".offset: 48"});
-  expectLinesInOrder(assembly, {".offset: 52", "hidden_group_size_x",
-                                ".offset: 56", "hidden_group_size_y",
-                                ".offset: 60", "hidden_group_size_z",
-                                ".offset: 64", "hidden_block_count_x",
-                                ".offset: 68", "hidden_block_count_y",
-                                ".offset: 72", "hidden_block_count_z"});
+  EXPECT_EQ(assembly.find("hidden_"), std::string::npos);
+}
+
+// The kernargs are explicit, so every code object version emits the same
+// kernel symbol and the same 112-byte segment; only the directives and the
+// metadata version differ.
+TEST(SkinnyGEMM, KernargsAreTheSameAtEveryCodeObjectVersion) {
+  struct VersionCase {
+    CodeObjectVersion version;
+    std::string directive;
+    std::string metadataVersion;
+  };
+  const std::vector<VersionCase> cases = {
+      {CodeObjectVersion::v4, ".amdhsa_code_object_version 4",
+       "amdhsa.version: [1, 1]"},
+      {CodeObjectVersion::v5, ".amdhsa_code_object_version 5",
+       "amdhsa.version: [1, 2]"},
+      {CodeObjectVersion::v6, ".amdhsa_code_object_version 6",
+       "amdhsa.version: [1, 2]"},
+  };
+  SkinnyGEMMConfig grid3d = config(1, 1, 16, 2, 1);
+  for (const SkinnyGEMMConfig &gemm :
+       {grid3d, persistentConfig(config(1, 1, 16, 1, 1))}) {
+    for (const VersionCase &versionCase : cases) {
+      KernelAbi abi;
+      abi.codeObjectVersion = versionCase.version;
+      std::string assembly = emitSkinnyGEMM(Target::get("gfx950"), gemm, abi);
+      SCOPED_TRACE("grid3d " + std::to_string(gemm.grid3d) + " directive " +
+                   versionCase.directive + "\nassembly:\n" + assembly);
+      EXPECT_NE(assembly.find(".name: " + skinnyGEMMKernelName(gemm)),
+                std::string::npos);
+      EXPECT_NE(assembly.find(".kernarg_segment_size: 112"), std::string::npos);
+      EXPECT_NE(assembly.find(versionCase.directive), std::string::npos);
+      EXPECT_NE(assembly.find(versionCase.metadataVersion), std::string::npos);
+      EXPECT_NE(assembly.find(".name: numWorkGroupsX"), std::string::npos);
+      EXPECT_EQ(assembly.find("hidden_"), std::string::npos);
+    }
+  }
+}
+
+// The reduce kernel needs no counts, so it also has the same arguments at
+// every code object version.
+TEST(SplitKReduce, KernargsAreTheSameAtEveryCodeObjectVersion) {
+  for (CodeObjectVersion version :
+       {CodeObjectVersion::v4, CodeObjectVersion::v5, CodeObjectVersion::v6}) {
+    KernelAbi abi;
+    abi.codeObjectVersion = version;
+    std::string assembly = emitSplitKReduce(Target::get("gfx950"), abi);
+    SCOPED_TRACE("assembly:\n" + assembly);
+    EXPECT_NE(assembly.find(".kernarg_segment_size: 56"), std::string::npos);
+    EXPECT_EQ(assembly.find("hidden_"), std::string::npos);
+  }
 }

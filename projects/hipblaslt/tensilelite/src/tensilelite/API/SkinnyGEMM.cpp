@@ -3444,8 +3444,9 @@ static void validate(const SkinnyGEMMConfig &config) {
   require(config.numXcds >= 1, "numXcds", config.numXcds, "at least 1");
 }
 
-// The kernarg layout of the reference: the pointers, the i32 scalars, then
-// the hidden group sizes and block counts.
+// The kernarg layout of the reference: the pointers, the i32 and f32 scalars,
+// then the host-filled workgroup counts; no hidden arguments, so it works at
+// every code object version.
 static SkinnyArguments declareArguments(KernelSignature &signature) {
   SkinnyArguments arguments;
   arguments.d = signature.addPointer("D");
@@ -3466,15 +3467,10 @@ static SkinnyArguments declareArguments(KernelSignature &signature) {
   // The f32 scalars only need their size: the metadata has no value type.
   arguments.alpha = signature.addScalar("alpha", 4);
   arguments.beta = signature.addScalar("beta", 4);
-  signature.addHidden(KernelArgumentKind::hiddenGroupSizeX, 4);
-  signature.addHidden(KernelArgumentKind::hiddenGroupSizeY, 4);
-  signature.addHidden(KernelArgumentKind::hiddenGroupSizeZ, 4);
-  arguments.blocksX =
-      signature.addHidden(KernelArgumentKind::hiddenBlockCountX, 4);
-  arguments.blocksY =
-      signature.addHidden(KernelArgumentKind::hiddenBlockCountY, 4);
-  arguments.blocksZ =
-      signature.addHidden(KernelArgumentKind::hiddenBlockCountZ, 4);
+  // The host fills the grid dimensions with the launched workgroup counts.
+  arguments.blocksX = signature.addScalar("numWorkGroupsX", 4);
+  arguments.blocksY = signature.addScalar("numWorkGroupsY", 4);
+  arguments.blocksZ = signature.addScalar("numWorkGroupsZ", 4);
   return arguments;
 }
 
@@ -3495,7 +3491,8 @@ rocm::tensilelite::skinnyGEMMKernelName(const SkinnyGEMMConfig &config) {
 }
 
 std::string rocm::tensilelite::emitSkinnyGEMM(const Target &target,
-                                              const SkinnyGEMMConfig &config) {
+                                              const SkinnyGEMMConfig &config,
+                                              const KernelAbi &abi) {
   validate(config);
   SkinnyDims dims(config);
   if (dims.ldsBytes > target.maxLdsSize())
@@ -3507,6 +3504,7 @@ std::string rocm::tensilelite::emitSkinnyGEMM(const Target &target,
   // The workgroup ids are the tile (tx, ty) and the split kz; the persistent
   // launch only has the block id x.
   KernelOptions options;
+  options.abi = abi;
   options.workgroupIdY = config.grid3d;
   options.workgroupIdZ = config.grid3d;
   Kernel kernel(target, skinnyGEMMKernelName(config), 64 * config.waves,
@@ -3524,7 +3522,8 @@ std::string rocm::tensilelite::emitSkinnyGEMM(const Target &target,
   return kernel.toAssembly();
 }
 
-std::string rocm::tensilelite::emitSplitKReduce(const Target &target) {
+std::string rocm::tensilelite::emitSplitKReduce(const Target &target,
+                                                const KernelAbi &abi) {
   KernelSignature signature;
   ReduceArguments offsets;
   offsets.d = signature.addPointer("D");
@@ -3537,14 +3536,9 @@ std::string rocm::tensilelite::emitSplitKReduce(const Target &target) {
   offsets.ldC = signature.addScalar("ldC", 4);
   offsets.alpha = signature.addScalar("alpha", 4);
   offsets.beta = signature.addScalar("beta", 4);
-  signature.addHidden(KernelArgumentKind::hiddenGroupSizeX, 4);
-  signature.addHidden(KernelArgumentKind::hiddenGroupSizeY, 4);
-  signature.addHidden(KernelArgumentKind::hiddenGroupSizeZ, 4);
-  signature.addHidden(KernelArgumentKind::hiddenBlockCountX, 4);
-  signature.addHidden(KernelArgumentKind::hiddenBlockCountY, 4);
-  signature.addHidden(KernelArgumentKind::hiddenBlockCountZ, 4);
   // The workgroup id y is the column j.
   KernelOptions options;
+  options.abi = abi;
   options.workgroupIdY = true;
   Kernel kernel(target, "splitk_reduce", reduceBlock, std::move(signature),
                 options);

@@ -4,6 +4,7 @@
 #ifndef ROCM_TENSILELITE_API_SKINNYGEMM_HPP
 #define ROCM_TENSILELITE_API_SKINNYGEMM_HPP
 
+#include <tensilelite/Codegen/KernelAbi.hpp>
 #include <tensilelite/Codegen/Target.hpp>
 
 #include <cstdint>
@@ -51,8 +52,12 @@ std::string skinnyGEMMKernelName(const SkinnyGEMMConfig &config);
 /// byte offsets, are the pointers D (0), A (8), B (16), scalesA (24), scalesB
 /// (32), ws (40) and C (48), then the i32 ldD (56), ldA (60), ldB (64), m (68),
 /// n (72), k (76), spk (80) and ldC (84), then the f32 alpha (88) and beta
-/// (92), then the hidden group sizes x, y, z (96 to 104) and block counts x, y,
-/// z (108 to 116), for a segment size of 120. The block is (64 * waves, 1, 1).
+/// (92), then the i32 numWorkGroupsX (96), numWorkGroupsY (100) and
+/// numWorkGroupsZ (104), the grid dimensions that the host (or the launcher)
+/// fills with the launched workgroup counts, for a segment size of 112. There
+/// are no hidden arguments at any code object version. abi selects the code
+/// object version (v4, v5 or v6) of the directives and the metadata;
+/// maxPreloadDwords is not honoured yet. The block is (64 * waves, 1, 1).
 /// BN = waves * (64 / lanesK) * tn. Both values of useBeta share this ABI.
 ///
 /// With several splits (k > spk) the kernel stores each split's raw f32 slice
@@ -87,12 +92,13 @@ std::string skinnyGEMMKernelName(const SkinnyGEMMConfig &config);
 /// ceil(max(m, n) / BN) * ceil(min(m, n) / bm) * ceil(k / spk) tiles, in the
 /// order of the XCD remap (numXcds) and the grouped decode (group); blocks past
 /// the tile count do nothing. The kernel computes the split count in the
-/// kernel and reads only the hidden block count x.
+/// kernel and reads only numWorkGroupsX.
 ///
 /// Throws std::invalid_argument for invalid knobs and when the configuration
 /// exceeds the LDS or the register budget.
 std::string emitSkinnyGEMM(const codegen::Target &target,
-                           const SkinnyGEMMConfig &config);
+                           const SkinnyGEMMConfig &config,
+                           const codegen::KernelAbi &abi = {});
 
 /// Emits the split-K reduction kernel splitk_reduce: with sum[i, j] the f32
 /// sum over z = 0..splits-1 of ws[z * m * n + j * m + i], summed in split order
@@ -102,11 +108,12 @@ std::string emitSkinnyGEMM(const codegen::Target &target,
 /// may alias D, and ldC is its own column stride. The kernargs, with their
 /// byte offsets, are the pointers D (0, bf16, column stride ldD), ws (8, f32)
 /// and C (16), then the i32 ldD (24), m (28), n (32), splits (36) and ldC
-/// (40), then the f32 alpha (44) and beta (48), then the hidden group sizes
-/// x, y, z (52 to 60) and block counts x, y, z (64 to 72), for a segment size
-/// of 80. The block is (256, 1, 1) and the grid is (ceil(m / 256), n, 1);
-/// splits must be at least 1.
-std::string emitSplitKReduce(const codegen::Target &target);
+/// (40), then the f32 alpha (44) and beta (48), for a segment size of 56 (the
+/// 52 bytes of arguments rounded up to 8). It has no hidden arguments and needs
+/// no workgroup counts. The block is (256, 1, 1) and the grid is (ceil(m /
+/// 256), n, 1); splits must be at least 1. The abi is as for emitSkinnyGEMM.
+std::string emitSplitKReduce(const codegen::Target &target,
+                             const codegen::KernelAbi &abi = {});
 
 } // namespace rocm::tensilelite
 

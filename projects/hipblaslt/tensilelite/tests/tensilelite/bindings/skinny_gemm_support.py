@@ -17,6 +17,11 @@ import numpy as np
 ARCH = "gfx950"
 TARGET = "amdgcn-amd-amdhsa--gfx950"
 REDUCE_KERNEL_NAME = "splitk_reduce"
+# The code object versions the kernels can be emitted for; 6 is the default.
+CODE_OBJECT_VERSIONS = (4, 5, 6)
+DEFAULT_CODE_OBJECT_VERSION = 6
+# The EI_ABIVERSION byte of the ELF header of a code object, per version.
+ELF_ABI_VERSIONS = {4: 2, 5: 3, 6: 4}
 # Keep in sync with the reduce block of the emitted splitk_reduce kernel.
 REDUCE_BLOCK = 256
 MX_BLOCK = 32
@@ -396,8 +401,8 @@ def loadKernel(hsaco: bytes, name: str) -> LoadedKernel:
 
 
 def launchKernel(kernel: LoadedKernel, grid, block, args) -> None:
-    """Launches with the explicit kernargs only (ctypes values; the runtime
-    fills the hidden arguments) and waits for completion."""
+    """Launches with the kernargs (ctypes values), which are the whole kernarg
+    segment as the kernels have no hidden arguments, and waits for completion."""
     hip = _hip()
     hipCheck(
         hip.hipModuleLaunchKernel(
@@ -425,8 +430,9 @@ def reduceArgs(
     alpha: float = 1.0,
     beta: float = 0.0,
 ) -> tuple:
-    """The explicit kernargs of splitk_reduce: the pointers D, ws and C, then
-    ldD, m, n, splits and ldC (i32), then alpha and beta (f32)."""
+    """The kernargs of splitk_reduce, which has no hidden arguments: the pointers
+    D, ws and C, then ldD, m, n, splits and ldC (i32), then alpha and beta
+    (f32)."""
     return (
         dBuf.pointer,
         wsBuf.pointer,
@@ -963,41 +969,78 @@ def expectedD(p: Problem, inputs: Inputs) -> np.ndarray:
     return (fused + scaled.astype(np.float64)).astype(np.float32)
 
 
-# Kernels are emitted and loaded once per session; the modules stay loaded
-# until the process exits.
-_kernelCache: dict[str, LoadedKernel] = {}
+# Kernels are emitted and loaded once per session, by name and code object
+# version; the modules stay loaded until the process exits.
+_kernelCache: dict[tuple[str, int], LoadedKernel] = {}
 
 
-def gemmKernel(p: Problem) -> LoadedKernel:
+def gemmAsm(p: Problem, codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION) -> str:
+    """The assembly text of the problem's GEMM kernel."""
+    import tensilelite_codegen
+
+    return tensilelite_codegen.emitSkinnyGEMM(
+        skinnyConfig(p), ARCH, codeObjectVersion
+    )
+
+
+def reduceAsm(codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION) -> str:
+    """The assembly text of the splitk_reduce kernel."""
+    import tensilelite_codegen
+
+    return tensilelite_codegen.emitSplitKReduce(ARCH, codeObjectVersion)
+
+
+def assemble(asm: str) -> bytes:
+    """The code object of an assembly text."""
+    import tensilelite_jit
+
+    return tensilelite_jit.assembleToHSACO(asm, TARGET)
+
+
+def elfAbiVersion(hsaco: bytes) -> int:
+    """EI_ABIVERSION of a code object (byte 8 of e_ident): 2, 3 and 4 for the
+    code object versions 4, 5 and 6."""
+    assert hsaco[:4] == b"\x7fELF", "not an ELF file"
+    return hsaco[8]
+
+
+def hasHiddenArgs(source: str | bytes) -> bool:
+    """Whether an assembly text or a code object declares a hidden kernel
+    argument. The metadata note of a code object stores its strings as they are,
+    so the value kinds are found in the bytes."""
+    data = source.encode() if isinstance(source, str) else source
+    return b"hidden_" in data
+
+
+def gemmKernel(
+    p: Problem, codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION
+) -> LoadedKernel:
     """The loaded GEMM kernel of the problem's configuration."""
-    import tensilelite_codegen
-    import tensilelite_jit
-
     name = gemmKernelName(p)
-    if name not in _kernelCache:
-        asm = tensilelite_codegen.emitSkinnyGEMM(skinnyConfig(p))
-        hsaco = tensilelite_jit.assembleToHSACO(asm, TARGET)
-        _kernelCache[name] = LoadedKernel(hsaco, name)
-    return _kernelCache[name]
+    key = (name, codeObjectVersion)
+    if key not in _kernelCache:
+        hsaco = assemble(gemmAsm(p, codeObjectVersion))
+        _kernelCache[key] = LoadedKernel(hsaco, name)
+    return _kernelCache[key]
 
 
-def reduceKernel() -> LoadedKernel:
+def reduceKernel(
+    codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION,
+) -> LoadedKernel:
     """The loaded splitk_reduce kernel."""
-    import tensilelite_codegen
-    import tensilelite_jit
-
-    if REDUCE_KERNEL_NAME not in _kernelCache:
-        hsaco = tensilelite_jit.assembleToHSACO(
-            tensilelite_codegen.emitSplitKReduce(), TARGET
-        )
-        _kernelCache[REDUCE_KERNEL_NAME] = LoadedKernel(hsaco, REDUCE_KERNEL_NAME)
-    return _kernelCache[REDUCE_KERNEL_NAME]
+    key = (REDUCE_KERNEL_NAME, codeObjectVersion)
+    if key not in _kernelCache:
+        hsaco = assemble(reduceAsm(codeObjectVersion))
+        _kernelCache[key] = LoadedKernel(hsaco, REDUCE_KERNEL_NAME)
+    return _kernelCache[key]
 
 
 def gemmArgs(p: Problem, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf) -> tuple:
-    """The explicit kernargs of the GEMM kernel: the pointers D, A, B, scalesA,
-    scalesB, ws and C, then ldD, ldA, ldB, m, n, k, spk and ldC (i32), then alpha
-    and beta (f32)."""
+    """The kernargs of the GEMM kernel, which has no hidden arguments: the
+    pointers D, A, B, scalesA, scalesB, ws and C, then ldD, ldA, ldB, m, n, k,
+    spk and ldC (i32), then alpha and beta (f32), then the launched workgroup
+    counts numWorkGroupsX, numWorkGroupsY and numWorkGroupsZ (i32), which are
+    the grid of the problem."""
     return (
         dBuf.pointer,
         aBuf.pointer,
@@ -1012,6 +1055,7 @@ def gemmArgs(p: Problem, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf) -> tup
         ),
         ctypes.c_float(p.alpha),
         ctypes.c_float(p.beta),
+        *(ctypes.c_int32(count) for count in p.grid),
     )
 
 
@@ -1022,7 +1066,7 @@ def gemmBlock(p: Problem) -> tuple[int, int, int]:
 def launchGemm(
     p: Problem, kernel, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf
 ) -> None:
-    """Runs the GEMM kernel with its explicit kernargs."""
+    """Runs the GEMM kernel with its kernargs."""
     args = gemmArgs(p, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf)
     launchKernel(kernel, p.grid, gemmBlock(p), args)
 
@@ -1047,14 +1091,19 @@ def verifyGemm(p: Problem, inputs: Inputs, dBits: np.ndarray, ws: np.ndarray) ->
 
 
 def executeProblem(
-    p: Problem, inputs: Inputs, iters: int, verifyFn=None, aliasC: bool = False
+    p: Problem,
+    inputs: Inputs,
+    iters: int,
+    verifyFn=None,
+    aliasC: bool = False,
+    codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION,
 ) -> np.ndarray:
     """Launches the GEMM (and the split-K reduction) iters times each, which must
     be idempotent, checks the results against the reference unless the inputs
     carry none, and returns the D bits. verifyFn(inputs, (dBits, ws)) replaces
     the GEMM check. With aliasC, C and D share one buffer that starts as C
     (ldC == ldD), and a single iteration is allowed since the reduce overwrites
-    C."""
+    C. The kernels are emitted for codeObjectVersion."""
     dBits, ws = makeOutputs(p.m, p.n, p.ldD, p.splits)
     if aliasC:
         assert p.ldC == p.ldD and iters == 1, "aliasing needs ldC == ldD, 1 iter"
@@ -1065,7 +1114,7 @@ def executeProblem(
             stack.enter_context(DeviceBuffer(array)) for array in arrays
         )
         cBuf = dBuf if aliasC else stack.enter_context(DeviceBuffer(inputs.cBits))
-        kernel = gemmKernel(p)
+        kernel = gemmKernel(p, codeObjectVersion)
         for _ in range(iters):
             launchGemm(p, kernel, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf)
         dBuf.download(dBits)
@@ -1075,7 +1124,7 @@ def executeProblem(
         elif inputs.expected is not None:
             verifyGemm(p, inputs, dBits, ws)
         if p.splits > 1:
-            reducer = reduceKernel()
+            reducer = reduceKernel(codeObjectVersion)
             for _ in range(iters):
                 launchReduce(
                     reducer,
@@ -1096,9 +1145,17 @@ def executeProblem(
     return dBits
 
 
-def runProblem(p: Problem, iters: int, seed: int = 42, verifyFn=None) -> None:
+def runProblem(
+    p: Problem,
+    iters: int,
+    seed: int = 42,
+    verifyFn=None,
+    codeObjectVersion: int = DEFAULT_CODE_OBJECT_VERSION,
+) -> None:
     """Runs and verifies the problem on random inputs."""
-    executeProblem(p, makeInputs(p, seed), iters, verifyFn)
+    executeProblem(
+        p, makeInputs(p, seed), iters, verifyFn, codeObjectVersion=codeObjectVersion
+    )
 
 
 def computeD(p: Problem, seed: int) -> np.ndarray:

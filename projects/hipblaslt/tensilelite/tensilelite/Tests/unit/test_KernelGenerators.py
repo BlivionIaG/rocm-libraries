@@ -71,6 +71,9 @@ EXPECTED_ARGS = [
     {"type": "int32", "semantic": "StrideC0"},
     {"type": "float32", "semantic": "Alpha"},
     {"type": "float32", "semantic": "Beta"},
+    {"type": "int32", "semantic": "NumWorkGroupsX"},
+    {"type": "int32", "semantic": "NumWorkGroupsY"},
+    {"type": "int32", "semantic": "NumWorkGroupsZ"},
 ]
 
 COMMON_ASSERTS = {
@@ -685,12 +688,18 @@ def test_assign_generated_code_object_files(fakeCodegen):
 # --------------------------------------------------------------------------- #
 # The real emitter.
 # --------------------------------------------------------------------------- #
-def emittedExplicitArgs(source):
+def emittedMetadata(source):
     match = re.search(r"\.amdgpu_metadata\n(.*?)\n\.end_amdgpu_metadata", source, re.S)
     assert match, "no metadata in the emitted source"
-    metadata = yaml.safe_load(match.group(1).split("\n...")[0])
-    kernel = metadata["amdhsa.kernels"][0]
-    return [arg for arg in kernel[".args"] if not arg[".value_kind"].startswith("hidden_")]
+    return yaml.safe_load(match.group(1).split("\n...")[0])
+
+
+def emittedKernelMetadata(source):
+    return emittedMetadata(source)["amdhsa.kernels"][0]
+
+
+def emittedExplicitArgs(source):
+    return [arg for arg in emittedKernelMetadata(source)[".args"] if not arg[".value_kind"].startswith("hidden_")]
 
 
 @needsCodegen
@@ -715,20 +724,49 @@ def test_real_source_is_code_object_v6():
     assert kernelNameOf(S1) in source
 
 
-@needsCodegen
-@pytest.mark.parametrize("params", [S1, S4, betaVariant(S1), betaVariant(S4)])
-def test_real_emitted_arguments_match_the_declared_ones(params):
-    explicit = emittedExplicitArgs(SkinnyGEMM.emit(params, "gfx950"))
+ARG_NAMES = [
+    "D", "A", "B", "scalesA", "scalesB", "ws", "C", "ldD", "ldA", "ldB", "m", "n", "k", "spk",
+    "ldC", "alpha", "beta", "numWorkGroupsX", "numWorkGroupsY", "numWorkGroupsZ",
+]
+ARG_SIZES = {"address": 8, "uint64": 8, "int32": 4, "float32": 4}
+
+
+def checkEmittedArguments(source):
+    """The explicit kernargs are the declared ones, packed in order, and they are the whole segment."""
+    explicit = emittedExplicitArgs(source)
     declared = SkinnyGEMM.args()
-    assert len(explicit) == len(declared) == 17
-    assert [arg[".name"] for arg in explicit] == [
-        "D", "A", "B", "scalesA", "scalesB", "ws", "C", "ldD", "ldA", "ldB", "m", "n", "k", "spk",
-        "ldC", "alpha", "beta",
-    ]
-    sizes = {"address": 8, "uint64": 8, "int32": 4, "float32": 4}
+    assert len(explicit) == len(declared) == len(ARG_NAMES) == 20
+    assert [arg[".name"] for arg in explicit] == ARG_NAMES
     offset = 0
     for emitted, arg in zip(explicit, declared):
-        assert emitted[".size"] == sizes[arg["type"]]
+        assert emitted[".size"] == ARG_SIZES[arg["type"]]
         assert emitted[".offset"] == offset
         assert (emitted[".value_kind"] == "global_buffer") == (arg["type"] in ("address", "uint64"))
         offset += emitted[".size"]
+    assert "hidden_" not in source
+    # The segment is the arguments rounded up to 8 bytes.
+    assert offset == 108
+    assert emittedKernelMetadata(source)[".kernarg_segment_size"] == 112
+
+
+@needsCodegen
+@pytest.mark.parametrize("params", [S1, S4, betaVariant(S1), betaVariant(S4)])
+def test_real_emitted_arguments_match_the_declared_ones(params):
+    checkEmittedArguments(SkinnyGEMM.emit(params, "gfx950"))
+
+
+# The code object version of the directive and the amdhsa.version of the metadata.
+CODE_OBJECT_VERSION_METADATA = {4: [1, 1], 5: [1, 2], 6: [1, 2]}
+
+
+@needsCodegen
+@pytest.mark.parametrize("codeObjectVersion", [4, 5, 6])
+@pytest.mark.parametrize("params", [S1, S4, betaVariant(S1), betaVariant(S4)])
+def test_real_emitted_arguments_at_every_code_object_version(params, codeObjectVersion):
+    source = realCodegen().emitSkinnyGEMM(
+        realCodegen().SkinnyGEMMConfig(**params), "gfx950", codeObjectVersion
+    )
+    checkEmittedArguments(source)
+    assert f".amdhsa_code_object_version {codeObjectVersion}" in source
+    assert emittedMetadata(source)["amdhsa.version"] == CODE_OBJECT_VERSION_METADATA[codeObjectVersion]
+    assert kernelNameOf(params) in source

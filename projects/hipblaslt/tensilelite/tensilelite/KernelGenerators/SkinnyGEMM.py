@@ -47,6 +47,10 @@ _ARGS = (
     {"type": "int32", "semantic": "StrideC0"},
     {"type": "float32", "semantic": "Alpha"},
     {"type": "float32", "semantic": "Beta"},
+    # The launched workgroup counts, filled by the host.
+    {"type": "int32", "semantic": "NumWorkGroupsX"},
+    {"type": "int32", "semantic": "NumWorkGroupsY"},
+    {"type": "int32", "semantic": "NumWorkGroupsZ"},
 )
 
 

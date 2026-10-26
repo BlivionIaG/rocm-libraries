@@ -122,7 +122,7 @@ def test_emit_skinny_gemm_assembles():
     config = codegen.SkinnyGEMMConfig(lanesK=16, waves=1, prefetch=1)
     asm = codegen.emitSkinnyGEMM(config)
     assert f".globl {codegen.skinnyGEMMKernelName(config)}" in asm
-    assert ".kernarg_segment_size: 120" in asm
+    assert ".kernarg_segment_size: 112" in asm
     assert ".group_segment_fixed_size: 0" in asm
     assert jit.assembleToHSACO(asm, support.TARGET)[:4] == ELF_MAGIC
 
@@ -144,7 +144,7 @@ def test_unsupported_arch():
 def test_emit_split_k_reduce_assembles():
     asm = codegen.emitSplitKReduce()
     assert ".globl splitk_reduce" in asm
-    assert ".kernarg_segment_size: 80" in asm
+    assert ".kernarg_segment_size: 56" in asm
     assert jit.assembleToHSACO(asm, support.TARGET)[:4] == ELF_MAGIC
 
 
@@ -2738,3 +2738,95 @@ def test_tail_scales_never_read_the_next_row_group(LANES_K, K, UP):
         )
 
     support.executeProblem(p, inputs, 1, verifyFn=verifyFirstRowGroup)
+
+
+# The kernels pass the launched workgroup counts as explicit kernargs and have
+# no hidden arguments, so they run at every code object version. The cases are
+# the smallest of each launch: the 3-D grid and the persistent grid with fewer
+# blocks than tiles (so a wrong numWorkGroupsX shows), each with and without
+# beta and with and without split-K (GEMM and reduce).
+GRID_3D_KNOBS = dict(m=2, n=300, k=2048, spk=2048, up_scales=0)
+PERSISTENT_KNOBS = dict(
+    m=7, n=150, k=1024, spk=1024, bm=3, tn=2, lanes_k=16, waves=2, pf=1, blocks=5
+)
+CODE_OBJECT_VERSION_CASES = {
+    "grid3d": {**GRID_3D_KNOBS},
+    "grid3d_beta": {**GRID_3D_KNOBS, "use_beta": True},
+    "grid3d_split_k": {**GRID_3D_KNOBS, "k": 4096, "spk": 1024},
+    "grid3d_beta_split_k": {**GRID_3D_KNOBS, "k": 4096, "spk": 1024, "use_beta": True},
+    "persistent": {**PERSISTENT_KNOBS, "up_scales": 0},
+    "persistent_beta": {**PERSISTENT_KNOBS, "up_scales": 0, "use_beta": True},
+    "persistent_split_k": {**PERSISTENT_KNOBS, "up_scales": 0, "k": 2048},
+}
+
+
+def codeObjectVersionProblem(name):
+    knobs = CODE_OBJECT_VERSION_CASES[name]
+    return resolve(**knobs, alpha=0.75, beta=-2.5)
+
+
+def test_code_object_version_cases_cover_both_launches():
+    problems = {
+        name: codeObjectVersionProblem(name) for name in CODE_OBJECT_VERSION_CASES
+    }
+    assert all(p.grid3d == name.startswith("grid3d") for name, p in problems.items())
+    assert all(
+        (p.splits > 1) == name.endswith("split_k") for name, p in problems.items()
+    )
+    persistent = problems["persistent"]
+    tiles = support.countTiles(
+        persistent.m,
+        persistent.n,
+        persistent.k,
+        persistent.spk,
+        persistent.bm,
+        persistent.bn,
+    )
+    assert 1 < persistent.blocks < tiles
+
+
+@pytest.mark.parametrize("codeObjectVersion", support.CODE_OBJECT_VERSIONS)
+@pytest.mark.parametrize("name", CODE_OBJECT_VERSION_CASES)
+def test_gemm_mxfp8_skinny_code_object_versions_run(name, codeObjectVersion):
+    """The GEMM (and the split-K reduce) built for the code object version
+    matches the reference."""
+    p = codeObjectVersionProblem(name)
+    skipUnlessRunnable(p)
+    try:
+        support.runProblem(p, 3, codeObjectVersion=codeObjectVersion)
+    except ValueError as err:
+        if p.use_beta and "register budget" in str(err):
+            pytest.skip(str(err))
+        raise
+
+
+@pytest.mark.parametrize("codeObjectVersion", support.CODE_OBJECT_VERSIONS)
+@pytest.mark.parametrize("name", CODE_OBJECT_VERSION_CASES)
+def test_gemm_mxfp8_skinny_code_object_version_abi(name, codeObjectVersion):
+    """The code object has the ELF ABI version of the code object version and no
+    hidden arguments, neither the GEMM nor the reduce."""
+    p = codeObjectVersionProblem(name)
+    sources = [(support.gemmAsm(p, codeObjectVersion), b"numWorkGroupsX")]
+    if p.splits > 1:
+        sources.append((support.reduceAsm(codeObjectVersion), b"splits"))
+    for asm, argumentName in sources:
+        assert not support.hasHiddenArgs(asm)
+        hsaco = support.assemble(asm)
+        expectedAbi = support.ELF_ABI_VERSIONS[codeObjectVersion]
+        assert support.elfAbiVersion(hsaco) == expectedAbi
+        # The metadata strings are in the bytes, so the check below can fail.
+        assert argumentName in hsaco
+        assert not support.hasHiddenArgs(hsaco)
+
+
+def test_has_hidden_args_detects_the_value_kinds():
+    assert support.hasHiddenArgs(".value_kind: hidden_block_count_x")
+    assert support.hasHiddenArgs(b".value_kind: hidden_group_size_x")
+    assert not support.hasHiddenArgs(".value_kind: by_value")
+
+
+def test_code_object_version_must_be_4_5_or_6():
+    with pytest.raises(ValueError, match="codeObjectVersion must be 4, 5 or 6, got 3"):
+        codegen.emitSplitKReduce("gfx950", 3)
+    with pytest.raises(ValueError, match="codeObjectVersion must be 4, 5 or 6, got 7"):
+        codegen.emitSkinnyGEMM(codegen.SkinnyGEMMConfig(), "gfx950", 7)

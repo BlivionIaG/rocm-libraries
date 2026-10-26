@@ -8,6 +8,7 @@
 #include <nanobind/stl/string.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 namespace nb = nanobind;
@@ -15,6 +16,26 @@ using namespace nb::literals;
 
 using namespace rocm::tensilelite;
 using namespace rocm::tensilelite::codegen;
+
+// The version is an int because the JIT module already registers the
+// CodeObjectVersion enum.
+static KernelAbi makeAbi(int32_t codeObjectVersion) {
+  KernelAbi abi;
+  switch (codeObjectVersion) {
+  case 4:
+    abi.codeObjectVersion = CodeObjectVersion::v4;
+    return abi;
+  case 5:
+    abi.codeObjectVersion = CodeObjectVersion::v5;
+    return abi;
+  case 6:
+    abi.codeObjectVersion = CodeObjectVersion::v6;
+    return abi;
+  default:
+    throw std::invalid_argument("codeObjectVersion must be 4, 5 or 6, got " +
+                                std::to_string(codeObjectVersion));
+  }
+}
 
 NB_MODULE(tensilelite_codegen, m) {
   m.doc() = "Kernels emitted with the TensileLite C++ codegen library.";
@@ -66,26 +87,31 @@ NB_MODULE(tensilelite_codegen, m) {
   // each call builds its kernel on the calling thread.
   m.def(
       "emitSkinnyGEMM",
-      [](const SkinnyGEMMConfig &config, const std::string &arch) {
-        return emitSkinnyGEMM(Target::get(arch), config);
+      [](const SkinnyGEMMConfig &config, const std::string &arch,
+         int32_t codeObjectVersion) {
+        return emitSkinnyGEMM(Target::get(arch), config,
+                              makeAbi(codeObjectVersion));
       },
-      "config"_a, "arch"_a = "gfx950",
+      "config"_a, "arch"_a = "gfx950", "codeObjectVersion"_a = 6,
       "Returns the assembly text of the GEMM kernel for config, for the 3-D "
       "launch (grid3d, group = 1, numXcds = 1) with any upIters and "
       "partialSteps. Raises ValueError for invalid knobs, an unsupported arch, "
       "the features that are not emitted yet (grid3d = false, group, numXcds; "
       "the message names the knob) and a configuration that exceeds the "
-      "register budget.");
+      "register budget. codeObjectVersion (4, 5 or 6) selects the directives "
+      "and the metadata, and raises ValueError for another value; the kernargs "
+      "are the same at every version.");
 
   m.def(
       "emitSplitKReduce",
-      [](const std::string &arch) {
-        return emitSplitKReduce(Target::get(arch));
+      [](const std::string &arch, int32_t codeObjectVersion) {
+        return emitSplitKReduce(Target::get(arch), makeAbi(codeObjectVersion));
       },
-      "arch"_a = "gfx950",
+      "arch"_a = "gfx950", "codeObjectVersion"_a = 6,
       "Returns the assembly text of the splitk_reduce kernel: D[i, j] is the "
       "bf16 truncation of fma(beta, C[j * ldC + i], alpha * sum), with sum the "
       "f32 sum over the splits of ws[z * m * n + j * m + i]; C is read only "
       "when beta is not zero. Block (256, 1, 1), grid (ceil(m / 256), n, 1). "
-      "Raises ValueError for an unsupported arch.");
+      "codeObjectVersion (4, 5 or 6) selects the directives and the metadata. "
+      "Raises ValueError for an unsupported arch or code object version.");
 }

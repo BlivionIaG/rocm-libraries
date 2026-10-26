@@ -219,22 +219,26 @@ def loadAsmKernel(stack: ExitStack, pattern: str, name: str) -> LoadedKernel:
     return stack.enter_context(LoadedKernel(hsaco, name))
 
 
-def gemmKernelFor(stack: ExitStack, p: Problem, asmDir: str | None) -> LoadedKernel:
+def gemmKernelFor(
+    stack: ExitStack, p: Problem, asmDir: str | None, codeObjectVersion: int
+) -> LoadedKernel:
     if asmDir is None:
-        return support.gemmKernel(p)
+        return support.gemmKernel(p, codeObjectVersion)
     name = support.gemmKernelName(p)
     return loadAsmKernel(stack, f"{asmDir}/{name}_*/kernel.s", name)
 
 
-def reduceKernelFor(stack: ExitStack, asmDir: str | None) -> LoadedKernel:
+def reduceKernelFor(
+    stack: ExitStack, asmDir: str | None, codeObjectVersion: int
+) -> LoadedKernel:
     if asmDir is None:
-        return support.reduceKernel()
+        return support.reduceKernel(codeObjectVersion)
     name = support.REDUCE_KERNEL_NAME
     return loadAsmKernel(stack, f"{asmDir}/{name}_*/kernel.s", name)
 
 
 def benchProblem(
-    p: Problem, iters: int, verify: bool, asmDir: str | None
+    p: Problem, iters: int, verify: bool, asmDir: str | None, codeObjectVersion: int
 ) -> tuple[list[int], list[int] | None]:
     """Times the GEMM (cold LLC) and, for split-K, the reduce (warm) in ns per
     iteration; with verify the results are checked against the host reference."""
@@ -254,7 +258,7 @@ def benchProblem(
         dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf = (
             stack.enter_context(DeviceBuffer(array)) for array in arrays
         )
-        kernel = gemmKernelFor(stack, p, asmDir)
+        kernel = gemmKernelFor(stack, p, asmDir, codeObjectVersion)
         flush = stack.enter_context(LlcFlush())
         args = support.gemmArgs(p, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf)
         gemmTimes = timeLaunches(
@@ -265,7 +269,7 @@ def benchProblem(
             wsBuf.download(ws)
             support.verifyGemm(p, inputs, dBits, ws)
         if p.splits > 1:
-            reducer = reduceKernelFor(stack, asmDir)
+            reducer = reduceKernelFor(stack, asmDir, codeObjectVersion)
             grid, block = support.reduceLaunchDims(p.m, p.n)
             args = support.reduceArgs(
                 dBuf, wsBuf, cBuf, p.ldD, p.m, p.n, p.splits, p.ldC, p.alpha, p.beta
@@ -308,16 +312,14 @@ def formatSweepLine(p: Problem, gemmTimes, reduceTimes) -> str:
     return "SWEEP " + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
-def printAsm(p: Problem) -> None:
+def printAsm(p: Problem, codeObjectVersion: int) -> None:
     """Prints the emitted GEMM kernel's .s, and the split-K reduce's if the
     problem splits K, straight from the emitter (no assembling or GPU)."""
-    import tensilelite_codegen
-
     print(f"# ASM {p.label}", flush=True)
-    print(tensilelite_codegen.emitSkinnyGEMM(support.skinnyConfig(p)))
+    print(support.gemmAsm(p, codeObjectVersion))
     if p.splits > 1:
         print(f"# ASM {support.REDUCE_KERNEL_NAME}", flush=True)
-        print(tensilelite_codegen.emitSplitKReduce())
+        print(support.reduceAsm(codeObjectVersion))
 
 
 def sweepShape(
@@ -329,6 +331,7 @@ def sweepShape(
     overrides: dict,
     asmDir,
     printOnly: bool,
+    codeObjectVersion: int,
 ) -> None:
     """Runs one shape and prints its SWEEP line, or with printOnly its emitted
     asm instead of benchmarking it; a shape that violates the constraints with
@@ -338,9 +341,11 @@ def sweepShape(
     try:
         p = support.makeProblem(m, n, k, padding=(0, 0, 0), **knobs)
         if printOnly:
-            printAsm(p)
+            printAsm(p, codeObjectVersion)
             return
-        gemmTimes, reduceTimes = benchProblem(p, iters, verify, asmDir)
+        gemmTimes, reduceTimes = benchProblem(
+            p, iters, verify, asmDir, codeObjectVersion
+        )
     except (AssertionError, MissingAsm) as err:
         reason = str(err).splitlines()[0]
         print(f"SWEEP m={m} n={n} k={k} SKIPPED {reason}", flush=True)
@@ -392,6 +397,13 @@ def makeParser() -> argparse.ArgumentParser:
         "--use-beta",
         action="store_true",
         help="Run the useBeta GEMM, which prefetches C and adds beta * C",
+    )
+    parser.add_argument(
+        "--code-object-version",
+        type=int,
+        choices=support.CODE_OBJECT_VERSIONS,
+        default=support.DEFAULT_CODE_OBJECT_VERSION,
+        help="Code object version the kernels are emitted for",
     )
     parser.add_argument("--alpha", type=float, default=1.0, help="Scale of A * B")
     parser.add_argument("--beta", type=float, default=0.0, help="Scale of C")
@@ -456,6 +468,7 @@ def main() -> None:
             overrides,
             args.asm_dir,
             args.print_asm,
+            args.code_object_version,
         )
         return
     if not args.print_asm:
@@ -466,7 +479,15 @@ def main() -> None:
         print(header, flush=True)
     for m, n, k in SWEEPS[args.sweep]():
         sweepShape(
-            m, n, k, args.iters, args.verify, overrides, args.asm_dir, args.print_asm
+            m,
+            n,
+            k,
+            args.iters,
+            args.verify,
+            overrides,
+            args.asm_dir,
+            args.print_asm,
+            args.code_object_version,
         )
 
 
