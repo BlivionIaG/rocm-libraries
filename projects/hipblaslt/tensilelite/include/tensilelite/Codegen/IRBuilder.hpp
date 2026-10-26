@@ -211,15 +211,19 @@ public:
   void movb64(RegisterRef dst, Operand src);
 
   // The 32-bit integer ops below share these rules. Results wrap modulo 2^32,
-  // so the ops are sign-agnostic.
+  // so the ops are sign-agnostic, except that mulhsi32 and the min and max ops
+  // are explicitly signed or unsigned.
   //
-  // The op is a SALU instruction (s_add_u32, s_sub_u32, s_mul_i32) iff dst and
-  // every register operand are SGPRs; SALU add and sub write SCC. A VGPR dst
-  // gives a VALU instruction (v_add_u32, v_sub_u32, v_mul_lo_u32). SGPR and
-  // immediate operands are legalized for gfx9 (one SGPR or literal per
-  // instruction, no literals in VOP3, VOP2 src1 a VGPR) by swapping
-  // commutative operands or copying an operand into a temporary register,
-  // which is released after the op.
+  // The op is a SALU instruction (s_add_u32, s_sub_u32, s_mul_i32,
+  // s_mul_hi_i32, s_min_i32, s_max_i32, s_min_u32, s_max_u32) iff dst and every
+  // register operand are SGPRs; SALU add, sub, min and max write SCC, and
+  // s_mul_i32 and s_mul_hi_i32 do not. A VGPR dst gives a VALU instruction
+  // (v_add_u32, v_sub_u32, v_mul_lo_u32, v_mul_hi_i32, v_min_i32, v_max_i32,
+  // v_min_u32, v_max_u32). SGPR and immediate operands are legalized for gfx9
+  // (one SGPR or literal per instruction, no literals in VOP3, VOP2 src1 a
+  // VGPR) by swapping commutative operands or copying an operand into a
+  // temporary register, which is released after the op. The copies are moves
+  // and write neither SCC nor VCC.
   //
   // Immediates are 32-bit patterns. dst may alias an operand.
   //
@@ -234,8 +238,28 @@ public:
   /// Emits dst = the low 32 bits of a * b.
   /// An immediate 2^k in either operand (INT32_MIN counts as 2^31) gives a move
   /// for k == 0 and otherwise a shift, s_lshl_b32 or v_lshlrev_b32. Unlike
-  /// s_mul_i32, the SALU shift writes SCC.
+  /// s_mul_i32, the SALU shift writes SCC. A multiplication by 1 is a move of
+  /// the other operand, or no instruction at all when that operand is dst, so
+  /// it writes no SCC.
   void muli32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = the high 32 bits of the signed 64-bit product a * b, as an
+  /// s_mul_hi_i32 or a v_mul_hi_i32 (VOP3: literals are copied to VGPRs). It
+  /// writes no SCC, and no VCC. The operands are signed, so for unsigned
+  /// values the result differs from the unsigned high product whenever an
+  /// operand is at or above 2^31.
+  void mulhsi32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = the smaller of a and b as signed values. The SALU form,
+  /// s_min_i32, writes SCC; the VALU form is v_min_i32.
+  void minsi32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = the larger of a and b as signed values. The SALU form,
+  /// s_max_i32, writes SCC; the VALU form is v_max_i32.
+  void maxsi32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = the smaller of a and b as unsigned values. The SALU form,
+  /// s_min_u32, writes SCC; the VALU form is v_min_u32.
+  void minui32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = the larger of a and b as unsigned values. The SALU form,
+  /// s_max_u32, writes SCC; the VALU form is v_max_u32.
+  void maxui32(RegisterRef dst, Operand a, Operand b);
 
   // The 64-bit integer ops below share these rules. Results wrap modulo 2^64,
   // so the ops are sign-agnostic.
@@ -283,7 +307,9 @@ public:
   //
   // The op is a SALU instruction iff dst and every register operand are SGPRs:
   // s_and_b32/b64, s_or_b32/b64, s_lshl_b32/b64, s_lshr_b32/b64 and
-  // s_ashr_i32/i64; they write SCC. A VGPR dst gives v_and_b32, v_or_b32,
+  // s_ashr_i32/i64; they write SCC, except that a 32-bit shift by an immediate
+  // amount whose low 5 bits are 0 is a move of a, or no instruction when a is
+  // dst, and so writes no SCC. A VGPR dst gives v_and_b32, v_or_b32,
   // v_lshlrev_b32/b64, v_lshrrev_b32/b64 or v_ashrrev_i32/i64; the builder
   // hides the reversed operand order. gfx9 has no 64-bit VALU and/or, so
   // andi64 and ori64 into VGPRs are one 32-bit op per half, and so is the SALU
@@ -338,23 +364,38 @@ public:
   // and a copy for b = 1. The remainder is a - ((a + that bias) & -2^k): five
   // instructions, four for b = 2 and a move of 0 for b = 1. These are plain
   // SALU or VALU ops, so the SALU form then has no readfirstlane and no
-  // active-lane precondition. Negative powers of two and INT32_MIN use the
-  // general expansions.
+  // active-lane precondition.
+  //
+  // Any other immediate b >= 3 (a constant that is not a power of two) uses
+  // LLVM's magic-number expansion, also exact for every a, including INT32_MIN
+  // and INT32_MAX, and for either useIEEE. The quotient is the high half of
+  // a * M (mulhsi32, with M the magic multiplier of b), plus a when M is
+  // negative, shifted right arithmetically by the magic shift when that is not
+  // 0, plus the sign bit of that result: three to five instructions, one
+  // temporary register for the sign bit, and one more when dst aliases a (the
+  // intermediate values then live in a temporary, so dst is written only by the
+  // last instruction). The remainder is a - q * b for that quotient q in a
+  // temporary: two instructions more. These are plain SALU or VALU ops with a
+  // literal multiplier legalized as for mulhsi32, so the SALU form has no
+  // readfirstlane and no active-lane precondition, and the VALU form writes no
+  // VCC. Negative divisors, including -1 and the negative powers of two, and
+  // INT32_MIN use the general expansions.
   //
   // The op is a SALU sequence iff dst and every register operand are SGPRs
   // (the uniform form), and a VALU sequence for a VGPR dst, where SGPR and
-  // immediate operands are legalized. The uniform form computes the f32
-  // reciprocal in temporary VGPRs and moves it to an SGPR with
-  // v_readfirstlane_b32, as LLVM lowers uniform division, so it needs at least
-  // one active lane: readfirstlane with exec == 0 is undefined, and LLVM has
-  // the same precondition. It writes SCC, and the fast path reads exec.
+  // immediate operands are legalized. The uniform form of the general
+  // expansions computes the f32 reciprocal in temporary VGPRs and moves it to
+  // an SGPR with v_readfirstlane_b32, as LLVM lowers uniform division, so it
+  // needs at least one active lane: readfirstlane with exec == 0 is undefined,
+  // and LLVM has the same precondition. The SALU forms write SCC, and the fast
+  // path reads exec.
   //
-  // Neither form writes exec or VCC; every correction is a compare and a
-  // select, with masks in temporary SGPR pairs. Temporary VGPRs, SGPRs and an
-  // SGPR pair are allocated and released inside the op.
+  // Neither form writes exec or VCC. In the general expansions every
+  // correction is a compare and a select, with masks in temporary SGPR pairs.
+  // Temporary VGPRs, SGPRs and an SGPR pair are allocated and released inside
+  // the op.
   //
-  // a and b are read only at the start of the expansion and dst is written
-  // only by its last instruction, so dst may alias a or b.
+  // dst is written only by the last instruction, so dst may alias a or b.
   //
   // Throws std::invalid_argument, before emitting anything, if dst or a
   // register operand is not exactly one register or is an AGPR, or if dst is
@@ -416,6 +457,41 @@ public:
   /// Emits dst = cond ? a : b for a register pair; an immediate is
   /// sign-extended to 64 bits.
   void selectb64(RegisterRef dst, RegisterRef cond, Operand a, Operand b);
+
+  // The selects below have no cond: the condition is implicit and the caller
+  // must have set it. An SGPR dst gives s_cselect_b32 (one per word, or one
+  // s_cselect_b64 for an even-aligned pair), which consumes the current SCC
+  // with no s_cmp re-test: SCC set selects a, clear selects b. A VGPR dst gives
+  // one v_cndmask_b32 per word that reads the current VCC as the lane mask, one
+  // bit per lane with a set bit selecting a, with no test and no widening. SCC
+  // and VCC must be live and unclobbered up to the select: the builder never
+  // writes VCC, and its legalization copies are moves, which write neither SCC
+  // nor VCC, but the SALU forms of addi32, subi32, muli32 by a power of two,
+  // andi32, ori32, the shifts (but not a shift by zero), minsi32, maxsi32,
+  // minui32, maxui32, the 64-bit ops and the comparisons write SCC, so the
+  // caller must place the select before them. A mask that a VALU instruction
+  // wrote to VCC must already satisfy the two wait states; the builder emits
+  // no s_nop here.
+  //
+  // The operand rules are those of the selects with a cond: an SGPR dst needs
+  // scalar operands, which gfx9 cannot always encode and are then copied into
+  // temporary SGPRs; a VGPR dst takes SGPR, VGPR or immediate operands, copying
+  // all but VGPRs and inline constants into temporary VGPRs, since the implicit
+  // VCC read already uses the constant bus. dst may alias or overlap an operand
+  // as for the selects with a cond.
+  //
+  // Throws std::invalid_argument, before emitting anything, if dst is not the
+  // right number of registers (1 for selectb32, 2 for selectb64) or is an
+  // AGPR, if an operand is an AGPR or has the wrong number of registers, or if
+  // an SGPR dst has a VGPR operand.
+
+  /// Emits dst = SCC (SGPR dst) or VCC (VGPR dst) ? a : b for one register;
+  /// immediates are 32-bit patterns.
+  void selectb32(RegisterRef dst, Operand a, Operand b);
+  /// Emits dst = SCC (SGPR dst) or VCC (VGPR dst) ? a : b for a register pair;
+  /// an immediate is sign-extended to 64 bits. A VGPR pair is one v_cndmask_b32
+  /// per word, both reading the same VCC.
+  void selectb64(RegisterRef dst, Operand a, Operand b);
 
   // Buffer resource descriptors.
 

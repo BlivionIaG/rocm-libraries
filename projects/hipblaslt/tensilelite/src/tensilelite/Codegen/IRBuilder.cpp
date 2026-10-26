@@ -542,7 +542,21 @@ void IRBuilder::movb64(RegisterRef dst, Operand src) {
 
 namespace {
 
-enum class BinaryOp { add, sub, mul, bitAnd, bitOr, shl, lshr, ashr };
+enum class BinaryOp {
+  add,
+  sub,
+  mul,
+  mulHighSigned,
+  bitAnd,
+  bitOr,
+  shl,
+  lshr,
+  ashr,
+  minSigned,
+  maxSigned,
+  minUnsigned,
+  maxUnsigned
+};
 
 } // namespace
 
@@ -551,8 +565,37 @@ static bool isShift(BinaryOp op) {
 }
 
 static bool isCommutative(BinaryOp op) {
-  return op == BinaryOp::add || op == BinaryOp::mul || op == BinaryOp::bitAnd ||
-         op == BinaryOp::bitOr;
+  switch (op) {
+  case BinaryOp::add:
+  case BinaryOp::mul:
+  case BinaryOp::mulHighSigned:
+  case BinaryOp::bitAnd:
+  case BinaryOp::bitOr:
+  case BinaryOp::minSigned:
+  case BinaryOp::maxSigned:
+  case BinaryOp::minUnsigned:
+  case BinaryOp::maxUnsigned:
+    return true;
+  case BinaryOp::sub:
+  case BinaryOp::shl:
+  case BinaryOp::lshr:
+  case BinaryOp::ashr:
+    return false;
+  }
+  return false;
+}
+
+// rocisa has no v_min_u32 or v_max_u32 class, so the unsigned VALU forms are
+// the signed classes with the mnemonic replaced.
+template <typename SInst, typename VInst>
+static void createUnsignedMinMax(IRBuilder &builder, RegisterRef dst, Operand a,
+                                 Operand b, std::string_view valuMnemonic) {
+  if (dst.kind == RegisterKind::sgpr) {
+    builder.create<SInst>(dst.container(), a, b);
+    return;
+  }
+  builder.create<VInst>(dst.container(), a, b)
+      ->setInst(std::string(valuMnemonic));
 }
 
 // Picks the SALU form for an sgpr dst and the VALU form otherwise. rocisa's
@@ -567,6 +610,9 @@ static void createBinaryI32(IRBuilder &builder, BinaryOp op, RegisterRef dst,
   case BinaryOp::mul:
     return createForKind<rocisa::SMulI32, rocisa::VMulLOU32>(builder, dst, a,
                                                              b);
+  case BinaryOp::mulHighSigned:
+    return createForKind<rocisa::SMulHII32, rocisa::VMulHII32>(builder, dst, a,
+                                                               b);
   case BinaryOp::bitAnd:
     return createForKind<rocisa::SAndB32, rocisa::VAndB32>(builder, dst, a, b);
   case BinaryOp::bitOr:
@@ -580,6 +626,16 @@ static void createBinaryI32(IRBuilder &builder, BinaryOp op, RegisterRef dst,
   case BinaryOp::ashr:
     return createForKind<rocisa::SAShiftRightI32, rocisa::VAShiftRightI32>(
         builder, dst, b, a, std::string());
+  case BinaryOp::minSigned:
+    return createForKind<rocisa::SMinI32, rocisa::VMinI32>(builder, dst, a, b);
+  case BinaryOp::maxSigned:
+    return createForKind<rocisa::SMaxI32, rocisa::VMaxI32>(builder, dst, a, b);
+  case BinaryOp::minUnsigned:
+    return createUnsignedMinMax<rocisa::SMinU32, rocisa::VMinI32>(
+        builder, dst, a, b, "v_min_u32");
+  case BinaryOp::maxUnsigned:
+    return createUnsignedMinMax<rocisa::SMaxU32, rocisa::VMaxI32>(
+        builder, dst, a, b, "v_max_u32");
   }
 }
 
@@ -593,8 +649,8 @@ static void emitBinaryI32(IRBuilder &builder, BinaryOp op, RegisterRef dst,
     if (!isLegalSop2(a, b))
       b = copyToTemporary(builder, RegisterKind::sgpr, 1, b, temps);
     assert(isLegalSop2(a, b) && "illegal salu operands");
-  } else if (op == BinaryOp::mul) {
-    // v_mul_lo_u32 is VOP3 only, so it takes no literals.
+  } else if (op == BinaryOp::mul || op == BinaryOp::mulHighSigned) {
+    // v_mul_lo_u32 and v_mul_hi_i32 are VOP3 only, so they take no literals.
     legalizeVop3Sources(builder, a, b, temps);
   } else {
     // x - c is x + (-c) modulo 2^32, which needs no copy since VOP2 src0
@@ -621,9 +677,19 @@ static void emitBinaryI32(IRBuilder &builder, BinaryOp op, RegisterRef dst,
   createBinaryI32(builder, op, dst, a, b);
 }
 
+// Emits dst = a for an operation that leaves the value unchanged, a move that
+// is omitted when a already is dst. It never writes SCC, unlike the SALU
+// operation it stands for.
+static void emitIdentity32(IRBuilder &builder, RegisterRef dst, Operand a) {
+  if (a.isRegister() && a.reg() == dst)
+    return;
+  builder.movb32(dst, a);
+}
+
 // Emits a * b as a copy (k == 0) or a << k when a or b is the immediate 2^k
 // with k <= maxExponent, for single registers (width 1) or pairs (width 2).
-// Returns false, emitting nothing, when neither operand is such an immediate.
+// A 32-bit product by 1 is emitIdentity32. Returns false, emitting nothing,
+// when neither operand is such an immediate.
 static bool emitMulByPowerOfTwo(IRBuilder &builder, int32_t width,
                                 RegisterRef dst, Operand a, Operand b,
                                 int32_t maxExponent) {
@@ -636,7 +702,7 @@ static bool emitMulByPowerOfTwo(IRBuilder &builder, int32_t width,
   if (!exponent)
     return false;
   if (*exponent == 0 && width == 1)
-    builder.movb32(dst, a);
+    emitIdentity32(builder, dst, a);
   else if (*exponent == 0)
     builder.movb64(dst, a);
   else if (width == 1)
@@ -661,6 +727,31 @@ void IRBuilder::muli32(RegisterRef dst, Operand a, Operand b) {
   if (emitMulByPowerOfTwo(*this, 1, dst, a, b, largestExponent32))
     return;
   emitBinaryI32(*this, BinaryOp::mul, dst, a, b);
+}
+
+void IRBuilder::mulhsi32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("mulhsi32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::mulHighSigned, dst, a, b);
+}
+
+void IRBuilder::minsi32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("minsi32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::minSigned, dst, a, b);
+}
+
+void IRBuilder::maxsi32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("maxsi32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::maxSigned, dst, a, b);
+}
+
+void IRBuilder::minui32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("minui32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::minUnsigned, dst, a, b);
+}
+
+void IRBuilder::maxui32(RegisterRef dst, Operand a, Operand b) {
+  requireArithmetic("maxui32", dst, a, b, 1);
+  emitBinaryI32(*this, BinaryOp::maxUnsigned, dst, a, b);
 }
 
 // i64 arithmetic.
@@ -840,18 +931,29 @@ void IRBuilder::ori32(RegisterRef dst, Operand a, Operand b) {
   emitBinaryI32(*this, BinaryOp::bitOr, dst, a, b);
 }
 
+// Only the low 5 bits of a 32-bit shift amount are used.
+static bool isZeroShift(Operand amount) {
+  return amount.isImmediate() && (amount.immediate() & 31) == 0;
+}
+
 void IRBuilder::shli32(RegisterRef dst, Operand a, Operand b) {
   requireArithmetic("shli32", dst, a, b, 1);
+  if (isZeroShift(b))
+    return emitIdentity32(*this, dst, a);
   emitBinaryI32(*this, BinaryOp::shl, dst, a, b);
 }
 
 void IRBuilder::shrui32(RegisterRef dst, Operand a, Operand b) {
   requireArithmetic("shrui32", dst, a, b, 1);
+  if (isZeroShift(b))
+    return emitIdentity32(*this, dst, a);
   emitBinaryI32(*this, BinaryOp::lshr, dst, a, b);
 }
 
 void IRBuilder::shrsi32(RegisterRef dst, Operand a, Operand b) {
   requireArithmetic("shrsi32", dst, a, b, 1);
+  if (isZeroShift(b))
+    return emitIdentity32(*this, dst, a);
   emitBinaryI32(*this, BinaryOp::ashr, dst, a, b);
 }
 
@@ -957,7 +1059,8 @@ void IRBuilder::shrsi64(RegisterRef dst, Operand a, Operand b) {
 // one Newton step and two corrections, with abs and a sign fix-up for sdiv and
 // srem. The fast path is AMDGPUCodeGenPrepare::expandDivRem24Impl and
 // AMDGPUTargetLowering::LowerDIVREM24, whose remainder is a - q * b. A divisor
-// 2^k takes LLVM's shift expansions.
+// 2^k takes LLVM's shift expansions, and any other constant >= 3 its
+// magic-number expansion.
 
 namespace {
 
@@ -1225,12 +1328,97 @@ static void emitDivisionByPowerOfTwo(IRBuilder &builder, RegisterRef dst,
   builder.subi32(dst, a, biased);
 }
 
+namespace {
+
+// Multiplier and shift of LLVM's signed division by a positive constant.
+struct SignedMagic {
+  int32_t multiplier;
+  int32_t shift;
+};
+
+} // namespace
+
+// Returns the magic number of the signed division by d >= 2, after Hacker's
+// Delight.
+static SignedMagic signedMagic(int32_t d) {
+  constexpr uint32_t two31 = 0x80000000u;
+  uint32_t ad = static_cast<uint32_t>(d);
+  uint32_t t = two31;
+  uint32_t anc = t - 1 - t % ad;
+  int32_t p = 31;
+  uint32_t q1 = two31 / anc;
+  uint32_t r1 = two31 - q1 * anc;
+  uint32_t q2 = two31 / ad;
+  uint32_t r2 = two31 - q2 * ad;
+  uint32_t delta = 0;
+  do {
+    ++p;
+    q1 *= 2;
+    r1 *= 2;
+    if (r1 >= anc) {
+      ++q1;
+      r1 -= anc;
+    }
+    q2 *= 2;
+    r2 *= 2;
+    if (r2 >= ad) {
+      ++q2;
+      r2 -= ad;
+    }
+    delta = ad - r2;
+  } while (q1 < delta || (q1 == delta && r1 == 0));
+  return {static_cast<int32_t>(q2 + 1), p - 32};
+}
+
+// LLVM's sdiv by a constant that is not a power of two: the high half of the
+// product with the magic multiplier, corrected for the sign of the multiplier,
+// shifted, and rounded toward zero by adding the sign bit of the result. dst is
+// written only by the last instruction, so dst may alias a; otherwise dst holds
+// the intermediate values itself.
+static void emitQuotientByConstant(IRBuilder &builder, RegisterRef dst,
+                                   Operand a, int32_t divisor) {
+  SignedMagic magic = signedMagic(divisor);
+  std::optional<RegisterRange> aliasTemp;
+  RegisterRef q = dst;
+  if (a.isRegister() && a.reg() == dst) {
+    aliasTemp.emplace(allocate(builder, dst.kind));
+    q = aliasTemp->ref();
+  }
+  RegisterRange sign = allocate(builder, dst.kind);
+  builder.mulhsi32(q, a, magic.multiplier);
+  if (magic.multiplier < 0)
+    builder.addi32(q, q, a);
+  builder.shrsi32(q, q, magic.shift);
+  builder.shrui32(sign.ref(), q, 31);
+  builder.addi32(dst, q, sign);
+}
+
+// The remainder is a - (a / divisor) * divisor, with dst written last.
+static void emitRemainderByConstant(IRBuilder &builder, RegisterRef dst,
+                                    Operand a, int32_t divisor) {
+  RegisterRange quotient = allocate(builder, dst.kind);
+  emitQuotientByConstant(builder, quotient.ref(), a, divisor);
+  builder.muli32(quotient.ref(), quotient, divisor);
+  builder.subi32(dst, a, quotient);
+}
+
+static void emitDivisionByConstant(IRBuilder &builder, RegisterRef dst,
+                                   Operand a, int32_t divisor,
+                                   DivisionResult result) {
+  if (result == DivisionResult::quotient)
+    return emitQuotientByConstant(builder, dst, a, divisor);
+  emitRemainderByConstant(builder, dst, a, divisor);
+}
+
 static void emitDivision(IRBuilder &builder, RegisterRef dst, Operand a,
                          Operand b, bool useIEEE, DivisionResult result) {
   // Negative powers of two and INT32_MIN take the general expansions.
   if (std::optional<int32_t> exponent =
           powerOfTwoExponent(b, largestPositiveExponent))
     return emitDivisionByPowerOfTwo(builder, dst, a, *exponent, result);
+  // The powers of two are handled above, so this is every other constant >= 3.
+  if (b.isImmediate() && b.immediate() >= 3)
+    return emitDivisionByConstant(builder, dst, a, b.immediate(), result);
   if (useIEEE)
     return emitExact(builder, dst, a, b, result);
   emitFast(builder, dst, a, b, result);
@@ -1490,11 +1678,10 @@ void IRBuilder::cmpi64(Predicate pred, RegisterRef dst, Operand a, Operand b) {
 
 // Select.
 
-static void requireSelect(std::string_view opName, int32_t width,
-                          RegisterRef dst, RegisterRef cond, Operand a,
-                          Operand b) {
-  requireRegister(opName, dst, width);
-  requireOperands(opName, a, b, width);
+// Throws std::invalid_argument naming opName unless cond is an sgpr or an sgpr
+// pair at an even index, and a uniform bool when dst is an SGPR.
+static void requireSelectCondition(std::string_view opName, RegisterRef dst,
+                                   RegisterRef cond) {
   bool validCondition =
       cond.kind == RegisterKind::sgpr && (cond.count == 1 || isLaneMask(cond));
   if (!validCondition)
@@ -1502,12 +1689,21 @@ static void requireSelect(std::string_view opName, int32_t width,
         std::string(opName) +
         " condition must be an sgpr or an sgpr pair at an even index, got " +
         registerText(cond));
-  if (dst.kind != RegisterKind::sgpr)
-    return;
-  if (cond.count != 1)
+  if (dst.kind == RegisterKind::sgpr && cond.count != 1)
     throw std::invalid_argument(
         std::string(opName) + " sgpr destination " + registerText(dst) +
         " needs a uniform bool condition, got " + registerText(cond));
+}
+
+// An empty cond is the implicit condition, SCC or VCC, which has nothing to
+// validate.
+static void requireSelect(std::string_view opName, int32_t width,
+                          RegisterRef dst, std::optional<RegisterRef> cond,
+                          Operand a, Operand b) {
+  requireRegister(opName, dst, width);
+  requireOperands(opName, a, b, width);
+  if (cond)
+    requireSelectCondition(opName, dst, *cond);
   requireScalarSources(opName, dst, a, b);
 }
 
@@ -1516,20 +1712,29 @@ static void testCondition(IRBuilder &builder, RegisterRef cond) {
   builder.create<rocisa::SCmpLgU32>(cond.container(), 0);
 }
 
+// The mask register of the cndmasks: VCC for an empty cond, the lane mask cond
+// itself, or a uniform bool cond widened to a temporary mask. A SALU write
+// followed by a VALU read needs no s_nop.
+static std::shared_ptr<rocisa::Container>
+selectMask(IRBuilder &builder, std::optional<RegisterRef> cond,
+           Temporaries &temps) {
+  if (!cond)
+    return std::make_shared<rocisa::VCC>();
+  if (cond->count == 2)
+    return cond->container();
+  RegisterRange widened = builder.allocateSgpr(2, 2);
+  testCondition(builder, *cond);
+  builder.create<rocisa::SCSelectB64>(widened.container(), -1, 0);
+  temps.push_back(std::move(widened));
+  return temps.back().container();
+}
+
 // The mask is read by the cndmasks only, so it cannot alias dst, a VGPR.
 static void emitVectorSelect(IRBuilder &builder, RegisterRef dst,
-                             RegisterRef cond, Operand a, Operand b) {
+                             std::optional<RegisterRef> cond, Operand a,
+                             Operand b) {
   Temporaries temps;
-  // A uniform bool widens to a temporary mask; a SALU write followed by a VALU
-  // read needs no s_nop.
-  RegisterRef mask = cond;
-  if (cond.count != 2) {
-    RegisterRange widened = builder.allocateSgpr(2, 2);
-    testCondition(builder, cond);
-    builder.create<rocisa::SCSelectB64>(widened.container(), -1, 0);
-    temps.push_back(std::move(widened));
-    mask = temps.back().ref();
-  }
+  std::shared_ptr<rocisa::Container> mask = selectMask(builder, cond, temps);
   Words words = wordSources(dst.count, a, b);
   // v_cndmask_b32 takes only VGPRs and inline constants, since the mask already
   // uses the constant bus.
@@ -1541,14 +1746,15 @@ static void emitVectorSelect(IRBuilder &builder, RegisterRef dst,
   bool highFirst = orderHalves(builder, dst, words, temps);
   emitWords(dst, words, highFirst, [&](RegisterRef part, WordSources word) {
     // Operand order is src0 = b, src1 = a: a mask bit set selects src1.
-    builder.create<rocisa::VCndMaskB32>(part.container(), word.b, word.a,
-                                        mask.container());
+    builder.create<rocisa::VCndMaskB32>(part.container(), word.b, word.a, mask);
   });
 }
 
-// Emits dst = cond ? a : b for a single register or a pair.
-static void emitSelect(IRBuilder &builder, RegisterRef dst, RegisterRef cond,
-                       Operand a, Operand b) {
+// Emits dst = cond ? a : b for a single register or a pair. An empty cond is
+// the implicit condition: the SALU forms consume SCC without a test and the
+// VALU form reads VCC.
+static void emitSelect(IRBuilder &builder, RegisterRef dst,
+                       std::optional<RegisterRef> cond, Operand a, Operand b) {
   // The operand checks already rejected agpr destinations.
   if (dst.kind == RegisterKind::vgpr)
     return emitVectorSelect(builder, dst, cond, a, b);
@@ -1557,7 +1763,8 @@ static void emitSelect(IRBuilder &builder, RegisterRef dst, RegisterRef cond,
     // The aligned pair is written by one instruction, so every operand is read
     // before dst is written and aliasing is safe.
     legalizeSalu64Sources(builder, a, b, temps);
-    testCondition(builder, cond);
+    if (cond)
+      testCondition(builder, *cond);
     builder.create<rocisa::SCSelectB64>(dst.container(), a, b);
     return;
   }
@@ -1569,7 +1776,8 @@ static void emitSelect(IRBuilder &builder, RegisterRef dst, RegisterRef cond,
     if (!isLegalSop2(word.a, word.b))
       word.b = copyToTemporary(builder, RegisterKind::sgpr, 1, word.b, temps);
   bool highFirst = orderHalves(builder, dst, words, temps);
-  testCondition(builder, cond);
+  if (cond)
+    testCondition(builder, *cond);
   emitWords(dst, words, highFirst, [&](RegisterRef part, WordSources word) {
     builder.create<rocisa::SCSelectB32>(part.container(), word.a, word.b);
   });
@@ -1581,10 +1789,20 @@ void IRBuilder::selectb32(RegisterRef dst, RegisterRef cond, Operand a,
   emitSelect(*this, dst, cond, a, b);
 }
 
+void IRBuilder::selectb32(RegisterRef dst, Operand a, Operand b) {
+  requireSelect("selectb32", 1, dst, std::nullopt, a, b);
+  emitSelect(*this, dst, std::nullopt, a, b);
+}
+
 void IRBuilder::selectb64(RegisterRef dst, RegisterRef cond, Operand a,
                           Operand b) {
   requireSelect("selectb64", 2, dst, cond, a, b);
   emitSelect(*this, dst, cond, a, b);
+}
+
+void IRBuilder::selectb64(RegisterRef dst, Operand a, Operand b) {
+  requireSelect("selectb64", 2, dst, std::nullopt, a, b);
+  emitSelect(*this, dst, std::nullopt, a, b);
 }
 
 // Buffer resource.
