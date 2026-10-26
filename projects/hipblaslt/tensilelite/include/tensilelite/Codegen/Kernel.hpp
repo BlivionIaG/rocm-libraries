@@ -89,9 +89,29 @@ private:
 
 /// A kernel under construction, emitted as a complete assembly file.
 ///
-/// The ABI (code object version and which workgroup ids are enabled) and the
-/// complete kernarg signature are fixed at construction, so the registers the
-/// hardware initializes are reserved before the body allocates anything.
+/// The ABI (code object version, enabled workgroup ids and kernarg preloading)
+/// and the complete kernarg signature are fixed at construction, so the
+/// registers the hardware initializes are reserved before the body allocates
+/// anything.
+///
+/// Kernarg preloading: the hardware can copy the first kernarg dwords into the
+/// SGPRs right after the kernarg segment pointer at kernel entry. The window is
+/// the longest prefix of whole explicit arguments that fits the request and the
+/// user SGPRs, so s[2, 2 + preloadDwords()) holds kernarg bytes
+/// [0, 4 * preloadDwords()) at entry, and the workgroup ids follow it. Every
+/// argument inside the window has one RegisterRange, pre-initialized by the
+/// hardware at s[2 + offset / 4], that is held until it is taken, released or
+/// the Kernel is destroyed. The allocator cannot hand out a held range, so
+/// nothing aliases a live preloaded value. loadArgument copies a held argument
+/// with s_mov and falls back to s_load once it is not held, which is always
+/// correct because the kernarg segment stays intact. The request
+/// (KernelAbi::maxPreloadDwords) is an upper bound: clamping it never affects
+/// correctness, only how many loads are saved.
+///
+/// A held range is released like every other register, in emission order, not
+/// in execution order. Do not release a preloaded range, or take it and drop
+/// it, inside a loop body when an earlier part of that loop, or a later
+/// iteration, still reads it.
 ///
 /// It owns the body module, the register allocator and an IRBuilder whose
 /// insertion point is the body. The builder and the allocator are not movable,
@@ -104,12 +124,16 @@ public:
   /// Creates an empty kernel named name with the complete signature.
   /// workgroupSize is the largest workgroup it may be launched with
   /// (max_flat_workgroup_size). Reserves the ABI registers before anything
-  /// else is allocated: the kernarg segment pointer in s[0:1], then the
-  /// enabled workgroup ids x, y, z in consecutive SGPRs. Throws
-  /// std::invalid_argument if name is not an identifier, workgroupSize is not
-  /// in [1, 1024], the code object version is not v4, v5 or v6, the signature
-  /// has hidden arguments at v4, or abi.maxPreloadDwords is negative or not
-  /// zero (kernarg preloading is not supported yet).
+  /// else is allocated: the kernarg segment pointer in s[0:1], the preloaded
+  /// kernarg arguments, then the enabled workgroup ids x, y, z in consecutive
+  /// SGPRs. Preloading is off when abi.maxPreloadDwords is 0; otherwise
+  /// preloadDwords() is the largest whole-argument prefix of at most
+  /// abi.maxPreloadDwords dwords (and at most the user SGPRs left after the
+  /// kernarg pointer), which may be 0. Throws std::invalid_argument if name is
+  /// not an identifier, workgroupSize is not in [1, 1024], the code object
+  /// version is not v4, v5 or v6, the signature has hidden arguments at v4,
+  /// abi.maxPreloadDwords is negative, or it is positive and the target does
+  /// not support kernarg preloading (even if the window would clamp to 0).
   Kernel(const Target &target, std::string_view name, int32_t workgroupSize,
          KernelSignature signature, const KernelOptions &options = {});
   Kernel(const Kernel &) = delete;
@@ -122,16 +146,21 @@ public:
   const KernelSignature &signature() const { return kernelSignature; }
   IRBuilder &builder() { return irBuilder; }
 
-  /// Kernarg segment pointer in s[0:1], the only user SGPRs enabled.
+  /// Number of kernarg dwords preloaded into s[2, 2 + preloadDwords()); 0 when
+  /// preloading is off or no whole argument fits.
+  int32_t preloadDwords() const { return preloadDwordCount; }
+  /// Kernarg segment pointer in s[0:1], the first user SGPRs.
   const RegisterRange &kernargSegmentPtr() const { return kernargPtr; }
-  /// Workgroup id x in s2, the first system SGPR after the user SGPRs.
+  /// Workgroup id x, the first system SGPR after the user SGPRs, at
+  /// s[2 + preloadDwords()].
   const RegisterRange &workgroupIdX() const { return workgroupIdXReg; }
   bool hasWorkgroupIdY() const { return workgroupIdYReg.has_value(); }
   bool hasWorkgroupIdZ() const { return workgroupIdZReg.has_value(); }
-  /// Workgroup id y, in s3; throws std::logic_error unless enabled.
+  /// Workgroup id y, at s[3 + preloadDwords()]; throws std::logic_error unless
+  /// enabled.
   const RegisterRange &workgroupIdY() const;
-  /// Workgroup id z, in s4 with y enabled and in s3 otherwise; throws
-  /// std::logic_error unless enabled.
+  /// Workgroup id z, at s[4 + preloadDwords()] with y enabled and at
+  /// s[3 + preloadDwords()] otherwise; throws std::logic_error unless enabled.
   const RegisterRange &workgroupIdZ() const;
   /// Workitem id in v0. On gfx90a and later the ids are packed: x is bits
   /// [9:0] (y [19:10] and z [29:20] are not enabled), so mask with 0x3ff
@@ -144,12 +173,30 @@ public:
   void setLdsSize(int32_t bytes);
   int32_t ldsSize() const { return ldsBytes; }
 
-  /// Emits an s_load of dst.count dwords (1, 2 or 4) from the kernarg segment
-  /// at byte offset, such as one returned by the signature. The caller emits
-  /// the wait. Throws std::invalid_argument if dst is not SGPRs aligned to its
-  /// count, or the load is misaligned or outside the segment.
-  std::shared_ptr<rocisa::SMemLoadInstruction> loadArgument(RegisterRef dst,
-                                                            int32_t offset);
+  /// Makes dst.count dwords (1, 2 or 4) of the kernarg segment at byte offset,
+  /// such as one returned by the signature, available in dst. Dwords of a
+  /// preloaded argument that is still held are copied with s_mov (64-bit when
+  /// both registers are even), and skipped when source and destination are the
+  /// same register; every other dword, including those straddling the window
+  /// edge or in padding, is loaded with s_load (the widest aligned loads). A
+  /// request spanning several arguments is split per argument. It never
+  /// releases a range, so it is safe inside a loop. The caller emits the wait,
+  /// which only the s_load part needs and which is harmless otherwise. Throws
+  /// std::invalid_argument if dst is not SGPRs aligned to its count, or the
+  /// request is misaligned or outside the segment.
+  void loadArgument(RegisterRef dst, int32_t offset);
+
+  /// Moves the pre-initialized range of the argument starting at byte offset
+  /// to the caller, who owns it like any allocated range. Returns std::nullopt
+  /// if the argument is not preloaded or was already taken or released. Hidden
+  /// arguments count as arguments here; they are never preloaded. Throws
+  /// std::invalid_argument if offset is not the start of an argument.
+  std::optional<RegisterRange> takePreloadedArgument(int32_t offset);
+
+  /// Frees the pre-initialized range of the argument starting at byte offset
+  /// so the allocator can reuse it; does nothing if it is not held. Throws
+  /// std::invalid_argument if offset is not the start of an argument.
+  void releasePreloadedArgument(int32_t offset);
 
   /// Returns the complete assembly file: target and code object version
   /// directives, the kernel symbol and body, the kernel descriptor and the
@@ -158,14 +205,32 @@ public:
   std::string toAssembly() const;
 
 private:
-  // Ranges are declared after the allocator so they are released first, and
-  // the body before the builder that points into it.
+  /// A preloaded explicit argument and, while held, its register range.
+  struct PreloadedArgument {
+    int32_t offset;
+    int32_t size;
+    std::optional<RegisterRange> range;
+  };
+
+  /// Returns the preloaded argument at byte offset if offset is the start of
+  /// an argument, else throws std::invalid_argument; null if the argument is
+  /// outside the window.
+  PreloadedArgument *findPreloaded(int32_t offset);
+  /// Returns the preloaded argument whose held range covers the dword at byte
+  /// offset, or null.
+  const PreloadedArgument *heldArgumentAt(int32_t offset) const;
+
+  // Ranges, including the preloaded ones, are declared after the allocator so
+  // they are released first, and the body before the builder that points into
+  // it. The preload window size precedes the allocator because the workgroup
+  // id reservations below depend on it.
   Target kernelTarget;
   std::string kernelName;
   int32_t maxWorkgroupSize;
   int32_t ldsBytes = 0;
   CodeObjectVersion version;
   KernelSignature kernelSignature;
+  int32_t preloadDwordCount;
   RegisterAllocator registers;
   rocisa::Module bodyModule;
   IRBuilder irBuilder;
@@ -174,6 +239,7 @@ private:
   RegisterRange workitemIdReg;
   std::optional<RegisterRange> workgroupIdYReg;
   std::optional<RegisterRange> workgroupIdZReg;
+  std::vector<PreloadedArgument> preloaded;
 };
 
 } // namespace rocm::tensilelite::codegen

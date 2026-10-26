@@ -58,6 +58,11 @@ public:
   /// Number of XCDs; the dispatcher assigns workgroup L (x fastest over the
   /// grid) to XCD L mod xcdCount().
   int32_t xcdCount() const { return xcds; }
+  /// Number of user SGPRs the hardware can initialize at kernel entry: the
+  /// kernarg segment pointer and the preloaded kernarg dwords share them.
+  int32_t maxUserSgprs() const;
+  /// Whether the hardware can preload kernarg dwords into user SGPRs.
+  bool supportsKernargPreload() const;
 
 private:
   Target(IsaVersion isa, int32_t wavefront, int32_t xcds, std::string_view arch,

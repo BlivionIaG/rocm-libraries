@@ -33,6 +33,8 @@ TEST(Target, Gfx950Properties) {
   EXPECT_EQ(target.maxVmcnt(), 63);
   EXPECT_EQ(target.maxLgkmcnt(), 15);
   EXPECT_EQ(target.xcdCount(), 8);
+  EXPECT_EQ(target.maxUserSgprs(), 16);
+  EXPECT_TRUE(target.supportsKernargPreload());
 }
 
 TEST(Target, SelectsCurrentThreadKernel) {

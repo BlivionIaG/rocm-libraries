@@ -15,13 +15,19 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <iterator>
 #include <memory>
+#include <optional>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 using namespace rocm::tensilelite;
 using namespace rocm::tensilelite::codegen;
@@ -258,14 +264,11 @@ TEST_F(KernelTest, AcceptsExplicitArgumentsAtCodeObjectV4) {
                          optionsFor(CodeObjectVersion::v4)));
 }
 
-TEST_F(KernelTest, RejectsInvalidPreloadDwords) {
-  for (int32_t dwords : {1, 14, -1}) {
-    KernelOptions options;
-    options.abi.maxPreloadDwords = dwords;
-    EXPECT_THROW(Kernel(target, "k", 64, KernelSignature(), options),
-                 std::invalid_argument)
-        << "dwords " << dwords;
-  }
+TEST_F(KernelTest, RejectsNegativePreloadDwords) {
+  KernelOptions options;
+  options.abi.maxPreloadDwords = -1;
+  EXPECT_THROW(Kernel(target, "k", 64, KernelSignature(), options),
+               std::invalid_argument);
   EXPECT_NO_THROW(Kernel(target, "k", 64, KernelSignature(), KernelOptions()));
 }
 
@@ -1047,3 +1050,628 @@ TEST(KernelLaunch, LdsRoundTripOnDevice) {
                 in[g * ldsGroupSize + (t + 1) % ldsGroupSize])
           << "group " << g << " lane " << t;
 }
+
+// Kernarg preloading.
+
+static KernelOptions
+preloadOptions(int32_t request,
+               CodeObjectVersion version = CodeObjectVersion::v6,
+               bool y = false, bool z = false) {
+  KernelOptions options = optionsFor(version);
+  options.abi.maxPreloadDwords = request;
+  options.workgroupIdY = y;
+  options.workgroupIdZ = z;
+  return options;
+}
+
+// The assembly after the compat prologue, which the body label ends.
+static std::string bodyText(const std::string &assembly) {
+  std::size_t label = assembly.find("_body:\n");
+  if (label == std::string::npos)
+    return assembly;
+  return assembly.substr(label);
+}
+
+// A pointer followed by count 4-byte scalars named a0, a1, and so on.
+static KernelSignature pointerAndScalars(int32_t count) {
+  KernelSignature signature;
+  signature.addPointer("out");
+  for (int32_t i = 0; i < count; ++i)
+    signature.addScalar("a" + std::to_string(i), 4);
+  return signature;
+}
+
+TEST_F(KernelTest, PreloadDirectivesFollowTheWindow) {
+  struct Case {
+    bool y, z;
+    int32_t idY, idZ;
+    std::vector<std::string_view> directives;
+  };
+  // The window is the pointer and 3 scalars: 5 dwords in s[2:6].
+  const Case cases[] = {
+      {false, false, -1, -1, {}},
+      {true, false, 8, -1, {".amdhsa_system_sgpr_workgroup_id_y 1"}},
+      {false, true, -1, 8, {".amdhsa_system_sgpr_workgroup_id_z 1"}},
+      {true,
+       true,
+       8,
+       9,
+       {".amdhsa_system_sgpr_workgroup_id_y 1",
+        ".amdhsa_system_sgpr_workgroup_id_z 1"}},
+  };
+  for (const Case &c : cases) {
+    SCOPED_TRACE(std::string(c.y ? "y" : "") + (c.z ? "z" : ""));
+    Kernel kernel(target, "k", 64, pointerAndScalars(3),
+                  preloadOptions(14, CodeObjectVersion::v6, c.y, c.z));
+    EXPECT_EQ(kernel.preloadDwords(), 5);
+    EXPECT_EQ(kernel.workgroupIdX().start(), 7);
+    if (c.y)
+      EXPECT_EQ(kernel.workgroupIdY().start(), c.idY);
+    if (c.z)
+      EXPECT_EQ(kernel.workgroupIdZ().start(), c.idZ);
+    kernel.builder().createEndProgram();
+    std::string assembly = kernel.toAssembly();
+    std::vector<std::string_view> needles = {
+        "  .amdhsa_user_sgpr_kernarg_segment_ptr 1",
+        "  .amdhsa_user_sgpr_count 7",
+        "  .amdhsa_user_sgpr_kernarg_preload_length 5",
+        "  .amdhsa_user_sgpr_kernarg_preload_offset 0",
+        "  .amdhsa_system_sgpr_workgroup_id_x 1"};
+    needles.insert(needles.end(), c.directives.begin(), c.directives.end());
+    expectLinesInOrder(assembly, needles);
+  }
+}
+
+TEST_F(KernelTest, PreloadOffEmitsNoPreloadDirectives) {
+  for (int32_t request : {0, 1}) {
+    // A request of 1 clamps to 0 dwords: the pointer needs 2.
+    Kernel kernel(target, "k", 64, pointerAndScalars(3),
+                  preloadOptions(request));
+    EXPECT_EQ(kernel.preloadDwords(), 0);
+    kernel.builder().createEndProgram();
+    std::string assembly = kernel.toAssembly();
+    EXPECT_EQ(assembly.find("user_sgpr_count"), std::string::npos) << assembly;
+    EXPECT_EQ(assembly.find("preload"), std::string::npos) << assembly;
+    EXPECT_EQ(countLinesContaining(assembly, ".p2align 8"), 1) << assembly;
+  }
+}
+
+TEST_F(KernelTest, RoundsPreloadWindowToWholeArguments) {
+  KernelSignature twoPointers = pointerSignature({"a", "b"});
+  twoPointers.addScalar("n", 4);
+  EXPECT_EQ(
+      Kernel(target, "k", 64, twoPointers, preloadOptions(3)).preloadDwords(),
+      2);
+
+  EXPECT_EQ(Kernel(target, "k", 64, pointerAndScalars(1), preloadOptions(3))
+                .preloadDwords(),
+            3);
+  EXPECT_EQ(Kernel(target, "k", 64, pointerAndScalars(1), preloadOptions(1))
+                .preloadDwords(),
+            0);
+  // The request is only an upper bound.
+  EXPECT_EQ(Kernel(target, "k", 64, pointerAndScalars(1), preloadOptions(100))
+                .preloadDwords(),
+            3);
+  EXPECT_EQ(Kernel(target, "k", 64, KernelSignature(), preloadOptions(5))
+                .preloadDwords(),
+            0);
+}
+
+TEST_F(KernelTest, ClampsPreloadWindowToUserSgprs) {
+  // The pointer and 12 scalars fill the 14 dwords next to the kernarg pointer.
+  Kernel exact(target, "k", 64, pointerAndScalars(12), preloadOptions(100));
+  EXPECT_EQ(exact.preloadDwords(), 14);
+  EXPECT_EQ(exact.workgroupIdX().start(), 16);
+  Kernel longer(target, "k", 64, pointerAndScalars(20), preloadOptions(100));
+  EXPECT_EQ(longer.preloadDwords(), 14);
+  Kernel capped(target, "k", 64, pointerAndScalars(20), preloadOptions(6));
+  EXPECT_EQ(capped.preloadDwords(), 6);
+}
+
+TEST_F(KernelTest, PreloadWindowContainsPadding) {
+  KernelSignature signature;
+  signature.addScalar("n", 4);
+  signature.addPointer("p");
+  // The 4 byte padding after n belongs to the window but to no argument.
+  EXPECT_EQ(
+      Kernel(target, "k", 64, signature, preloadOptions(4)).preloadDwords(), 4);
+  EXPECT_EQ(
+      Kernel(target, "k", 64, signature, preloadOptions(3)).preloadDwords(), 1);
+}
+
+TEST_F(KernelTest, PreloadWindowExcludesHiddenArguments) {
+  KernelSignature signature = pointerAndScalars(1);
+  signature.addHidden(KernelArgumentKind::hiddenBlockCountX, 4);
+  signature.addHidden(KernelArgumentKind::hiddenGroupSizeX, 4);
+  Kernel kernel(target, "k", 64, std::move(signature),
+                preloadOptions(100, CodeObjectVersion::v5));
+  EXPECT_EQ(kernel.preloadDwords(), 3);
+  EXPECT_FALSE(kernel.takePreloadedArgument(12));
+}
+
+// The target is the only supported one, so the unsupported-target error
+// (std::invalid_argument for a positive request) cannot be constructed here.
+
+TEST_F(KernelTest, ReservesPreloadedArgumentRegisters) {
+  Kernel kernel(target, "k", 64, pointerAndScalars(2), preloadOptions(100));
+  ASSERT_EQ(kernel.preloadDwords(), 4);
+  std::optional<RegisterRange> out = kernel.takePreloadedArgument(0);
+  ASSERT_TRUE(out);
+  EXPECT_EQ(out->start(), 2);
+  EXPECT_EQ(out->count(), 2);
+  std::optional<RegisterRange> second = kernel.takePreloadedArgument(12);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(second->start(), 5);
+  EXPECT_EQ(second->count(), 1);
+  // The workgroup id follows the window.
+  EXPECT_EQ(kernel.workgroupIdX().start(), 6);
+  EXPECT_EQ(kernel.builder().allocateSgpr(1).start(), 7);
+}
+
+TEST_F(KernelTest, LoadsArgumentsInsideThePreloadWindow) {
+  // The window s[2:6] holds out in s[2:3] and a0, a1, a2 in s4, s5, s6.
+  Kernel kernel(target, "k", 64, pointerAndScalars(3), preloadOptions(100));
+  RegisterRange regs = kernel.builder().allocateSgpr(8, 4);
+  ASSERT_EQ(regs.start(), 8);
+  kernel.loadArgument(regs.ref(0, 2), 0);
+  kernel.loadArgument(regs.ref(2, 1), 12);
+  std::string assembly = bodyText(kernel.toAssembly());
+  expectLinesInOrder(assembly,
+                     {"s_mov_b64 s[8:9], s[2:3]", "s_mov_b32 s10, s5"});
+  EXPECT_EQ(assembly.find("s_load"), std::string::npos) << assembly;
+}
+
+TEST_F(KernelTest, SplitsLoadsPerArgument) {
+  Kernel kernel(target, "k", 64, pointerAndScalars(3), preloadOptions(100));
+  RegisterRange regs = kernel.builder().allocateSgpr(4, 4);
+  kernel.loadArgument(regs.ref(0, 4), 0);
+  std::string assembly = bodyText(kernel.toAssembly());
+  expectLinesInOrder(assembly, {"s_mov_b64 s[8:9], s[2:3]", "s_mov_b32 s10, s4",
+                                "s_mov_b32 s11, s5"});
+  EXPECT_EQ(assembly.find("s_load"), std::string::npos) << assembly;
+}
+
+TEST_F(KernelTest, LoadsStraddlingThePreloadWindowEdge) {
+  // The window ends after a2; a3 is not preloaded.
+  Kernel kernel(target, "k", 64, pointerAndScalars(4), preloadOptions(5));
+  ASSERT_EQ(kernel.preloadDwords(), 5);
+  RegisterRange regs = kernel.builder().allocateSgpr(4, 4);
+  ASSERT_EQ(regs.start(), 8);
+  kernel.loadArgument(regs.ref(0, 4), 8);
+  std::string assembly = bodyText(kernel.toAssembly());
+  expectLinesInOrder(assembly,
+                     {"s_mov_b32 s8, s4", "s_mov_b32 s9, s5",
+                      "s_mov_b32 s10, s6", "s_load_dword s11, s[0:1], 20"});
+  EXPECT_EQ(countLinesContaining(assembly, "s_load"), 1) << assembly;
+}
+
+TEST_F(KernelTest, LoadsOutsideThePreloadWindow) {
+  // The window is the pointer alone.
+  Kernel kernel(target, "k", 64, pointerAndScalars(4), preloadOptions(2));
+  RegisterRange regs = kernel.builder().allocateSgpr(4, 4);
+  kernel.loadArgument(regs.ref(0, 4), 8);
+  std::string assembly = kernel.toAssembly();
+  expectLinesInOrder(assembly, {"s_load_dwordx4 s[8:11], s[0:1], 8"});
+  EXPECT_EQ(assembly.find("s_mov"), std::string::npos) << assembly;
+}
+
+TEST_F(KernelTest, SplitsUnheldLoadsByDestinationAlignment) {
+  // a0 is held; the next 3 dwords start at the odd register s9.
+  Kernel kernel(target, "k", 64, pointerAndScalars(4), preloadOptions(3));
+  RegisterRange regs = kernel.builder().allocateSgpr(4, 4);
+  kernel.loadArgument(regs.ref(0, 4), 8);
+  expectLinesInOrder(kernel.toAssembly(),
+                     {"s_mov_b32 s8, s4", "s_load_dword s9, s[0:1], 12",
+                      "s_load_dwordx2 s[10:11], s[0:1], 16"});
+}
+
+TEST_F(KernelTest, LoadsAfterTakeOrReleaseFallBackToSLoad) {
+  for (bool take : {true, false}) {
+    SCOPED_TRACE(take ? "take" : "release");
+    Kernel kernel(target, "k", 64, pointerAndScalars(3), preloadOptions(100));
+    RegisterRange regs = kernel.builder().allocateSgpr(4, 4);
+    std::optional<RegisterRange> taken;
+    if (take)
+      taken = kernel.takePreloadedArgument(0);
+    else
+      kernel.releasePreloadedArgument(0);
+    kernel.loadArgument(regs.ref(0, 2), 0);
+    kernel.loadArgument(regs.ref(2, 1), 8);
+    std::string assembly = bodyText(kernel.toAssembly());
+    // Only the pointer left the window; a0 is still copied.
+    expectLinesInOrder(
+        assembly, {"s_load_dwordx2 s[8:9], s[0:1], 0", "s_mov_b32 s10, s4"});
+    EXPECT_EQ(countLinesContaining(assembly, "s_load"), 1) << assembly;
+  }
+}
+
+TEST_F(KernelTest, ReleasedPreloadRegistersAreReused) {
+  Kernel kernel(target, "k", 64, pointerAndScalars(1), preloadOptions(3));
+  // out is s[2:3], a0 is s4, the workgroup id is s5.
+  EXPECT_EQ(kernel.builder().allocateSgpr(2, 2).start(), 6);
+  kernel.releasePreloadedArgument(0);
+  EXPECT_EQ(kernel.builder().allocateSgpr(2, 2).start(), 2);
+  kernel.releasePreloadedArgument(8);
+  EXPECT_EQ(kernel.builder().allocateSgpr(1).start(), 2);
+}
+
+TEST_F(KernelTest, TakenPreloadRegistersAreReusedOnceDropped) {
+  Kernel kernel(target, "k", 64, pointerAndScalars(1), preloadOptions(3));
+  std::optional<RegisterRange> taken = kernel.takePreloadedArgument(0);
+  ASSERT_TRUE(taken);
+  EXPECT_EQ(kernel.builder().allocateSgpr(2, 2).start(), 6);
+  taken.reset();
+  EXPECT_EQ(kernel.builder().allocateSgpr(2, 2).start(), 2);
+}
+
+TEST_F(KernelTest, TakesAndReleasesPreloadedArguments) {
+  KernelSignature signature = pointerAndScalars(1);
+  signature.addHidden(KernelArgumentKind::hiddenBlockCountX, 4);
+  Kernel kernel(target, "k", 64, std::move(signature),
+                preloadOptions(3, CodeObjectVersion::v5));
+  // Only the start offsets of arguments are valid, hidden ones included.
+  for (int32_t offset : {-4, 2, 4, 20, 100}) {
+    EXPECT_THROW(kernel.takePreloadedArgument(offset), std::invalid_argument)
+        << offset;
+    EXPECT_THROW(kernel.releasePreloadedArgument(offset), std::invalid_argument)
+        << offset;
+  }
+  EXPECT_FALSE(kernel.takePreloadedArgument(12));
+  EXPECT_NO_THROW(kernel.releasePreloadedArgument(12));
+
+  EXPECT_TRUE(kernel.takePreloadedArgument(8));
+  EXPECT_FALSE(kernel.takePreloadedArgument(8));
+  kernel.releasePreloadedArgument(0);
+  kernel.releasePreloadedArgument(0);
+  EXPECT_FALSE(kernel.takePreloadedArgument(0));
+}
+
+TEST_F(KernelTest, TakesNothingWithoutPreload) {
+  Kernel kernel(target, "k", 64, pointerAndScalars(1), preloadOptions(0));
+  EXPECT_FALSE(kernel.takePreloadedArgument(0));
+  EXPECT_NO_THROW(kernel.releasePreloadedArgument(8));
+  EXPECT_THROW(kernel.takePreloadedArgument(4), std::invalid_argument);
+}
+
+// Preload prologue.
+
+static constexpr const char *objdumpPath = "/opt/rocm/llvm/bin/llvm-objdump";
+// Hardware with kernarg preload support enters the kernel this many bytes after
+// the symbol.
+static constexpr int64_t preloadEntryBytes = 256;
+
+namespace {
+
+struct DisassembledInstruction {
+  int64_t address;
+  std::string text;
+};
+
+} // namespace
+
+// Returns the instructions of the kernel in hsaco and sets entry to its
+// address; entry must be -1 on the call.
+static std::vector<DisassembledInstruction>
+disassemble(const std::vector<uint8_t> &hsaco, int64_t &entry) {
+  char path[] = "/tmp/codegen_preload_XXXXXX";
+  int fd = mkstemp(path);
+  EXPECT_GE(fd, 0);
+  if (fd < 0)
+    return {};
+  ssize_t written = write(fd, hsaco.data(), hsaco.size());
+  close(fd);
+  EXPECT_EQ(written, std::ssize(hsaco));
+  std::string command =
+      std::string(objdumpPath) + " -d --mcpu=gfx950 " + path + " 2>&1";
+  FILE *pipe = popen(command.c_str(), "r");
+  std::string output;
+  if (pipe) {
+    char chunk[4096];
+    for (std::size_t count; (count = fread(chunk, 1, sizeof(chunk), pipe)) > 0;)
+      output.append(chunk, count);
+    pclose(pipe);
+  }
+  unlink(path);
+
+  std::vector<DisassembledInstruction> instructions;
+  std::regex header("^([0-9a-f]+) <.*>:$");
+  std::regex instruction("^\\s+(\\S.*?)\\s+// ([0-9A-F]+):");
+  std::istringstream stream(output);
+  for (std::string current; std::getline(stream, current);) {
+    std::smatch match;
+    // The body label is a symbol too, so only the first header is the kernel.
+    if (std::regex_match(current, match, header)) {
+      if (entry < 0)
+        entry = std::stoll(match[1], nullptr, 16);
+    } else if (std::regex_search(current, match, instruction))
+      instructions.push_back({std::stoll(match[2], nullptr, 16), match[1]});
+  }
+  return instructions;
+}
+
+TEST(KernelPreloadPrologue, BodyStartsAtTheHardwareEntryOffset) {
+  if (access(objdumpPath, X_OK) != 0)
+    GTEST_SKIP() << "no llvm-objdump";
+  Target target = Target::get("gfx950");
+  struct Case {
+    int32_t scalars;
+    int32_t request;
+    std::vector<std::string_view> loads;
+  };
+  // The loads are the widest whose destination is aligned: x8 and x4 need a
+  // multiple of 4, x2 an even register, starting at s2.
+  const Case cases[] = {
+      {0, 2, {"s_load_dwordx2 s[2:3], s[0:1], 0x0"}},
+      {1, 3, {"s_load_dwordx2 s[2:3], s[0:1], 0x0", "s_load_dword s4,"}},
+      {3,
+       5,
+       {"s_load_dwordx2 s[2:3], s[0:1], 0x0",
+        "s_load_dwordx2 s[4:5], s[0:1], 0x8", "s_load_dword s6,"}},
+      {12,
+       14,
+       {"s_load_dwordx2 s[2:3], s[0:1], 0x0",
+        "s_load_dwordx8 s[4:11], s[0:1], 0x8",
+        "s_load_dwordx4 s[12:15], s[0:1], 0x28"}},
+  };
+  for (const Case &c : cases) {
+    SCOPED_TRACE("request " + std::to_string(c.request));
+    Kernel kernel(target, "codegen_preload_prologue", 64,
+                  pointerAndScalars(c.scalars), preloadOptions(c.request));
+    ASSERT_EQ(kernel.preloadDwords(), c.request);
+    kernel.builder().createEndProgram();
+    std::string assembly = kernel.toAssembly();
+    SCOPED_TRACE("assembly:\n" + assembly);
+    std::vector<uint8_t> hsaco =
+        assembleToHSACO(assembly, kernel.target().isaName());
+    ASSERT_FALSE(hsaco.empty());
+
+    int64_t entry = -1;
+    std::vector<DisassembledInstruction> instructions =
+        disassemble(hsaco, entry);
+    ASSERT_GE(entry, 0);
+    ASSERT_GT(std::ssize(instructions), std::ssize(c.loads) + 2);
+    int64_t next = 0;
+    for (std::string_view load : c.loads) {
+      EXPECT_EQ(instructions[next].address, entry + 8 * next);
+      EXPECT_NE(instructions[next].text.find(load), std::string::npos)
+          << instructions[next].text;
+      ++next;
+    }
+    EXPECT_EQ(instructions[next].text, "s_waitcnt lgkmcnt(0)");
+    EXPECT_EQ(instructions[next + 1].text.find("s_branch"), 0u);
+    // Skip the padding to the first body instruction.
+    int64_t body = next + 2;
+    while (body < std::ssize(instructions) &&
+           instructions[body].text == "s_nop 0")
+      ++body;
+    ASSERT_LT(body, std::ssize(instructions));
+    EXPECT_EQ(instructions[body].text, "s_endpgm");
+    EXPECT_EQ(instructions[body].address, entry + preloadEntryBytes);
+  }
+}
+
+// Preload on the device.
+
+static constexpr const char *preloadName = "codegen_preload";
+static constexpr int32_t preloadGrid[3] = {3, 2, 2};
+static constexpr int32_t preloadGroups =
+    preloadGrid[0] * preloadGrid[1] * preloadGrid[2];
+static constexpr int32_t preloadScalars = 13;
+// Workgroup ids x, y, z followed by the scalar arguments.
+static constexpr int32_t recordDwords = 3 + preloadScalars;
+static constexpr int32_t maxPreloadRequest = 100;
+// The pointer and 12 scalars fill the 14 dwords next to the kernarg pointer.
+static constexpr int32_t maxPreloadWindow = 14;
+
+namespace {
+
+enum class ArgumentUse {
+  /// Copy with loadArgument, then release the preloaded register.
+  copy,
+  /// Take the preloaded register and use it directly.
+  take,
+  /// Release the preloaded register, then load the value with loadArgument.
+  releaseThenLoad,
+};
+
+struct PreloadCase {
+  CodeObjectVersion version;
+  int32_t request;
+  ArgumentUse use;
+  /// Remove the preload directives, as old firmware ignores them, so the
+  /// compat prologue loads the window.
+  bool stripPreloadDirectives;
+};
+
+} // namespace
+
+static int32_t scalarValue(int32_t index) {
+  return 37 * index * index - 11 * index - 0x6000;
+}
+
+static KernelSignature preloadSignature() {
+  return pointerAndScalars(preloadScalars);
+}
+
+// Returns SGPRs holding the count dwords at offset, owned by keep, in the way
+// use prescribes.
+static RegisterRef obtainArgument(Kernel &kernel, ArgumentUse use,
+                                  int32_t offset, int32_t count,
+                                  std::vector<RegisterRange> &keep) {
+  if (use == ArgumentUse::take) {
+    if (std::optional<RegisterRange> taken =
+            kernel.takePreloadedArgument(offset)) {
+      keep.push_back(std::move(*taken));
+      return keep.back().ref();
+    }
+  }
+  keep.push_back(kernel.builder().allocateSgpr(count, count));
+  RegisterRef dst = keep.back().ref();
+  if (use == ArgumentUse::releaseThenLoad)
+    kernel.releasePreloadedArgument(offset);
+  kernel.loadArgument(dst, offset);
+  if (use == ArgumentUse::copy)
+    kernel.releasePreloadedArgument(offset);
+  return dst;
+}
+
+// Returns the byte offset of this workgroup's record in a VGPR, computed from
+// the workgroup ids wherever the hardware placed them.
+static RegisterRange computePreloadRecordOffset(Kernel &kernel) {
+  IRBuilder &builder = kernel.builder();
+  RegisterRange linear = builder.allocateSgpr(1);
+  // linear = x + gridX * (y + gridY * z).
+  builder.create<rocisa::SMulI32>(
+      linear.container(), kernel.workgroupIdZ().container(), preloadGrid[1]);
+  builder.create<rocisa::SAddU32>(linear.container(), linear.container(),
+                                  kernel.workgroupIdY().container());
+  builder.create<rocisa::SMulI32>(linear.container(), linear.container(),
+                                  preloadGrid[0]);
+  builder.create<rocisa::SAddU32>(linear.container(), linear.container(),
+                                  kernel.workgroupIdX().container());
+  builder.create<rocisa::SMulI32>(linear.container(), linear.container(),
+                                  4 * recordDwords);
+  RegisterRange offset = builder.allocateVgpr(1);
+  builder.create<rocisa::VMovB32>(offset.container(), linear.container());
+  return offset;
+}
+
+// Stores the workgroup ids and the scalar arguments of every workgroup from
+// lane 0, through the output pointer argument.
+static void buildPreloadKernel(Kernel &kernel, ArgumentUse use) {
+  IRBuilder &builder = kernel.builder();
+  std::vector<RegisterRange> keep;
+  keep.reserve(1 + preloadScalars);
+  RegisterRef out = obtainArgument(kernel, use, 0, 2, keep);
+  std::vector<RegisterRef> words = {kernel.workgroupIdX().ref(),
+                                    kernel.workgroupIdY().ref(),
+                                    kernel.workgroupIdZ().ref()};
+  for (int32_t i = 0; i < preloadScalars; ++i)
+    words.push_back(obtainArgument(kernel, use, 8 + 4 * i, 1, keep));
+  builder.createWaitCnt({.scalarMemory = 0});
+  RegisterRange base = computePreloadRecordOffset(kernel);
+  // The kernel ends right after the stores, so shrinking exec is safe.
+  builder.create<rocisa::SMovB64>(std::make_shared<rocisa::EXEC>(), 1);
+  RegisterRange address = builder.allocateVgpr(1);
+  RegisterRange data = builder.allocateVgpr(1);
+  for (int32_t i = 0; i < recordDwords; ++i) {
+    builder.create<rocisa::VAddU32>(address.container(), 4 * i,
+                                    base.container());
+    builder.create<rocisa::VMovB32>(data.container(), words[i].container());
+    builder.create<rocisa::GlobalStoreB32>(address.container(),
+                                           data.container(), out.container());
+  }
+  builder.createEndProgram();
+}
+
+static std::string stripPreloadDirectives(const std::string &assembly) {
+  std::istringstream stream(assembly);
+  std::string stripped;
+  for (std::string current; std::getline(stream, current);) {
+    if (current.find("kernarg_preload_length") != std::string::npos ||
+        current.find("kernarg_preload_offset") != std::string::npos)
+      continue;
+    stripped += current + "\n";
+  }
+  return stripped;
+}
+
+static void runPreloadKernel(const std::vector<uint8_t> &hsaco,
+                             std::vector<int32_t> &records) {
+  ModulePtr module;
+  hipFunction_t function = nullptr;
+  loadKernel(hsaco, preloadName, module, function);
+  DevicePtr deviceOut;
+  // The sentinel shows any record the kernel failed to write.
+  uploadBytes(nullptr, records.size() * sizeof(int32_t), deviceOut);
+  ASSERT_FALSE(testing::Test::HasFatalFailure());
+
+  void *out = deviceOut.get();
+  std::vector<int32_t> scalars;
+  for (int32_t i = 0; i < preloadScalars; ++i)
+    scalars.push_back(scalarValue(i));
+  std::vector<void *> args = {&out};
+  for (int32_t &scalar : scalars)
+    args.push_back(&scalar);
+  launchWithParams(function,
+                   dim3(preloadGrid[0], preloadGrid[1], preloadGrid[2]), 64,
+                   args.data());
+  ASSERT_FALSE(testing::Test::HasFatalFailure());
+  download(deviceOut, records);
+}
+
+static void checkPreloadRecords(const std::vector<int32_t> &records) {
+  for (int32_t z = 0; z < preloadGrid[2]; ++z)
+    for (int32_t y = 0; y < preloadGrid[1]; ++y)
+      for (int32_t x = 0; x < preloadGrid[0]; ++x) {
+        int32_t linear = x + preloadGrid[0] * (y + preloadGrid[1] * z);
+        for (int32_t i = 0; i < recordDwords; ++i) {
+          int32_t expected = i < 3 ? (i == 0   ? x
+                                      : i == 1 ? y
+                                               : z)
+                                   : scalarValue(i - 3);
+          ASSERT_EQ(records[linear * recordDwords + i], expected)
+              << "group (" << x << ", " << y << ", " << z << ") word " << i;
+        }
+      }
+}
+
+static std::string
+preloadCaseName(const testing::TestParamInfo<PreloadCase> &info) {
+  const PreloadCase &c = info.param;
+  const char *uses[] = {"Copy", "Take", "ReleaseThenLoad"};
+  return "V" + std::to_string(static_cast<int32_t>(c.version)) + "Request" +
+         std::to_string(c.request) + uses[static_cast<int32_t>(c.use)] +
+         (c.stripPreloadDirectives ? "Stripped" : "");
+}
+
+static std::vector<PreloadCase> preloadCases() {
+  std::vector<PreloadCase> cases;
+  for (CodeObjectVersion version :
+       {CodeObjectVersion::v4, CodeObjectVersion::v5, CodeObjectVersion::v6})
+    for (ArgumentUse use :
+         {ArgumentUse::copy, ArgumentUse::take, ArgumentUse::releaseThenLoad}) {
+      for (int32_t request : {0, 3, maxPreloadRequest})
+        cases.push_back({version, request, use, false});
+      cases.push_back({version, maxPreloadRequest, use, true});
+    }
+  return cases;
+}
+
+namespace {
+
+class KernelPreloadLaunch : public testing::TestWithParam<PreloadCase> {};
+
+} // namespace
+
+TEST_P(KernelPreloadLaunch, ArgumentsAndWorkgroupIdsOnDevice) {
+  const PreloadCase &c = GetParam();
+  Target target = Target::get("gfx950");
+  KernelOptions options = preloadOptions(c.request, c.version, true, true);
+  Kernel kernel(target, preloadName, 64, preloadSignature(), options);
+  int32_t window = c.request == 0 ? 0 : c.request == 3 ? 3 : maxPreloadWindow;
+  ASSERT_EQ(kernel.preloadDwords(), window);
+  EXPECT_EQ(kernel.workgroupIdX().start(), 2 + window);
+  buildPreloadKernel(kernel, c.use);
+  std::string assembly = kernel.toAssembly();
+  if (c.stripPreloadDirectives)
+    assembly = stripPreloadDirectives(assembly);
+  SCOPED_TRACE("assembly:\n" + assembly);
+
+  // Assembling is checked before the device so it runs without a GPU.
+  std::vector<uint8_t> hsaco =
+      assembleToHSACO(assembly, kernel.target().isaName());
+  ASSERT_FALSE(hsaco.empty());
+  if (!hasHipDevice())
+    GTEST_SKIP() << "no HIP device";
+
+  std::vector<int32_t> records(preloadGroups * recordDwords, -1);
+  runPreloadKernel(hsaco, records);
+  if (testing::Test::HasFatalFailure())
+    return;
+  checkPreloadRecords(records);
+}
+
+INSTANTIATE_TEST_SUITE_P(Codegen, KernelPreloadLaunch,
+                         testing::ValuesIn(preloadCases()), preloadCaseName);

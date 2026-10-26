@@ -42,6 +42,17 @@ Target Target::get(std::string_view arch) {
   return gfx950;
 }
 
+int32_t Target::maxUserSgprs() const {
+  // rocisa has no cap for this; every gfx9 target provides 16 user SGPRs.
+  return 16;
+}
+
+bool Target::supportsKernargPreload() const {
+  // rocisa has no cap for this; the assembler accepts the preload directives
+  // from gfx90a (9.0.10) on.
+  return isa >= IsaVersion{9, 0, 10};
+}
+
 void Target::selectForCurrentThread() const {
   rocisa::rocIsa::getInstance().setKernel(isa, wavefront);
 }
