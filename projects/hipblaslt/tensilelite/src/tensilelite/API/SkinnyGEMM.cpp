@@ -27,6 +27,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace rocm::tensilelite;
@@ -3501,14 +3502,17 @@ std::string rocm::tensilelite::emitSkinnyGEMM(const Target &target,
     throw std::invalid_argument(
         "config exceeds the LDS budget: " + std::to_string(dims.ldsBytes) +
         " bytes of " + std::to_string(target.maxLdsSize()));
-  Kernel kernel(target, skinnyGEMMKernelName(config), 64 * config.waves);
-  if (dims.scalesShared)
-    kernel.setLdsSize(dims.ldsBytes);
+  KernelSignature signature;
+  SkinnyArguments arguments = declareArguments(signature);
   // The workgroup ids are the tile (tx, ty) and the split kz; the persistent
   // launch only has the block id x.
-  if (config.grid3d)
-    kernel.enableWorkgroupIds(true, true);
-  SkinnyArguments arguments = declareArguments(kernel.signature());
+  KernelOptions options;
+  options.workgroupIdY = config.grid3d;
+  options.workgroupIdZ = config.grid3d;
+  Kernel kernel(target, skinnyGEMMKernelName(config), 64 * config.waves,
+                std::move(signature), options);
+  if (dims.scalesShared)
+    kernel.setLdsSize(dims.ldsBytes);
   SkinnyGEMMEmitter(kernel, config, arguments).emit();
   try {
     kernel.builder().allocator().checkLimits();
@@ -3521,10 +3525,7 @@ std::string rocm::tensilelite::emitSkinnyGEMM(const Target &target,
 }
 
 std::string rocm::tensilelite::emitSplitKReduce(const Target &target) {
-  Kernel kernel(target, "splitk_reduce", reduceBlock);
-  // The workgroup id y is the column j.
-  kernel.enableWorkgroupIds(true, false);
-  KernelSignature &signature = kernel.signature();
+  KernelSignature signature;
   ReduceArguments offsets;
   offsets.d = signature.addPointer("D");
   offsets.ws = signature.addPointer("ws");
@@ -3542,6 +3543,11 @@ std::string rocm::tensilelite::emitSplitKReduce(const Target &target) {
   signature.addHidden(KernelArgumentKind::hiddenBlockCountX, 4);
   signature.addHidden(KernelArgumentKind::hiddenBlockCountY, 4);
   signature.addHidden(KernelArgumentKind::hiddenBlockCountZ, 4);
+  // The workgroup id y is the column j.
+  KernelOptions options;
+  options.workgroupIdY = true;
+  Kernel kernel(target, "splitk_reduce", reduceBlock, std::move(signature),
+                options);
   SplitKReduceEmitter(kernel, offsets).emit();
   return kernel.toAssembly();
 }

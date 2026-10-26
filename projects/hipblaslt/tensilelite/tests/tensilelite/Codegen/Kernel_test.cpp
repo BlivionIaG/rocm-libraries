@@ -15,10 +15,12 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace rocm::tensilelite;
@@ -27,6 +29,20 @@ using namespace rocm::tensilelite::codegen::test;
 
 static bool hasLine(const std::string &text, const std::string &line) {
   return text.find("\n" + line + "\n") != std::string::npos;
+}
+
+static KernelSignature
+pointerSignature(std::initializer_list<const char *> names) {
+  KernelSignature signature;
+  for (const char *name : names)
+    signature.addPointer(name);
+  return signature;
+}
+
+static KernelOptions optionsFor(CodeObjectVersion version) {
+  KernelOptions options;
+  options.abi.codeObjectVersion = version;
+  return options;
 }
 
 namespace {
@@ -39,8 +55,7 @@ protected:
 } // namespace
 
 TEST_F(KernelTest, DefaultEmitsCodeObjectV6) {
-  Kernel kernel(target, "empty_kernel", 256);
-  kernel.signature().addPointer("out");
+  Kernel kernel(target, "empty_kernel", 256, pointerSignature({"out"}));
   kernel.builder().createEndProgram();
   EXPECT_EQ(kernel.codeObjectVersion(), CodeObjectVersion::v6);
 
@@ -91,14 +106,17 @@ TEST_F(KernelTest, MapsCodeObjectVersions) {
     const char *metadata;
   };
   const Case cases[] = {
-      {CodeObjectVersion::v5, ".amdhsa_code_object_version 5",
-       "amdhsa.version: [1, 2]"},
       {CodeObjectVersion::v4, ".amdhsa_code_object_version 4",
        "amdhsa.version: [1, 1]"},
+      {CodeObjectVersion::v5, ".amdhsa_code_object_version 5",
+       "amdhsa.version: [1, 2]"},
+      {CodeObjectVersion::v6, ".amdhsa_code_object_version 6",
+       "amdhsa.version: [1, 2]"},
   };
   for (const Case &c : cases) {
     SCOPED_TRACE(c.directive);
-    Kernel kernel(target, "k", 64, c.version);
+    Kernel kernel(target, "k", 64, KernelSignature(), optionsFor(c.version));
+    EXPECT_EQ(kernel.codeObjectVersion(), c.version);
     kernel.builder().createEndProgram();
     std::string assembly = kernel.toAssembly();
     EXPECT_TRUE(hasLine(assembly, c.directive)) << assembly;
@@ -107,11 +125,12 @@ TEST_F(KernelTest, MapsCodeObjectVersions) {
 }
 
 TEST_F(KernelTest, LaysOutArgumentsNaturally) {
-  Kernel kernel(target, "args_kernel", 64);
-  EXPECT_EQ(kernel.signature().addPointer("x"), 0);
-  EXPECT_EQ(kernel.signature().addPointer("y"), 8);
-  EXPECT_EQ(kernel.signature().addScalar("a", 4), 16);
-  EXPECT_EQ(kernel.signature().addScalar("n", 4), 20);
+  KernelSignature signature;
+  EXPECT_EQ(signature.addPointer("x"), 0);
+  EXPECT_EQ(signature.addPointer("y"), 8);
+  EXPECT_EQ(signature.addScalar("a", 4), 16);
+  EXPECT_EQ(signature.addScalar("n", 4), 20);
+  Kernel kernel(target, "args_kernel", 64, std::move(signature));
   EXPECT_EQ(kernel.signature().segmentSize(), 24);
   kernel.builder().createEndProgram();
 
@@ -163,7 +182,7 @@ TEST_F(KernelTest, PadsArgumentsToNaturalAlignment) {
   wide.addScalar("u32", 4);
   EXPECT_EQ(wide.addScalar("u64", 8), 8);
 
-  Kernel kernel(target, "no_args", 64);
+  Kernel kernel(target, "no_args", 64, KernelSignature());
   kernel.builder().createEndProgram();
   EXPECT_EQ(kernel.signature().segmentSize(), 0);
   std::string assembly = kernel.toAssembly();
@@ -185,17 +204,73 @@ TEST_F(KernelTest, RejectsInvalidArguments) {
 }
 
 TEST_F(KernelTest, RejectsInvalidKernelParameters) {
-  EXPECT_THROW(Kernel(target, "bad-name", 64), std::invalid_argument);
-  EXPECT_THROW(Kernel(target, "", 64), std::invalid_argument);
-  EXPECT_THROW(Kernel(target, "k", 0), std::invalid_argument);
-  EXPECT_THROW(Kernel(target, "k", 1025), std::invalid_argument);
-  EXPECT_NO_THROW(Kernel(target, "k", 1024));
-  EXPECT_THROW(Kernel(target, "k", 64, static_cast<CodeObjectVersion>(3)),
-               std::invalid_argument);
+  const KernelSignature none;
+  EXPECT_THROW(Kernel(target, "bad-name", 64, none), std::invalid_argument);
+  EXPECT_THROW(Kernel(target, "", 64, none), std::invalid_argument);
+  EXPECT_THROW(Kernel(target, "k", 0, none), std::invalid_argument);
+  EXPECT_THROW(Kernel(target, "k", 1025, none), std::invalid_argument);
+  EXPECT_NO_THROW(Kernel(target, "k", 1024, none));
+  for (int32_t invalid : {3, 7})
+    EXPECT_THROW(Kernel(target, "k", 64, none,
+                        optionsFor(static_cast<CodeObjectVersion>(invalid))),
+                 std::invalid_argument)
+        << "version " << invalid;
+}
+
+static KernelSignature signatureWithHidden(KernelArgumentKind kind) {
+  KernelSignature signature;
+  signature.addPointer("p");
+  signature.addScalar("n", 4);
+  signature.addHidden(kind, 4);
+  return signature;
+}
+
+static constexpr KernelArgumentKind hiddenKinds[] = {
+    KernelArgumentKind::hiddenBlockCountX,
+    KernelArgumentKind::hiddenBlockCountY,
+    KernelArgumentKind::hiddenBlockCountZ,
+    KernelArgumentKind::hiddenGroupSizeX,
+    KernelArgumentKind::hiddenGroupSizeY,
+    KernelArgumentKind::hiddenGroupSizeZ,
+};
+
+TEST_F(KernelTest, RejectsHiddenArgumentsAtCodeObjectV4) {
+  for (KernelArgumentKind kind : hiddenKinds) {
+    SCOPED_TRACE(static_cast<int32_t>(kind));
+    EXPECT_THROW(Kernel(target, "k", 64, signatureWithHidden(kind),
+                        optionsFor(CodeObjectVersion::v4)),
+                 std::invalid_argument);
+  }
+}
+
+TEST_F(KernelTest, AcceptsHiddenArgumentsFromCodeObjectV5) {
+  for (CodeObjectVersion version :
+       {CodeObjectVersion::v5, CodeObjectVersion::v6})
+    for (KernelArgumentKind kind : hiddenKinds) {
+      SCOPED_TRACE(static_cast<int32_t>(kind));
+      EXPECT_NO_THROW(Kernel(target, "k", 64, signatureWithHidden(kind),
+                             optionsFor(version)));
+    }
+}
+
+TEST_F(KernelTest, AcceptsExplicitArgumentsAtCodeObjectV4) {
+  EXPECT_NO_THROW(Kernel(target, "k", 64, pointerSignature({"a", "b"}),
+                         optionsFor(CodeObjectVersion::v4)));
+}
+
+TEST_F(KernelTest, RejectsInvalidPreloadDwords) {
+  for (int32_t dwords : {1, 14, -1}) {
+    KernelOptions options;
+    options.abi.maxPreloadDwords = dwords;
+    EXPECT_THROW(Kernel(target, "k", 64, KernelSignature(), options),
+                 std::invalid_argument)
+        << "dwords " << dwords;
+  }
+  EXPECT_NO_THROW(Kernel(target, "k", 64, KernelSignature(), KernelOptions()));
 }
 
 TEST_F(KernelTest, ReservesAbiRegisters) {
-  Kernel kernel(target, "k", 64);
+  Kernel kernel(target, "k", 64, KernelSignature());
   EXPECT_EQ(kernel.kernargSegmentPtr().kind(), RegisterKind::sgpr);
   EXPECT_EQ(kernel.kernargSegmentPtr().start(), 0);
   EXPECT_EQ(kernel.kernargSegmentPtr().count(), 2);
@@ -213,7 +288,7 @@ TEST_F(KernelTest, ReservesAbiRegisters) {
 
 TEST_F(KernelTest, DerivesRegisterCountsFromHighWaterMarks) {
   {
-    Kernel kernel(target, "empty", 64);
+    Kernel kernel(target, "empty", 64, KernelSignature());
     std::string assembly = kernel.toAssembly();
     EXPECT_TRUE(hasLine(assembly, "  .amdhsa_accum_offset 8")) << assembly;
     EXPECT_TRUE(hasLine(assembly, "  .amdhsa_next_free_vgpr 8")) << assembly;
@@ -222,7 +297,7 @@ TEST_F(KernelTest, DerivesRegisterCountsFromHighWaterMarks) {
     EXPECT_TRUE(hasLine(assembly, "    .vgpr_count: 8")) << assembly;
     EXPECT_TRUE(hasLine(assembly, "    .agpr_count: 0")) << assembly;
   }
-  Kernel kernel(target, "grown", 64);
+  Kernel kernel(target, "grown", 64, KernelSignature());
   // The registers are released before printing, so only the high-water mark
   // can account for them.
   kernel.builder().allocateVgpr(10);
@@ -237,7 +312,7 @@ TEST_F(KernelTest, DerivesRegisterCountsFromHighWaterMarks) {
 }
 
 TEST_F(KernelTest, PlacesAgprsAfterAccumOffset) {
-  Kernel kernel(target, "accumulators", 64);
+  Kernel kernel(target, "accumulators", 64, KernelSignature());
   kernel.builder().allocateVgpr(10);
   kernel.builder().allocateAgpr(6);
   std::string assembly = kernel.toAssembly();
@@ -248,13 +323,13 @@ TEST_F(KernelTest, PlacesAgprsAfterAccumOffset) {
 }
 
 TEST_F(KernelTest, ExceedingAgprLimitThrows) {
-  Kernel kernel(target, "k", 64);
+  Kernel kernel(target, "k", 64, KernelSignature());
   kernel.builder().allocateAgpr(target.maxAgpr() + 1);
   EXPECT_THROW(kernel.toAssembly(), std::runtime_error);
 }
 
 TEST_F(KernelTest, ExceedingRegisterLimitThrows) {
-  Kernel kernel(target, "k", 64);
+  Kernel kernel(target, "k", 64, KernelSignature());
   kernel.builder().allocateVgpr(target.maxVgpr());
   EXPECT_THROW(kernel.toAssembly(), std::runtime_error);
 }
@@ -267,8 +342,7 @@ static void addReferenceGemmExplicitArguments(KernelSignature &signature) {
 }
 
 TEST_F(KernelTest, ReplicatesReferenceGemmArgumentLayout) {
-  Kernel kernel(target, "gemm", 256);
-  KernelSignature &signature = kernel.signature();
+  KernelSignature signature;
   addReferenceGemmExplicitArguments(signature);
   EXPECT_EQ(signature.arguments()[5].offset, 40);
   EXPECT_EQ(signature.arguments()[6].offset, 48);
@@ -281,6 +355,7 @@ TEST_F(KernelTest, ReplicatesReferenceGemmArgumentLayout) {
   EXPECT_EQ(signature.addHidden(KernelArgumentKind::hiddenBlockCountZ, 4), 96);
   EXPECT_EQ(signature.segmentSize(), 104);
   EXPECT_TRUE(signature.arguments().back().name.empty());
+  Kernel kernel(target, "gemm", 256, std::move(signature));
   kernel.builder().createEndProgram();
 
   std::string assembly = kernel.toAssembly();
@@ -310,8 +385,7 @@ TEST_F(KernelTest, ReplicatesReferenceGemmArgumentLayout) {
 }
 
 TEST_F(KernelTest, ReplicatesReferenceSplitkReduceArgumentLayout) {
-  Kernel kernel(target, "splitk_reduce", 256);
-  KernelSignature &signature = kernel.signature();
+  KernelSignature signature;
   signature.addPointer("a");
   signature.addPointer("b");
   for (const char *name : {"s0", "s1", "s2", "s3"})
@@ -325,6 +399,7 @@ TEST_F(KernelTest, ReplicatesReferenceSplitkReduceArgumentLayout) {
   EXPECT_EQ(signature.addHidden(KernelArgumentKind::hiddenBlockCountY, 4), 48);
   EXPECT_EQ(signature.addHidden(KernelArgumentKind::hiddenBlockCountZ, 4), 52);
   EXPECT_EQ(signature.segmentSize(), 56);
+  Kernel kernel(target, "splitk_reduce", 256, std::move(signature));
   kernel.builder().createEndProgram();
 
   std::string assembly = kernel.toAssembly();
@@ -372,57 +447,73 @@ TEST_F(KernelTest, RejectsInvalidHiddenArguments) {
   EXPECT_EQ(std::ssize(signature.arguments()), 1);
 }
 
-TEST_F(KernelTest, EnablesWorkgroupIds) {
-  {
-    Kernel kernel(target, "none", 64);
-    EXPECT_THROW(kernel.workgroupIdY(), std::logic_error);
-    EXPECT_THROW(kernel.workgroupIdZ(), std::logic_error);
-    std::string assembly = kernel.toAssembly();
-    EXPECT_EQ(assembly.find("workgroup_id_y"), std::string::npos) << assembly;
-    EXPECT_EQ(assembly.find("workgroup_id_z"), std::string::npos) << assembly;
-  }
-  {
-    Kernel kernel(target, "both", 64);
-    kernel.enableWorkgroupIds(true, true);
-    EXPECT_EQ(kernel.workgroupIdY().start(), 3);
-    EXPECT_EQ(kernel.workgroupIdZ().start(), 4);
-    EXPECT_EQ(kernel.builder().allocateSgpr(1).start(), 5);
-    std::string assembly = kernel.toAssembly();
-    expectLinesInOrder(assembly, {".amdhsa_system_sgpr_workgroup_id_x 1",
-                                  ".amdhsa_system_sgpr_workgroup_id_y 1",
-                                  ".amdhsa_system_sgpr_workgroup_id_z 1",
-                                  ".amdhsa_system_vgpr_workitem_id 0"});
-    EXPECT_THROW(kernel.enableWorkgroupIds(true, false), std::logic_error);
-  }
-  {
-    Kernel kernel(target, "both_empty", 64);
-    kernel.enableWorkgroupIds(true, true);
-    EXPECT_TRUE(hasLine(kernel.toAssembly(), "  .amdhsa_next_free_sgpr 5"));
-  }
-  {
-    Kernel kernel(target, "z_only", 64);
-    kernel.enableWorkgroupIds(false, true);
-    EXPECT_EQ(kernel.workgroupIdZ().start(), 3);
-    EXPECT_THROW(kernel.workgroupIdY(), std::logic_error);
-    std::string assembly = kernel.toAssembly();
-    EXPECT_EQ(assembly.find("workgroup_id_y"), std::string::npos) << assembly;
-    EXPECT_TRUE(hasLine(assembly, "  .amdhsa_system_sgpr_workgroup_id_z 1"))
-        << assembly;
-  }
+static KernelOptions idOptions(bool y, bool z) {
+  KernelOptions options;
+  options.workgroupIdY = y;
+  options.workgroupIdZ = z;
+  return options;
 }
 
-TEST_F(KernelTest, RejectsInvalidWorkgroupIdRequests) {
-  Kernel none(target, "none", 64);
-  EXPECT_THROW(none.enableWorkgroupIds(false, false), std::invalid_argument);
+TEST_F(KernelTest, DisablesWorkgroupIdsYAndZByDefault) {
+  Kernel kernel(target, "none", 64, KernelSignature());
+  EXPECT_FALSE(kernel.hasWorkgroupIdY());
+  EXPECT_FALSE(kernel.hasWorkgroupIdZ());
+  EXPECT_THROW(kernel.workgroupIdY(), std::logic_error);
+  EXPECT_THROW(kernel.workgroupIdZ(), std::logic_error);
+  std::string assembly = kernel.toAssembly();
+  EXPECT_EQ(assembly.find("workgroup_id_y"), std::string::npos) << assembly;
+  EXPECT_EQ(assembly.find("workgroup_id_z"), std::string::npos) << assembly;
+}
 
-  Kernel busy(target, "busy", 64);
-  RegisterRange held = busy.builder().allocateSgpr(1);
-  ASSERT_EQ(held.start(), 3);
-  EXPECT_THROW(busy.enableWorkgroupIds(true, false), std::invalid_argument);
+TEST_F(KernelTest, PlacesWorkgroupIdsYAndZAfterX) {
+  Kernel kernel(target, "both", 64, KernelSignature(), idOptions(true, true));
+  EXPECT_EQ(kernel.workgroupIdX().start(), 2);
+  EXPECT_EQ(kernel.workgroupIdY().start(), 3);
+  EXPECT_EQ(kernel.workgroupIdZ().start(), 4);
+  EXPECT_EQ(kernel.builder().allocateSgpr(1).start(), 5);
+  std::string assembly = kernel.toAssembly();
+  expectLinesInOrder(assembly, {".amdhsa_system_sgpr_workgroup_id_x 1",
+                                ".amdhsa_system_sgpr_workgroup_id_y 1",
+                                ".amdhsa_system_sgpr_workgroup_id_z 1",
+                                ".amdhsa_system_vgpr_workitem_id 0"});
+}
+
+TEST_F(KernelTest, CountsReservedWorkgroupIdsWithoutBody) {
+  Kernel kernel(target, "both_empty", 64, KernelSignature(),
+                idOptions(true, true));
+  EXPECT_TRUE(hasLine(kernel.toAssembly(), "  .amdhsa_next_free_sgpr 5"));
+}
+
+TEST_F(KernelTest, PlacesOnlyWorkgroupIdY) {
+  Kernel kernel(target, "y_only", 64, KernelSignature(),
+                idOptions(true, false));
+  EXPECT_TRUE(kernel.hasWorkgroupIdY());
+  EXPECT_FALSE(kernel.hasWorkgroupIdZ());
+  EXPECT_EQ(kernel.workgroupIdY().start(), 3);
+  EXPECT_THROW(kernel.workgroupIdZ(), std::logic_error);
+  EXPECT_EQ(kernel.builder().allocateSgpr(1).start(), 4);
+  std::string assembly = kernel.toAssembly();
+  EXPECT_EQ(assembly.find("workgroup_id_z"), std::string::npos) << assembly;
+  EXPECT_TRUE(hasLine(assembly, "  .amdhsa_system_sgpr_workgroup_id_y 1"))
+      << assembly;
+}
+
+TEST_F(KernelTest, PlacesOnlyWorkgroupIdZ) {
+  Kernel kernel(target, "z_only", 64, KernelSignature(),
+                idOptions(false, true));
+  EXPECT_FALSE(kernel.hasWorkgroupIdY());
+  EXPECT_TRUE(kernel.hasWorkgroupIdZ());
+  EXPECT_EQ(kernel.workgroupIdZ().start(), 3);
+  EXPECT_THROW(kernel.workgroupIdY(), std::logic_error);
+  EXPECT_EQ(kernel.builder().allocateSgpr(1).start(), 4);
+  std::string assembly = kernel.toAssembly();
+  EXPECT_EQ(assembly.find("workgroup_id_y"), std::string::npos) << assembly;
+  EXPECT_TRUE(hasLine(assembly, "  .amdhsa_system_sgpr_workgroup_id_z 1"))
+      << assembly;
 }
 
 TEST_F(KernelTest, SetsLdsSize) {
-  Kernel kernel(target, "lds", 64);
+  Kernel kernel(target, "lds", 64, KernelSignature());
   EXPECT_EQ(kernel.ldsSize(), 0);
   kernel.setLdsSize(4096);
   EXPECT_EQ(kernel.ldsSize(), 4096);
@@ -438,12 +529,13 @@ TEST_F(KernelTest, SetsLdsSize) {
 }
 
 TEST_F(KernelTest, LoadsArguments) {
-  Kernel kernel(target, "loads", 64);
-  KernelSignature &signature = kernel.signature();
+  KernelSignature signature;
   signature.addPointer("p");
   signature.addScalar("n", 4);
   signature.addHidden(KernelArgumentKind::hiddenGroupSizeX, 4);
   signature.addHidden(KernelArgumentKind::hiddenBlockCountX, 4);
+  int32_t end = signature.segmentSize();
+  Kernel kernel(target, "loads", 64, std::move(signature));
   IRBuilder &builder = kernel.builder();
   RegisterRange regs = builder.allocateSgpr(8, 4);
   kernel.loadArgument(regs.ref(0, 1), 8);
@@ -460,7 +552,6 @@ TEST_F(KernelTest, LoadsArguments) {
   EXPECT_THROW(kernel.loadArgument(regs.ref(1, 2), 0), std::invalid_argument);
   EXPECT_THROW(kernel.loadArgument(regs.ref(0, 1), 2), std::invalid_argument);
   EXPECT_THROW(kernel.loadArgument(regs.ref(0, 1), -4), std::invalid_argument);
-  int32_t end = signature.segmentSize();
   EXPECT_NO_THROW(kernel.loadArgument(regs.ref(0, 1), end - 4));
   EXPECT_THROW(kernel.loadArgument(regs.ref(0, 1), end), std::invalid_argument);
   EXPECT_THROW(kernel.loadArgument(regs.ref(0, 2), end - 4),
@@ -469,8 +560,7 @@ TEST_F(KernelTest, LoadsArguments) {
 
 TEST(KernelLaunch, EmptyKernelAssemblesLoadsAndLaunches) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, "codegen_empty_kernel", 256);
-  kernel.signature().addPointer("out");
+  Kernel kernel(target, "codegen_empty_kernel", 256, pointerSignature({"out"}));
   kernel.builder().createEndProgram();
 
   // Assembling is checked before the device so it runs without a GPU.
@@ -529,8 +619,6 @@ static void emitAgprRoundTrip(Kernel &kernel, const RegisterRange &pointers,
 }
 
 static void buildAgprRoundTrip(Kernel &kernel) {
-  kernel.signature().addPointer("in");
-  kernel.signature().addPointer("out");
   RegisterRange pointers = loadRoundTripPointers(kernel);
   RegisterRange globalId = computeGlobalId(kernel);
   emitAgprRoundTrip(kernel, pointers, globalId);
@@ -562,7 +650,8 @@ static void runRoundTrip(const std::vector<uint8_t> &hsaco, const char *name,
 
 TEST(KernelLaunch, AgprRoundTripOnDevice) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, roundTripName, roundTripGroupSize);
+  Kernel kernel(target, roundTripName, roundTripGroupSize,
+                pointerSignature({"in", "out"}));
   buildAgprRoundTrip(kernel);
   std::string assembly = kernel.toAssembly();
   SCOPED_TRACE("assembly:\n" + assembly);
@@ -655,8 +744,6 @@ static RegisterRange computeRecordOffset(Kernel &kernel,
 }
 
 static void buildIdsAndHiddenKernel(Kernel &kernel) {
-  kernel.enableWorkgroupIds(true, true);
-  addIdsSignature(kernel.signature());
   IRBuilder &builder = kernel.builder();
   RegisterRange out = builder.allocateSgpr(2, 2);
   RegisterRange values = builder.allocateSgpr(idsDwords);
@@ -700,7 +787,10 @@ static void runIdsAndHidden(const std::vector<uint8_t> &hsaco,
 
 TEST(KernelLaunch, WorkgroupIdsAndHiddenArgumentsOnDevice) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, idsName, idsBlockSize);
+  KernelSignature signature;
+  addIdsSignature(signature);
+  Kernel kernel(target, idsName, idsBlockSize, std::move(signature),
+                idOptions(true, true));
   buildIdsAndHiddenKernel(kernel);
   std::string assembly = kernel.toAssembly();
   SCOPED_TRACE("assembly:\n" + assembly);
@@ -731,6 +821,145 @@ TEST(KernelLaunch, WorkgroupIdsAndHiddenArgumentsOnDevice) {
           ASSERT_EQ(records[linear * idsDwords + i], expected[i])
               << "group (" << x << ", " << y << ", " << z << ") word " << i;
       }
+}
+
+static constexpr const char *abiName = "codegen_abi_versions";
+static constexpr int32_t abiGrid[3] = {3, 2, 2};
+static constexpr int32_t abiGroups = abiGrid[0] * abiGrid[1] * abiGrid[2];
+static constexpr int32_t abiScalarA = 0x1234;
+static constexpr int32_t abiScalarB = -77;
+// Workgroup ids x, y, z followed by the two scalar arguments.
+static constexpr int32_t abiDwords = 5;
+// Byte offset of e_ident[EI_ABIVERSION] in an ELF file.
+static constexpr int32_t elfAbiVersionIndex = 8;
+
+static KernelSignature abiSignature() {
+  KernelSignature signature;
+  signature.addPointer("out");
+  signature.addScalar("a", 4);
+  signature.addScalar("b", 4);
+  return signature;
+}
+
+// Returns the byte offset of this workgroup's record in a VGPR.
+static RegisterRange computeAbiRecordOffset(Kernel &kernel,
+                                            const RegisterRange &values) {
+  IRBuilder &builder = kernel.builder();
+  RegisterRange linear = builder.allocateSgpr(1);
+  // linear = x + gridX * (y + gridY * z).
+  builder.create<rocisa::SMulI32>(linear.container(), values.sub(2),
+                                  abiGrid[1]);
+  builder.create<rocisa::SAddU32>(linear.container(), linear.container(),
+                                  values.sub(1));
+  builder.create<rocisa::SMulI32>(linear.container(), linear.container(),
+                                  abiGrid[0]);
+  builder.create<rocisa::SAddU32>(linear.container(), linear.container(),
+                                  values.sub(0));
+  builder.create<rocisa::SMulI32>(linear.container(), linear.container(),
+                                  4 * abiDwords);
+  RegisterRange offset = builder.allocateVgpr(1);
+  builder.create<rocisa::VMovB32>(offset.container(), linear.container());
+  return offset;
+}
+
+// Stores the ids and the two arguments of every workgroup from lane 0.
+static void buildAbiKernel(Kernel &kernel) {
+  IRBuilder &builder = kernel.builder();
+  RegisterRange out = builder.allocateSgpr(2, 2);
+  RegisterRange values = builder.allocateSgpr(abiDwords);
+  kernel.loadArgument(out.ref(), 0);
+  const RegisterRange *ids[] = {&kernel.workgroupIdX(), &kernel.workgroupIdY(),
+                                &kernel.workgroupIdZ()};
+  for (int32_t i = 0; i < 3; ++i)
+    builder.create<rocisa::SMovB32>(values.sub(i), ids[i]->container());
+  kernel.loadArgument(values.ref(3), 8);
+  kernel.loadArgument(values.ref(4), 12);
+  builder.createWaitCnt({.scalarMemory = 0});
+  RegisterRange base = computeAbiRecordOffset(kernel, values);
+  // The kernel ends right after the stores, so shrinking exec is safe.
+  builder.create<rocisa::SMovB64>(std::make_shared<rocisa::EXEC>(), 1);
+  RegisterRange address = builder.allocateVgpr(1);
+  RegisterRange data = builder.allocateVgpr(1);
+  for (int32_t i = 0; i < abiDwords; ++i) {
+    builder.create<rocisa::VAddU32>(address.container(), 4 * i,
+                                    base.container());
+    builder.create<rocisa::VMovB32>(data.container(), values.sub(i));
+    builder.create<rocisa::GlobalStoreB32>(address.container(),
+                                           data.container(), out.container());
+  }
+  builder.createEndProgram();
+}
+
+static void runAbiKernel(const std::vector<uint8_t> &hsaco,
+                         std::vector<int32_t> &records) {
+  ModulePtr module;
+  hipFunction_t function = nullptr;
+  loadKernel(hsaco, abiName, module, function);
+  DevicePtr deviceOut;
+  // The sentinel shows any record the kernel failed to write.
+  uploadBytes(nullptr, records.size() * sizeof(int32_t), deviceOut);
+  ASSERT_FALSE(testing::Test::HasFatalFailure());
+
+  void *out = deviceOut.get();
+  int32_t a = abiScalarA;
+  int32_t b = abiScalarB;
+  void *args[] = {&out, &a, &b};
+  launchWithParams(function, dim3(abiGrid[0], abiGrid[1], abiGrid[2]), 64,
+                   args);
+  ASSERT_FALSE(testing::Test::HasFatalFailure());
+  download(deviceOut, records);
+}
+
+static void checkAbiRecords(const std::vector<int32_t> &records) {
+  for (int32_t z = 0; z < abiGrid[2]; ++z)
+    for (int32_t y = 0; y < abiGrid[1]; ++y)
+      for (int32_t x = 0; x < abiGrid[0]; ++x) {
+        int32_t linear = x + abiGrid[0] * (y + abiGrid[1] * z);
+        const int32_t expected[abiDwords] = {x, y, z, abiScalarA, abiScalarB};
+        for (int32_t i = 0; i < abiDwords; ++i)
+          ASSERT_EQ(records[linear * abiDwords + i], expected[i])
+              << "group (" << x << ", " << y << ", " << z << ") word " << i;
+      }
+}
+
+static void checkArgumentsAndIdsAtVersion(CodeObjectVersion version,
+                                          uint8_t elfAbiVersion) {
+  Target target = Target::get("gfx950");
+  KernelOptions options = optionsFor(version);
+  options.workgroupIdY = true;
+  options.workgroupIdZ = true;
+  Kernel kernel(target, abiName, 64, abiSignature(), options);
+  for (const KernelArgument &arg : kernel.signature().arguments())
+    ASSERT_FALSE(arg.name.empty()) << "unexpected hidden argument";
+  buildAbiKernel(kernel);
+  std::string assembly = kernel.toAssembly();
+  SCOPED_TRACE("assembly:\n" + assembly);
+
+  // Assembling is checked before the device so it runs without a GPU.
+  std::vector<uint8_t> hsaco =
+      assembleToHSACO(assembly, kernel.target().isaName());
+  ASSERT_GT(std::ssize(hsaco), elfAbiVersionIndex);
+  EXPECT_EQ(hsaco[elfAbiVersionIndex], elfAbiVersion);
+  if (!hasHipDevice())
+    GTEST_SKIP() << "no HIP device";
+
+  std::vector<int32_t> records(abiGroups * abiDwords, -1);
+  runAbiKernel(hsaco, records);
+  if (testing::Test::HasFatalFailure())
+    return;
+  checkAbiRecords(records);
+}
+
+TEST(KernelLaunch, ArgumentsAndWorkgroupIdsOnDeviceAtCodeObjectV4) {
+  checkArgumentsAndIdsAtVersion(CodeObjectVersion::v4, 2);
+}
+
+TEST(KernelLaunch, ArgumentsAndWorkgroupIdsOnDeviceAtCodeObjectV5) {
+  checkArgumentsAndIdsAtVersion(CodeObjectVersion::v5, 3);
+}
+
+TEST(KernelLaunch, ArgumentsAndWorkgroupIdsOnDeviceAtCodeObjectV6) {
+  checkArgumentsAndIdsAtVersion(CodeObjectVersion::v6, 4);
 }
 
 static constexpr const char *ldsName = "codegen_lds_round_trip";
@@ -777,8 +1006,6 @@ static void emitLdsExchange(Kernel &kernel, const RegisterRange &pointers,
 }
 
 static void buildLdsRoundTrip(Kernel &kernel) {
-  kernel.signature().addPointer("in");
-  kernel.signature().addPointer("out");
   kernel.setLdsSize(4 * ldsGroupSize);
   IRBuilder &builder = kernel.builder();
   RegisterRange pointers = builder.allocateSgpr(4, 4);
@@ -791,7 +1018,7 @@ static void buildLdsRoundTrip(Kernel &kernel) {
 
 TEST(KernelLaunch, LdsRoundTripOnDevice) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, ldsName, ldsGroupSize);
+  Kernel kernel(target, ldsName, ldsGroupSize, pointerSignature({"in", "out"}));
   buildLdsRoundTrip(kernel);
   std::string assembly = kernel.toAssembly();
   SCOPED_TRACE("assembly:\n" + assembly);

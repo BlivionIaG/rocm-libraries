@@ -181,8 +181,9 @@ static void runSaxpy(const std::vector<uint8_t> &hsaco, SaxpyOffsets offsets,
 
 TEST(Saxpy, MatchesHostReferenceOnDevice) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, kernelName, workgroupSize);
-  SaxpyOffsets offsets = declareArguments(kernel.signature());
+  KernelSignature signature;
+  SaxpyOffsets offsets = declareArguments(signature);
+  Kernel kernel(target, kernelName, workgroupSize, std::move(signature));
   ASSERT_EQ(offsets.x, 0);
   ASSERT_EQ(offsets.y, 8);
   ASSERT_EQ(offsets.a, 16);

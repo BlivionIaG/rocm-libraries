@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -18,6 +19,8 @@ using namespace rocm::tensilelite::codegen;
 // LLVM counts them in the metadata .sgpr_count of every gfx950 kernel.
 static constexpr int32_t gfx9ExtraSgprs = 6;
 static constexpr int32_t maxWorkgroupSizeLimit = 1024;
+// The kernarg segment pointer is a 64-bit user SGPR pair.
+static constexpr int32_t kernargPtrSgprs = 2;
 
 namespace {
 
@@ -27,6 +30,14 @@ struct RegisterCounts {
   int32_t agprCount;
   int32_t nextFreeSgpr;
   int32_t metadataSgprCount;
+};
+
+// Where the hardware initializes the SGPRs the kernel reads at entry.
+struct SgprLayout {
+  int32_t userSgprCount;
+  int32_t workgroupIdX;
+  std::optional<int32_t> workgroupIdY;
+  std::optional<int32_t> workgroupIdZ;
 };
 
 } // namespace
@@ -109,10 +120,42 @@ static int32_t validatedWorkgroupSize(int32_t size) {
   return size;
 }
 
-static CodeObjectVersion validatedVersion(CodeObjectVersion version) {
+static const KernelAbi &validatedAbi(const KernelAbi &abi) {
   // Throws for unsupported versions; the minor version itself is unused here.
-  (void)metadataVersionMinor(version);
-  return version;
+  (void)metadataVersionMinor(abi.codeObjectVersion);
+  if (abi.maxPreloadDwords < 0)
+    throw std::invalid_argument("max preload dwords must be non-negative");
+  if (abi.maxPreloadDwords != 0)
+    throw std::invalid_argument("kernarg preloading is not supported yet");
+  return abi;
+}
+
+// All hidden argument kinds are code object v5 additions.
+static KernelSignature validatedSignature(KernelSignature signature,
+                                          CodeObjectVersion version) {
+  if (version != CodeObjectVersion::v4)
+    return signature;
+  for (const KernelArgument &arg : signature.arguments())
+    if (isHidden(arg.kind))
+      throw std::invalid_argument(
+          "hidden kernel arguments need code object v5 or later");
+  return signature;
+}
+
+// The user SGPRs come first, then the enabled system SGPRs: workgroup ids x, y
+// and z in that order, consuming consecutive registers.
+static SgprLayout computeSgprLayout(const KernelOptions &options) {
+  // The kernarg preload window goes between the kernarg pointer and the system
+  // SGPRs, so it grows the user SGPR count here.
+  SgprLayout layout;
+  layout.userSgprCount = kernargPtrSgprs;
+  int32_t next = layout.userSgprCount;
+  layout.workgroupIdX = next++;
+  if (options.workgroupIdY)
+    layout.workgroupIdY = next++;
+  if (options.workgroupIdZ)
+    layout.workgroupIdZ = next++;
+  return layout;
 }
 
 static RegisterCounts countRegisters(const RegisterAllocator &registers) {
@@ -277,32 +320,28 @@ int32_t KernelSignature::segmentSize() const {
 
 // Validation runs in the initializers so no partially built kernel exists.
 Kernel::Kernel(const Target &target, std::string_view name,
-               int32_t workgroupSize, CodeObjectVersion codeObjectVersion)
+               int32_t workgroupSize, KernelSignature signature,
+               const KernelOptions &options)
     : kernelTarget(target), kernelName(validatedName(name)),
       maxWorkgroupSize(validatedWorkgroupSize(workgroupSize)),
-      version(validatedVersion(codeObjectVersion)), registers(target),
-      bodyModule(kernelName), irBuilder(target, registers, bodyModule),
-      kernargPtr(
-          registers.reserve(RegisterKind::sgpr, 0, 2, "kernarg_segment_ptr")),
-      workgroupIdXReg(
-          registers.reserve(RegisterKind::sgpr, 2, 1, "workgroup_id_x")),
+      version(validatedAbi(options.abi).codeObjectVersion),
+      kernelSignature(validatedSignature(std::move(signature), version)),
+      registers(target), bodyModule(kernelName),
+      irBuilder(target, registers, bodyModule),
+      kernargPtr(registers.reserve(RegisterKind::sgpr, 0, kernargPtrSgprs,
+                                   "kernarg_segment_ptr")),
+      workgroupIdXReg(registers.reserve(RegisterKind::sgpr,
+                                        computeSgprLayout(options).workgroupIdX,
+                                        1, "workgroup_id_x")),
       workitemIdReg(
-          registers.reserve(RegisterKind::vgpr, 0, 1, "workitem_id")) {}
-
-void Kernel::enableWorkgroupIds(bool y, bool z) {
-  if (!y && !z)
-    throw std::invalid_argument("no workgroup id requested");
-  if (workgroupIdsEnabled)
-    throw std::logic_error("workgroup ids already enabled");
-  // The hardware packs the enabled ids right after workgroup id x.
-  int32_t next = 3;
-  if (y)
-    workgroupIdYReg.emplace(
-        registers.reserve(RegisterKind::sgpr, next++, 1, "workgroup_id_y"));
-  if (z)
-    workgroupIdZReg.emplace(
-        registers.reserve(RegisterKind::sgpr, next, 1, "workgroup_id_z"));
-  workgroupIdsEnabled = true;
+          registers.reserve(RegisterKind::vgpr, 0, 1, "workitem_id")) {
+  SgprLayout layout = computeSgprLayout(options);
+  if (layout.workgroupIdY)
+    workgroupIdYReg.emplace(registers.reserve(
+        RegisterKind::sgpr, *layout.workgroupIdY, 1, "workgroup_id_y"));
+  if (layout.workgroupIdZ)
+    workgroupIdZReg.emplace(registers.reserve(
+        RegisterKind::sgpr, *layout.workgroupIdZ, 1, "workgroup_id_z"));
 }
 
 const RegisterRange &Kernel::workgroupIdY() const {

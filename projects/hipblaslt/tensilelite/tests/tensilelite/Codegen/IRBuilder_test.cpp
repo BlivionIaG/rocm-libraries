@@ -711,7 +711,8 @@ assemblePlacement(RegisterKind dstKind, int32_t width, int32_t dstOffset,
                                               RegisterRange &)> &makeSource,
                   PlacementCounts &counts) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, "codegen_move_placement", arithWorkgroupSize);
+  Kernel kernel(target, "codegen_move_placement", arithWorkgroupSize,
+                KernelSignature());
   IRBuilder &builder = kernel.builder();
   RegisterRange sgprs = builder.allocateSgpr(4, 2);
   RegisterRange vgprs = builder.allocateVgpr(4, 2);
@@ -1551,7 +1552,8 @@ static void expectPlacementAssembles(const std::string &label,
                                      const PlacementEmitter &emit, APlacement a,
                                      BPlacement b, RegisterKind dstKind) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, "codegen_placement", arithWorkgroupSize);
+  Kernel kernel(target, "codegen_placement", arithWorkgroupSize,
+                KernelSignature());
   IRBuilder &builder = kernel.builder();
   PlacementRegisters regs{builder.allocateVgpr(1), builder.allocateVgpr(1),
                           builder.allocateSgpr(1), builder.allocateSgpr(1)};
@@ -2499,7 +2501,8 @@ placementsOf(const Arith64PlacementRegisters &regs) {
 // Emits every placement combination of one op into a single kernel.
 static void expectPlacementsAssemble(const OpCase64 &op, RegisterKind dstKind) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, "codegen_placement", arithWorkgroupSize);
+  Kernel kernel(target, "codegen_placement", arithWorkgroupSize,
+                KernelSignature());
   IRBuilder &builder = kernel.builder();
   Arith64PlacementRegisters aRegs = allocatePlacementRegisters(builder);
   Arith64PlacementRegisters bRegs = allocatePlacementRegisters(builder);
@@ -3346,7 +3349,8 @@ TEST_F(Bitwise64Device, DestinationAliasing) {
 static void expectShiftPlacementsAssemble(const OpCase64 &op,
                                           RegisterKind dstKind) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, "codegen_placement", arithWorkgroupSize);
+  Kernel kernel(target, "codegen_placement", arithWorkgroupSize,
+                KernelSignature());
   IRBuilder &builder = kernel.builder();
   Arith64PlacementRegisters aRegs = allocatePlacementRegisters(builder);
   RegisterRange vector = builder.allocateVgpr(1);
@@ -4930,7 +4934,7 @@ expectConstantPlacementsAssemble(const DivisionCase &c, RegisterKind dstKind,
                                  const char *kernelName,
                                  std::span<const int32_t> divisors) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, kernelName, arithWorkgroupSize);
+  Kernel kernel(target, kernelName, arithWorkgroupSize, KernelSignature());
   IRBuilder &builder = kernel.builder();
   RegisterRange vector = builder.allocateVgpr(1);
   RegisterRange scalar = builder.allocateSgpr(1);
@@ -7376,7 +7380,8 @@ TEST_F(MemoryTest, ErrorMessagesNameTheOperationAndTheProblem) {
 // Emits every width, payload kind and option into one kernel.
 TEST(MemoryAssembly, AllWidthsAndOptionsAssemble) {
   Target target = Target::get("gfx950");
-  Kernel kernel(target, "codegen_memory_assembly", memoryWorkgroupSize);
+  Kernel kernel(target, "codegen_memory_assembly", memoryWorkgroupSize,
+                KernelSignature());
   IRBuilder &builder = kernel.builder();
   kernel.setLdsSize(1 << 16);
   RegisterRange rsrc = builder.allocateSgpr(4, 4);
@@ -7715,8 +7720,10 @@ static void expectBytes(const std::vector<uint8_t> &actual,
 static void runMemoryCase(const MemoryCase &test) {
   const WidthSpec &spec = specOf(test.width);
   Target target = Target::get("gfx950");
-  Kernel kernel(target, memoryKernelName, memoryWorkgroupSize);
-  MemoryOffsets offsets = declareArguments(kernel.signature());
+  KernelSignature signature;
+  MemoryOffsets offsets = declareArguments(signature);
+  Kernel kernel(target, memoryKernelName, memoryWorkgroupSize,
+                std::move(signature));
   buildMemoryKernel(kernel, test, spec, offsets);
   std::string assembly = kernel.toAssembly();
   SCOPED_TRACE("assembly:\n" + assembly);

@@ -377,9 +377,10 @@ static void checkInputSizes(const ArithKernelSpec &spec, int32_t workgroupCount,
 // Returns the kernel's assembly.
 static std::string buildArithAssembly(const ArithKernelSpec &spec) {
   Target target = Target::get(archName);
-  Kernel kernel(target, kernelName, arithWorkgroupSize);
-  std::vector<int32_t> offsets = declarePointers(
-      kernel.signature(), static_cast<int32_t>(spec.inputs.size()));
+  KernelSignature signature;
+  std::vector<int32_t> offsets =
+      declarePointers(signature, static_cast<int32_t>(spec.inputs.size()));
+  Kernel kernel(target, kernelName, arithWorkgroupSize, std::move(signature));
   IRBuilder &builder = kernel.builder();
 
   std::vector<RegisterRange> pointers = loadPointers(kernel, offsets);

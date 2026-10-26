@@ -6,6 +6,7 @@
 
 #include <tensilelite/API/Compiler.hpp>
 #include <tensilelite/Codegen/IRBuilder.hpp>
+#include <tensilelite/Codegen/KernelAbi.hpp>
 #include <tensilelite/Codegen/Registers.hpp>
 #include <tensilelite/Codegen/Target.hpp>
 
@@ -27,8 +28,10 @@ enum class KernelArgumentKind {
   globalPointer,
   /// A scalar copied into the kernarg segment (value_kind by_value).
   byValue,
-  /// Hidden arguments the runtime fills from the launch (code object v5+ value
-  /// kinds). The block count is the number of workgroups in that dimension.
+  /// Hidden arguments the runtime fills from the launch. These value kinds
+  /// exist from code object v5 on: a Kernel at v4 rejects a signature that
+  /// contains them, and the runtime does not fill them in conformant v4
+  /// objects. The block count is the number of workgroups in that dimension.
   hiddenBlockCountX,
   hiddenBlockCountY,
   hiddenBlockCountZ,
@@ -86,6 +89,10 @@ private:
 
 /// A kernel under construction, emitted as a complete assembly file.
 ///
+/// The ABI (code object version and which workgroup ids are enabled) and the
+/// complete kernarg signature are fixed at construction, so the registers the
+/// hardware initializes are reserved before the body allocates anything.
+///
 /// It owns the body module, the register allocator and an IRBuilder whose
 /// insertion point is the body. The builder and the allocator are not movable,
 /// so the kernel is built in place and is neither copyable nor movable. Label
@@ -94,13 +101,17 @@ private:
 /// must be used on the thread that constructed the kernel.
 class Kernel {
 public:
-  /// Creates an empty kernel named name. workgroupSize is the largest
-  /// workgroup it may be launched with (max_flat_workgroup_size). Reserves the
-  /// ABI registers before anything else is allocated. Throws
+  /// Creates an empty kernel named name with the complete signature.
+  /// workgroupSize is the largest workgroup it may be launched with
+  /// (max_flat_workgroup_size). Reserves the ABI registers before anything
+  /// else is allocated: the kernarg segment pointer in s[0:1], then the
+  /// enabled workgroup ids x, y, z in consecutive SGPRs. Throws
   /// std::invalid_argument if name is not an identifier, workgroupSize is not
-  /// in [1, 1024], or codeObjectVersion is not v4, v5 or v6.
+  /// in [1, 1024], the code object version is not v4, v5 or v6, the signature
+  /// has hidden arguments at v4, or abi.maxPreloadDwords is negative or not
+  /// zero (kernarg preloading is not supported yet).
   Kernel(const Target &target, std::string_view name, int32_t workgroupSize,
-         CodeObjectVersion codeObjectVersion = CodeObjectVersion::v6);
+         KernelSignature signature, const KernelOptions &options = {});
   Kernel(const Kernel &) = delete;
   Kernel &operator=(const Kernel &) = delete;
 
@@ -108,7 +119,6 @@ public:
   std::string_view name() const { return kernelName; }
   int32_t workgroupSize() const { return maxWorkgroupSize; }
   CodeObjectVersion codeObjectVersion() const { return version; }
-  KernelSignature &signature() { return kernelSignature; }
   const KernelSignature &signature() const { return kernelSignature; }
   IRBuilder &builder() { return irBuilder; }
 
@@ -116,17 +126,12 @@ public:
   const RegisterRange &kernargSegmentPtr() const { return kernargPtr; }
   /// Workgroup id x in s2, the first system SGPR after the user SGPRs.
   const RegisterRange &workgroupIdX() const { return workgroupIdXReg; }
-  /// Enables the workgroup ids y and z, which the hardware places in the
-  /// system SGPRs right after workgroup id x in x, y, z order (s3 and s4 when
-  /// both are enabled). Call it before allocating SGPRs so those indices are
-  /// free. Throws std::invalid_argument if neither is requested or a register
-  /// is in use, and std::logic_error if called twice.
-  void enableWorkgroupIds(bool y, bool z);
   bool hasWorkgroupIdY() const { return workgroupIdYReg.has_value(); }
   bool hasWorkgroupIdZ() const { return workgroupIdZReg.has_value(); }
-  /// Workgroup id y; throws std::logic_error unless enabled.
+  /// Workgroup id y, in s3; throws std::logic_error unless enabled.
   const RegisterRange &workgroupIdY() const;
-  /// Workgroup id z; throws std::logic_error unless enabled.
+  /// Workgroup id z, in s4 with y enabled and in s3 otherwise; throws
+  /// std::logic_error unless enabled.
   const RegisterRange &workgroupIdZ() const;
   /// Workitem id in v0. On gfx90a and later the ids are packed: x is bits
   /// [9:0] (y [19:10] and z [29:20] are not enabled), so mask with 0x3ff
@@ -159,7 +164,6 @@ private:
   std::string kernelName;
   int32_t maxWorkgroupSize;
   int32_t ldsBytes = 0;
-  bool workgroupIdsEnabled = false;
   CodeObjectVersion version;
   KernelSignature kernelSignature;
   RegisterAllocator registers;
