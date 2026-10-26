@@ -4489,6 +4489,11 @@ rocblaslt_status makeArgument(rocblaslt_handle             handle,
                 log_error(__func__, "No solution for index", *solutionIndex);
                 return rocblaslt_status_invalid_value;
             }
+            if(solution->problemType.fusedA2A != data->problem.gemms[0].fusedA2A())
+            {
+                log_error(__func__, "Fused all-to-all mode of solution differs from the problem");
+                return rocblaslt_status_invalid_value;
+            }
 
             if(!data->problem.gemms.empty()
                && data->problem.gemms[0].getParams().uniformSummationOrder())

@@ -890,6 +890,93 @@ namespace
         EXPECT_EQ(gemm.initialize(fusedResult.algo, nullptr), HIPBLAS_STATUS_INVALID_VALUE);
     }
 
+    TEST_F(FusedA2ADispatch_pre_checkin, ExtGroupedGemmRejectsAFusedAlgo)
+    {
+        transposeA();
+        registerOneRank();
+        completeAndAttach();
+        makeD();
+
+        hipblasLtMatmulHeuristicResult_t fusedResult = {};
+        int                              returned    = 0;
+        ASSERT_EQ(heuristic(&fusedResult, &returned), HIPBLAS_STATUS_SUCCESS);
+        if(returned == 0)
+            GTEST_SKIP() << "no fused BF16 TN solution in the loaded library";
+
+        hipblasLtMatmulDesc_t plainDesc = nullptr;
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&plainDesc, HIPBLAS_COMPUTE_32F, HIP_R_32F),
+                  HIPBLAS_STATUS_SUCCESS);
+        const hipblasOperation_t op = HIPBLAS_OP_T;
+        EXPECT_EQ(hipblasLtMatmulDescSetAttribute(
+                      plainDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &op, sizeof(op)),
+                  HIPBLAS_STATUS_SUCCESS);
+
+        DeviceBuffer a(kK * kM * 2), b(kK * kN * 2), d(kLdd * kN * 2);
+        ASSERT_TRUE(a.ptr && b.ptr && d.ptr);
+        float alpha = 1.f;
+        float beta  = 0.f;
+
+        std::vector<hipblasLtMatmulDesc_t>   descs(2, plainDesc);
+        std::vector<void*>                   alphas(2, &alpha), betas(2, &beta);
+        std::vector<void*>                   as(2, a.ptr), bs(2, b.ptr), ds(2, d.ptr);
+        std::vector<hipblasLtMatrixLayout_t> matAs(2, Adesc), matBs(2, Bdesc), matDs(2, Ddesc);
+
+        hipblaslt_ext::GroupedGemm grouped(handle,
+                                           HIPBLAS_OP_T,
+                                           HIPBLAS_OP_N,
+                                           HIP_R_16BF,
+                                           HIP_R_16BF,
+                                           HIP_R_16BF,
+                                           HIP_R_16BF,
+                                           HIPBLAS_COMPUTE_32F);
+        EXPECT_EQ(
+            grouped.setProblem(descs, alphas, as, matAs, bs, matBs, betas, ds, matDs, ds, matDs),
+            HIPBLAS_STATUS_SUCCESS);
+        EXPECT_EQ(grouped.initialize(fusedResult.algo, nullptr), HIPBLAS_STATUS_INVALID_VALUE);
+
+        EXPECT_EQ(hipblasLtMatmulDescDestroy(plainDesc), HIPBLAS_STATUS_SUCCESS);
+    }
+
+    TEST_F(FusedA2ADispatch_pre_checkin, ExtGroupedGemmRejectsAFusedDescriptor)
+    {
+        transposeA();
+        registerOneRank();
+        completeAndAttach();
+        makeD();
+
+        hipblasLtMatmulDesc_t plainDesc = nullptr;
+        ASSERT_EQ(hipblasLtMatmulDescCreate(&plainDesc, HIPBLAS_COMPUTE_32F, HIP_R_32F),
+                  HIPBLAS_STATUS_SUCCESS);
+        const hipblasOperation_t op = HIPBLAS_OP_T;
+        EXPECT_EQ(hipblasLtMatmulDescSetAttribute(
+                      plainDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &op, sizeof(op)),
+                  HIPBLAS_STATUS_SUCCESS);
+
+        DeviceBuffer a(kK * kM * 2), b(kK * kN * 2), d(kLdd * kN * 2);
+        ASSERT_TRUE(a.ptr && b.ptr && d.ptr);
+        float        alpha = 1.f;
+        float        beta  = 0.f;
+
+        std::vector<hipblasLtMatmulDesc_t>   descs = {plainDesc, matmulDesc};
+        std::vector<void*>                   alphas(2, &alpha), betas(2, &beta);
+        std::vector<void*>                   as(2, a.ptr), bs(2, b.ptr), ds(2, d.ptr);
+        std::vector<hipblasLtMatrixLayout_t> matAs(2, Adesc), matBs(2, Bdesc), matDs(2, Ddesc);
+
+        hipblaslt_ext::GroupedGemm grouped(handle,
+                                           HIPBLAS_OP_T,
+                                           HIPBLAS_OP_N,
+                                           HIP_R_16BF,
+                                           HIP_R_16BF,
+                                           HIP_R_16BF,
+                                           HIP_R_16BF,
+                                           HIPBLAS_COMPUTE_32F);
+        EXPECT_EQ(
+            grouped.setProblem(descs, alphas, as, matAs, bs, matBs, betas, ds, matDs, ds, matDs),
+            HIPBLAS_STATUS_INVALID_VALUE);
+
+        EXPECT_EQ(hipblasLtMatmulDescDestroy(plainDesc), HIPBLAS_STATUS_SUCCESS);
+    }
+
     TEST_F(FusedA2ADispatch_pre_checkin, RejectsMissingExtent)
     {
         registerOneRank();
