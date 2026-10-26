@@ -30,6 +30,14 @@ test_categories:
   # The unit categories run a partial slice of the suite (quick/standard exclude
   # GPU tests), so syrupy would flag the un-exercised snapshots as failures.
   # `--snapshot-warn-unused` downgrades those to warnings instead of errors.
+  #
+  # The unit categories also pass `--dist=worksteal`. It only takes effect when
+  # pytest-xdist runs (parallel_workers > 1). xdist's default `load` scheduler
+  # sends each worker a fixed block of consecutive tests sized by count and never
+  # takes tests back, and about half of the unit suite's runtime sits in one
+  # block of consecutive tests (characterization/_codegen). One or two workers
+  # received that block while the rest finished and sat idle. `worksteal` lets
+  # idle workers take not-yet-started tests from busy ones.
   quick:
     description: "Fast host-only sanity checks (rocisa + TensileLite unit, no GPU)"
     test_paths:
@@ -39,6 +47,7 @@ test_categories:
       - "gpu"
     pytest_args:
       - "--snapshot-warn-unused"
+      - "--dist=worksteal"
     labels:
       - "quick"
       - "pre-commit"
@@ -53,6 +62,7 @@ test_categories:
       - "gpu"
     pytest_args:
       - "--snapshot-warn-unused"
+      - "--dist=worksteal"
     labels:
       - "standard"
       - "pr"
@@ -65,6 +75,7 @@ test_categories:
       - "tensilelite/Tests/unit"
     pytest_args:
       - "--snapshot-warn-unused"
+      - "--dist=worksteal"
     labels:
       - "comprehensive"
       - "nightly"
@@ -77,6 +88,7 @@ test_categories:
       - "tensilelite/Tests/unit"
     pytest_args:
       - "--snapshot-warn-unused"
+      - "--dist=worksteal"
     labels:
       - "full"
       - "all"
