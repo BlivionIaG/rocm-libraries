@@ -83,7 +83,7 @@ and it still owes a real test.
 > <details>
 > <summary>The full account: the churn, the deadlock, and the plan that makes the net unnecessary</summary>
 >
-> [`KernelWriterAssembly.py`](tensilelite/KernelWriterAssembly.py) is where a GEMM kernel actually becomes
+> [`KernelWriterAssembly.py`](tensilelite/KernelWriterAssembly.py) is where a GEMM kernel is turned into
 > assembly, which makes it one of the highest-consequence files in the repository. It is 20,259 lines.
 > Since the monorepo reorganization in April 2025 it has taken 303 commits from 78 authors, adding
 > 13,810 lines and removing 7,277. That window undercounts the file, which is years older than this
@@ -722,7 +722,7 @@ and Windows are not tracked separately. The exclusions in
 rather than product modules. The kernel writers are sometimes described as uncovered exceptions, but
 they are not: `KernelWriter.py`, `KernelWriterAssembly.py` and `SolutionStructs/Solution.py` all
 carry active per-file floors in the seventies. The genuinely uncovered modules are elsewhere,
-including `ExperimentalLibrary.py` at zero and much of `Tensile/Components/`.
+including `ExperimentalLibrary.py` at zero and much of `tensilelite/Components/`.
 
 **No C++ coverage target exists** for the reasons given under
 [../TESTING.md#unit-testing-strategy](../TESTING.md#unit-testing-strategy) (the C++ client's own
@@ -810,6 +810,7 @@ testing there (AIHPBLAS-3354) rather than at changes to Math CI itself.
 | A change only to the library logic YAML runs nothing in Math CI's `preliminary`, since the logic lives outside `tensilelite/`. Of the logic-corpus consistency checks, that leaves the whole-corpus chip-ID-arch-lock check unrun on that path; sibling-`DeviceNames` runs via `TensileLogic --check-all` regardless | Medium | Medium | `TensileLogic --check-all` checks sibling-`DeviceNames` in every kernel-generating build; Math CI's pytest suite still runs the chip-ID-arch-lock check on any PR that also touches `tensilelite/` | [#7481](https://github.com/ROCm/rocm-libraries/issues/7481) |
 | The `_needs_logic_dir` skipif (see [../TESTING.md#known-bugs-and-expected-failures](../TESTING.md#known-bugs-and-expected-failures)) always skips in TheRock CI, because the installed tree does not ship the corpus, so the corpus-backed pytest checks never execute there. Only the chip-ID-arch-lock check is actually exposed to this; sibling-`DeviceNames` runs via `TensileLogic --check-all` regardless | Low | Medium | `TensileLogic --check-all` covers sibling-`DeviceNames` regardless; Math CI's pytest suite can still catch a chip-ID-arch-lock violation when it runs, and the hermetic version runs everywhere but checks only gfx950 and gfx942 | [#7481](https://github.com/ROCm/rocm-libraries/issues/7481) |
 | gfx1250 gets no TheRock Test stage at all: the CI configuration overlay leaves its runner empty, and the `tensilelite` and `hipblaslt` test jobs exclude gfx125X because of hangs. That includes the pytest copies of the logic-corpus checks. Sibling-`DeviceNames` still gets build-time coverage there via `TensileLogic --check-all`; only the chip-ID-arch-lock check has no gfx1250 coverage at all | Medium | Medium | `TensileLogic --check-all` runs as a build step, unaffected by the missing runner | [#7481](https://github.com/ROCm/rocm-libraries/issues/7481) |
+| TheRock's `Test tensilelite` job runs the whole unit tree on one worker in every tier: `quick` and `standard` select the same tests in [`test_categories.yaml`](test_categories.yaml), and `quick` runs under a 15-minute step cap. Several unit tests read the embedded metadata of every shipped custom kernel, some at collection time, so the job's wall time grows with each custom kernel added. The gfx950 rocRoller kernels carry about 13k lines of metadata each, and adding 69 of them took the job from 11 to 14 minutes to 17 to 21 minutes | Medium | Medium | Metadata is parsed with libyaml (`CSafeLoader`). `readCustomKernelConfig` parses only the `custom.config` entry, and `getCustomKernelConfig` parses the whole block (for `amdhsa.kernels`) only for a kernel without an explicit `CustomKernel` block. `standard` runs under a 30-minute cap | [#14049](https://github.com/ROCm/rocm-libraries/issues/14049) |
 
 ### Known bugs and flaky tests
 
