@@ -480,7 +480,7 @@ TEST(TestGfx1151WmmaAttentionMatchers, DeclinesOverrideShapeGraphs)
     EXPECT_FALSE(matchGraph(spec).has_value());
 }
 
-// cuDNN's left_bound counts the diagonal key, so 0 keeps no keys and is declined.
+// left_bound = 0 is outside hipDNN's band domain (positive or -1), so it is declined.
 TEST(TestGfx1151WmmaAttentionMatchers, LeftBoundZeroIsDeclined)
 {
     GraphSpec spec;

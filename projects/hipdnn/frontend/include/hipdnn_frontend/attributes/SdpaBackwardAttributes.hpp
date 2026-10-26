@@ -121,7 +121,10 @@ public:
     // Scalar attributes
     std::optional<float> dropout_probability;
     std::optional<float> attn_scale_value;
+    /// Left diagonal-band bound: each query row keeps this many keys, including the diagonal;
+    /// -1 is unbounded and 0 is rejected.
     std::optional<int64_t> left_bound;
+    /// Right diagonal-band bound: keys up to this many past the diagonal are kept; -1 is unbounded.
     std::optional<int64_t> right_bound;
 
     // Enum attributes
@@ -495,14 +498,29 @@ public:
         setInput(InputNames::Offset, offset);
         return *this;
     }
-    // cuDNN semantics: left_bound = L keeps L keys up to and including the diagonal
-    // (FlashAttention's window_size_left = L - 1). Must be positive, or -1 for unbounded.
+    /**
+     * @brief Set the left diagonal-band bound (cuDNN semantics).
+     *
+     * left_bound = L keeps L keys per query row, up to and including the diagonal
+     * (FlashAttention's window_size_left = L - 1).
+     *
+     * @param value L > 0, or -1 for unbounded. Graph validation rejects 0 and values below -1.
+     * @return Reference to this object for method chaining.
+     */
     // NOLINTNEXTLINE(readability-identifier-naming)
     SdpaBackwardAttributes& set_diagonal_band_left_bound(int64_t value)
     {
         left_bound = value;
         return *this;
     }
+    /**
+     * @brief Set the right diagonal-band bound (cuDNN semantics).
+     *
+     * right_bound = R keeps keys up to R past the diagonal; 0 is causal.
+     *
+     * @param value R >= 0, or -1 for unbounded. Graph validation rejects values below -1.
+     * @return Reference to this object for method chaining.
+     */
     // NOLINTNEXTLINE(readability-identifier-naming)
     SdpaBackwardAttributes& set_diagonal_band_right_bound(int64_t value)
     {
@@ -546,7 +564,13 @@ public:
     // than a straight rename of a native setter (overload merge, one-to-many
     // split, or a capability hipDNN lacks).
 
-    // cuDNN set_sliding_window_length(n) forwards to the left diagonal-band bound.
+    /**
+     * @brief cuDNN spelling of set_diagonal_band_left_bound().
+     *
+     * @param value Window length L: keys per query row, including the diagonal. L > 0, or -1
+     *              for unbounded; graph validation rejects 0 and values below -1.
+     * @return Reference to this object for method chaining.
+     */
     // NOLINTNEXTLINE(readability-identifier-naming)
     SdpaBackwardAttributes& set_sliding_window_length(int value)
     {
