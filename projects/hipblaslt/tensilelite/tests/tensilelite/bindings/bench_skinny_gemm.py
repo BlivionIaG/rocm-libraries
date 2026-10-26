@@ -296,16 +296,38 @@ def formatSweepLine(p: Problem, gemmTimes, reduceTimes) -> str:
     return "SWEEP " + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
+def printAsm(p: Problem) -> None:
+    """Prints the emitted GEMM kernel's .s, and the split-K reduce's if the
+    problem splits K, straight from the emitter (no assembling or GPU)."""
+    import tensilelite_codegen
+
+    print(f"# ASM {p.label}", flush=True)
+    print(tensilelite_codegen.emitSkinnyGEMM(support.skinnyConfig(p)))
+    if p.splits > 1:
+        print(f"# ASM {support.REDUCE_KERNEL_NAME}", flush=True)
+        print(tensilelite_codegen.emitSplitKReduce())
+
+
 def sweepShape(
-    m: int, n: int, k: int, iters: int, verify: bool, overrides: dict, asmDir
+    m: int,
+    n: int,
+    k: int,
+    iters: int,
+    verify: bool,
+    overrides: dict,
+    asmDir,
+    printOnly: bool,
 ) -> None:
-    """Runs one shape and prints its SWEEP line; a shape that violates the
-    constraints with the overrides, or lacks reference asm, is reported as
-    skipped."""
+    """Runs one shape and prints its SWEEP line, or with printOnly its emitted
+    asm instead of benchmarking it; a shape that violates the constraints with
+    the overrides, or lacks reference asm, is reported as skipped."""
     knobs = {name: None for name in support.KNOB_OVERRIDE_NAMES}
     knobs.update(overrides)
     try:
         p = support.makeProblem(m, n, k, padding=(0, 0, 0), **knobs)
+        if printOnly:
+            printAsm(p)
+            return
         gemmTimes, reduceTimes = benchProblem(p, iters, verify, asmDir)
     except (AssertionError, MissingAsm) as err:
         reason = str(err).splitlines()[0]
@@ -374,6 +396,12 @@ def makeParser() -> argparse.ArgumentParser:
         "driver's --save-tmps (DIR/<gemm kernel name>_*/kernel.s and "
         "DIR/splitk_reduce_*/kernel.s) instead of the emitted kernels",
     )
+    parser.add_argument(
+        "--print-asm",
+        action="store_true",
+        help="Print the emitted kernel(s) .s for the shape(s) instead of "
+        "benchmarking; no assembling or GPU is needed",
+    )
     return parser
 
 
@@ -393,16 +421,26 @@ def main() -> None:
     overrides = knobOverrides(args)
     if args.sweep is None:
         sweepShape(
-            args.m, args.n, args.k, args.iters, args.verify, overrides, args.asm_dir
+            args.m,
+            args.n,
+            args.k,
+            args.iters,
+            args.verify,
+            overrides,
+            args.asm_dir,
+            args.print_asm,
         )
         return
-    header = f"# sweep={args.sweep} iters={args.iters} verify={int(args.verify)}"
-    header += " cold_llc=1"
-    for key, value in overrides.items():
-        header += f" {key}={value}"
-    print(header, flush=True)
+    if not args.print_asm:
+        header = f"# sweep={args.sweep} iters={args.iters} verify={int(args.verify)}"
+        header += " cold_llc=1"
+        for key, value in overrides.items():
+            header += f" {key}={value}"
+        print(header, flush=True)
     for m, n, k in SWEEPS[args.sweep]():
-        sweepShape(m, n, k, args.iters, args.verify, overrides, args.asm_dir)
+        sweepShape(
+            m, n, k, args.iters, args.verify, overrides, args.asm_dir, args.print_asm
+        )
 
 
 if __name__ == "__main__":
