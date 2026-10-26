@@ -16,12 +16,12 @@ KERNEL_NAMES = [
     (
         {},
         "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS0_PARTIAL_STEPS0_PF2_GROUP1_"
-        "NUM_XCDS1_GRID_3D1",
+        "NUM_XCDS1_GRID_3D1_USE_BETA0",
     ),
     (
         {"prefetch": 1, "upIters": 1},
         "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS1_PARTIAL_STEPS0_PF1_GROUP1_"
-        "NUM_XCDS1_GRID_3D1",
+        "NUM_XCDS1_GRID_3D1_USE_BETA0",
     ),
     (
         {
@@ -34,12 +34,22 @@ KERNEL_NAMES = [
             "grid3d": False,
         },
         "gemm_BM1_TN4_LANES_K16_WAVES1_UP_ITERS0_PARTIAL_STEPS2_PF2_GROUP1_"
-        "NUM_XCDS1_GRID_3D0",
+        "NUM_XCDS1_GRID_3D0_USE_BETA0",
     ),
     (
         {"group": 4, "numXcds": 8},
         "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS0_PARTIAL_STEPS0_PF2_GROUP4_"
-        "NUM_XCDS8_GRID_3D1",
+        "NUM_XCDS8_GRID_3D1_USE_BETA0",
+    ),
+    (
+        {"useBeta": True},
+        "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS0_PARTIAL_STEPS0_PF2_GROUP1_"
+        "NUM_XCDS1_GRID_3D1_USE_BETA1",
+    ),
+    (
+        {"useBeta": True, "grid3d": False, "lanesK": 16, "waves": 1},
+        "gemm_BM1_TN1_LANES_K16_WAVES1_UP_ITERS0_PARTIAL_STEPS0_PF2_GROUP1_"
+        "NUM_XCDS1_GRID_3D0_USE_BETA1",
     ),
 ]
 
@@ -64,9 +74,11 @@ def test_config_defaults_and_keywords():
     assert (config.bm, config.tn, config.lanesK, config.waves) == (1, 1, 64, 4)
     assert (config.prefetch, config.upIters, config.partialSteps) == (2, 0, 0)
     assert (config.group, config.numXcds, config.grid3d) == (1, 1, True)
+    assert config.useBeta is False
 
-    config = codegen.SkinnyGEMMConfig(tn=4, grid3d=False)
-    assert (config.tn, config.grid3d, config.bm) == (4, False, 1)
+    config = codegen.SkinnyGEMMConfig(tn=4, grid3d=False, useBeta=True)
+    assert (config.tn, config.grid3d, config.bm, config.useBeta) == (4, False, 1, True)
+    config.useBeta = False
     config.waves = 2
     config.numXcds = 8
     assert (config.waves, config.numXcds) == (2, 8)
@@ -332,7 +344,9 @@ def resolve(m, n, k, **knobs):
     resolved = {name: knobs.pop(name, None) for name in support.KNOB_OVERRIDE_NAMES}
     padding = knobs.pop("padding", (0, 0, 0))
     scalars = {
-        name: knobs.pop(name) for name in ("paddingC", "alpha", "beta") if name in knobs
+        name: knobs.pop(name)
+        for name in ("paddingC", "alpha", "beta", "use_beta")
+        if name in knobs
     }
     assert not knobs, f"unknown knobs {sorted(knobs)}"
     return support.makeProblem(m, n, k, padding=padding, **resolved, **scalars)
@@ -345,11 +359,24 @@ def skipUnlessRunnable(*problems):
 
 
 def run(m, n, k, *, iters=10, seed=42, **knobs):
-    """Resolves the problem and, if the emitter supports it, runs and verifies it."""
+    """Resolves the problem and, if the emitter supports it, runs and verifies it.
+    A useBeta kernel holds the VGPRs of C, so a tile that already nearly fills
+    the budget may not fit with them, and the test is skipped."""
     p = resolve(m, n, k, **knobs)
     skipUnlessRunnable(p)
-    support.runProblem(p, iters, seed)
+    try:
+        support.runProblem(p, iters, seed)
+    except ValueError as err:
+        if p.use_beta and "register budget" in str(err):
+            pytest.skip(str(err))
+        raise
 
+
+# (USE_BETA, BETA) of the matrix tests: the default kernel, the useBeta kernel
+# with beta 0, which never loads C (it is NaN), and the useBeta kernel that adds
+# -2.5 * C. With several splits the GEMM stores raw partials and the reduce
+# applies beta whatever the variant.
+BETA_VARIANTS = [(False, 0.0), (True, 0.0), (True, -2.5)]
 
 # (BM, TN, LANES_K, WAVES, PF, M, N, K, SPK).
 PARAMS = [
@@ -716,11 +743,23 @@ PADDED_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize("BM,TN,LANES_K,WAVES,PF,M,N,K,SPK", PARAMS)
-def test_gemm_mxfp8_skinny(BM, TN, LANES_K, WAVES, PF, M, N, K, SPK):
+def test_gemm_mxfp8_skinny(BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, USE_BETA, BETA):
     """D = A^T @ B matches the float64 dequantized reference (bf16-truncated)."""
     run(
-        M, N, K, spk=SPK, bm=BM, tn=TN, lanes_k=LANES_K, waves=WAVES, pf=PF, up_scales=0
+        M,
+        N,
+        K,
+        spk=SPK,
+        bm=BM,
+        tn=TN,
+        lanes_k=LANES_K,
+        waves=WAVES,
+        pf=PF,
+        up_scales=0,
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 
@@ -804,6 +843,135 @@ def test_gemm_mxfp8_skinny_split_k_reduce_aliases_c():
     skipUnlessRunnable(p)
     assert p.ldC == p.ldD
     support.executeProblem(p, support.makeInputs(p, 42), 1, aliasC=True)
+
+
+# Single-split shapes of the useBeta kernel, with C loaded by the vector path
+# (a tile inside the output with an even run: BM on path A, TN on path B) and by
+# the masked path (tails, odd runs): (BM, TN, LANES_K, WAVES, PF, M, N, K, SPK,
+# BLOCKS, UP, GROUP, XCDS) with BLOCKS = None for the 3-D launch.
+BETA_PARAMS = [
+    (2, 4, 16, 1, 1, 16, 64, 2048, 2048, None, 0, None, None),  # A, inside: dword.
+    (2, 4, 16, 1, 1, 17, 100, 2048, 2048, None, 0, None, None),  # A, both tails.
+    (2, 2, 16, 1, 1, 64, 16, 2048, 2048, None, 0, None, None),  # B, inside.
+    (4, 2, 8, 2, 1, 100, 18, 2048, 2048, None, 0, None, None),  # B, tails.
+    (3, 3, 16, 1, 1, 7, 100, 2048, 2048, None, 0, None, None),  # A, odd run.
+    (3, 3, 16, 1, 1, 100, 7, 2048, 2048, None, 0, None, None),  # B, odd run.
+    (8, 2, 16, 1, 0, 16, 64, 1024, 1024, None, 0, None, None),  # A, dwordx4, PF = 0.
+    (2, 8, 16, 1, 0, 64, 16, 1024, 1024, None, 0, None, None),  # B, dwordx4, PF = 0.
+    (6, 2, 16, 1, 1, 13, 50, 2048, 2048, None, 0, None, None),  # A, run of 6.
+    (4, 2, 16, 2, 0, 100, 18, 2048, 2048, None, 0, None, None),  # B, PF = 0.
+    (2, 4, 16, 1, 1, 17, 100, 2048, 2048, None, 1, None, None),  # Up-front scales.
+    (2, 4, 16, 1, 1, 17, 100, 2000, 2048, None, 0, None, None),  # Partial step 1.
+    (2, 4, 16, 1, 1, 17, 100, 2000, 2000, None, 0, None, None),  # Partial steps 2.
+    (2, 4, 16, 1, 1, 17, 100, 2048, 2048, 5, 0, None, None),  # Persistent.
+    (2, 2, 16, 1, 1, 64, 18, 2048, 2048, 5, 0, None, None),  # Persistent, B.
+    (2, 3, 16, 1, 1, 6, 100, 2048, 2048, 7, 0, 2, 8),  # Reordered tiles.
+    (1, 1, 16, 1, 2, 1, 300, 2048, 2048, None, 0, None, None),  # A, scalar tile.
+    (1, 1, 64, 4, 1, 300, 1, 4096, 4096, None, 1, None, None),  # B, scalar tile.
+]
+
+
+def betaProblem(row, **scalars):
+    """The useBeta problem of a BETA_PARAMS row."""
+    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, BLOCKS, UP, GROUP, XCDS = row
+    return resolve(
+        M,
+        N,
+        K,
+        spk=SPK,
+        bm=BM,
+        tn=TN,
+        lanes_k=LANES_K,
+        waves=WAVES,
+        pf=PF,
+        blocks=BLOCKS,
+        group=GROUP,
+        xcds=XCDS,
+        up_scales=UP,
+        use_beta=True,
+        **scalars,
+    )
+
+
+@pytest.mark.parametrize(
+    "ALPHA,BETA", [(1.0, 0.0), (0.75, 1.0), (1.0, -2.5), (0.75, -2.5)]
+)
+@pytest.mark.parametrize("ROW", BETA_PARAMS)
+def test_gemm_mxfp8_skinny_beta_variant(ROW, ALPHA, BETA):
+    """D = bf16(fma(beta, C, alpha * acc)) for the vector and the masked C loads,
+    both orientations and launches; with beta 0 C is NaN, so a load of it fails."""
+    p = betaProblem(ROW, alpha=ALPHA, beta=BETA)
+    skipUnlessRunnable(p)
+    support.runProblem(p, 3)
+
+
+@pytest.mark.parametrize("BETA", [0.0, -0.0])
+@pytest.mark.parametrize("ROW", BETA_PARAMS[:4] + BETA_PARAMS[13:15])
+def test_gemm_mxfp8_skinny_beta_variant_zero_does_not_read_c(ROW, BETA):
+    """With beta +0 or -0 C is never read, and its NaNs would show in D."""
+    p = betaProblem(ROW, alpha=0.75, beta=BETA)
+    skipUnlessRunnable(p)
+    inputs = support.makeInputs(p, 42)
+    assert np.isnan(support.bf16ToFloat32(inputs.cBits[: p.m])).all()
+    support.executeProblem(p, inputs, 3)
+
+
+@pytest.mark.parametrize("ROW", BETA_PARAMS[:4] + BETA_PARAMS[13:16])
+def test_gemm_mxfp8_skinny_beta_variant_aliases_c(ROW):
+    """C and D are one buffer: each lane loads its elements at the start of the
+    tile and stores them at the end, and the tiles are disjoint."""
+    p = betaProblem(ROW, alpha=0.75, beta=-2.5)
+    skipUnlessRunnable(p)
+    assert p.ldC == p.ldD
+    support.executeProblem(p, support.makeInputs(p, 42), 1, aliasC=True)
+
+
+@pytest.mark.parametrize("ROW", BETA_PARAMS[:4] + BETA_PARAMS[13:15])
+def test_gemm_mxfp8_skinny_beta_variant_padded_c(ROW):
+    """C has its own leading dimension, ldC != ldD."""
+    p = betaProblem(ROW, alpha=0.75, beta=1.5, paddingC=8, padding=(0, 0, 4))
+    skipUnlessRunnable(p)
+    assert p.ldC != p.ldD
+    support.runProblem(p, 3)
+
+
+def test_gemm_mxfp8_skinny_default_kernel_ignores_beta():
+    """Without useBeta the GEMM never reads C or applies beta (C is NaN here)."""
+    p = resolve(
+        17,
+        100,
+        2048,
+        spk=2048,
+        bm=2,
+        tn=4,
+        lanes_k=16,
+        waves=1,
+        pf=1,
+        up_scales=0,
+        alpha=0.75,
+        beta=1.5,
+    )
+    skipUnlessRunnable(p)
+    assert not p.use_beta
+    inputs = support.makeInputs(p, 42)
+    assert np.isnan(support.bf16ToFloat32(inputs.cBits[: p.m])).all()
+    support.executeProblem(p, inputs, 3)
+
+
+@pytest.mark.parametrize("ROW", [BETA_PARAMS[1], BETA_PARAMS[3]])
+def test_gemm_mxfp8_skinny_beta_variant_split_k(ROW):
+    """With several splits the useBeta GEMM stores raw partials, without alpha
+    and without C, and the reduce applies alpha and beta."""
+    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, *_ = ROW
+    p = betaProblem(
+        (BM, TN, LANES_K, WAVES, PF, M, N, 4 * SPK, SPK, None, 0, None, None),
+        alpha=0.75,
+        beta=-2.5,
+        paddingC=8,
+    )
+    skipUnlessRunnable(p)
+    assert p.splits == 4
+    support.runProblem(p, 3)
 
 
 @pytest.mark.parametrize("BM,TN,LANES_K,WAVES,PF,M,N,K,SPK", PADDED_PARAMS)
@@ -1051,11 +1219,12 @@ STORE_TAIL_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize(
     "BM,TN,LANES_K,WAVES,PF,M,N,K,SPK,LDD_PAD,BLOCKS,UP", STORE_TAIL_PARAMS
 )
 def test_gemm_mxfp8_skinny_store_tails(
-    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, LDD_PAD, BLOCKS, UP
+    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, LDD_PAD, BLOCKS, UP, USE_BETA, BETA
 ):
     """Vector stores of tiles inside the output and masked stores of the tail
     tiles write exactly the valid elements: the sentinel in the ld padding, past
@@ -1074,6 +1243,8 @@ def test_gemm_mxfp8_skinny_store_tails(
         blocks=BLOCKS,
         up_scales=UP,
         padding=(0, 0, LDD_PAD),
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 
@@ -1226,11 +1397,12 @@ EXTENT_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize(
     "BM,TN,LANES_K,WAVES,PF,M,N,K,SPK,PADDING,BLOCKS,UP", EXTENT_PARAMS
 )
 def test_gemm_mxfp8_skinny_exact_extents(
-    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, PADDING, BLOCKS, UP
+    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, PADDING, BLOCKS, UP, USE_BETA, BETA
 ):
     """The kernel reads only the required extents of A and B and writes only the
     logical extent of D, tight or padded, and matches the reference."""
@@ -1248,6 +1420,8 @@ def test_gemm_mxfp8_skinny_exact_extents(
         up_scales=UP,
         padding=PADDING,
         iters=1,
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 
@@ -1566,11 +1740,26 @@ SPK_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize(
     "BM,TN,LANES_K,WAVES,PF,M,N,K,SPK,PADDING,BLOCKS,GROUP,XCDS", SPK_PARAMS
 )
 def test_gemm_mxfp8_skinny_any_spk(
-    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, PADDING, BLOCKS, GROUP, XCDS
+    BM,
+    TN,
+    LANES_K,
+    WAVES,
+    PF,
+    M,
+    N,
+    K,
+    SPK,
+    PADDING,
+    BLOCKS,
+    GROUP,
+    XCDS,
+    USE_BETA,
+    BETA,
 ):
     """Any spk >= 1 matches the reference: each split sums exactly its K range."""
     run(
@@ -1589,6 +1778,8 @@ def test_gemm_mxfp8_skinny_any_spk(
         up_scales=0,
         padding=PADDING,
         iters=1,
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 
@@ -1855,12 +2046,27 @@ UP_SPK_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize(
     "BM,TN,LANES_K,WAVES,PF,M,N,K,SPK,PADDING,BLOCKS,GROUP,XCDS",
     SPK_PARAMS + UP_SPK_PARAMS,
 )
 def test_gemm_mxfp8_skinny_up_scales_any_spk(
-    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, PADDING, BLOCKS, GROUP, XCDS
+    BM,
+    TN,
+    LANES_K,
+    WAVES,
+    PF,
+    M,
+    N,
+    K,
+    SPK,
+    PADDING,
+    BLOCKS,
+    GROUP,
+    XCDS,
+    USE_BETA,
+    BETA,
 ):
     """The scales loaded up front give the reference result for any spk and K:
     the vector starts at the split's first touched iteration and the partial
@@ -1881,6 +2087,8 @@ def test_gemm_mxfp8_skinny_up_scales_any_spk(
         up_scales=1,
         padding=PADDING,
         iters=1,
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 
@@ -2106,9 +2314,10 @@ UP_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize("BM,TN,LANES_K,WAVES,PF,M,N,K,SPK,B,GROUP,XCDS", UP_PARAMS)
 def test_gemm_mxfp8_skinny_up_scales(
-    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, B, GROUP, XCDS
+    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, B, GROUP, XCDS, USE_BETA, BETA
 ):
     """The scales loaded up front give the reference result
     for every iteration count, ring depth, tail, split and tile order."""
@@ -2128,6 +2337,8 @@ def test_gemm_mxfp8_skinny_up_scales(
         group=GROUP,
         xcds=XCDS,
         up_scales=1,
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 
@@ -2143,8 +2354,11 @@ SHARED_SCALES_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize("BM,TN,LANES_K,WAVES,PF,M,N,K,SPK", SHARED_SCALES_PARAMS)
-def test_gemm_mxfp8_skinny_shared_up_scales(BM, TN, LANES_K, WAVES, PF, M, N, K, SPK):
+def test_gemm_mxfp8_skinny_shared_up_scales(
+    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, USE_BETA, BETA
+):
     """The scales shared through LDS give the reference result for block sizes
     with a non-power-of-two role domain, both paths, every ring depth and LDS
     offsets beyond the ds offset field."""
@@ -2159,6 +2373,8 @@ def test_gemm_mxfp8_skinny_shared_up_scales(BM, TN, LANES_K, WAVES, PF, M, N, K,
         waves=WAVES,
         pf=PF,
         up_scales=1,
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 
@@ -2210,11 +2426,12 @@ GROUPED_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize(
     "BM,TN,LANES_K,WAVES,PF,M,N,K,SPK,B,GROUP,XCDS", GROUPED_PARAMS
 )
 def test_gemm_mxfp8_skinny_reordered(
-    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, B, GROUP, XCDS
+    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, B, GROUP, XCDS, USE_BETA, BETA
 ):
     """Every tile is computed exactly once under the grouped and XCD-remapped order."""
     run(
@@ -2231,6 +2448,8 @@ def test_gemm_mxfp8_skinny_reordered(
         group=GROUP,
         xcds=XCDS,
         up_scales=0,
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 
@@ -2299,8 +2518,11 @@ PERSISTENT_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize("BM,TN,LANES_K,WAVES,PF,M,N,K,SPK,B", PERSISTENT_PARAMS)
-def test_gemm_mxfp8_skinny_persistent(BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, B):
+def test_gemm_mxfp8_skinny_persistent(
+    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, B, USE_BETA, BETA
+):
     """Every tile is computed exactly once for any number of launched blocks."""
     run(
         M,
@@ -2314,6 +2536,8 @@ def test_gemm_mxfp8_skinny_persistent(BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, 
         pf=PF,
         blocks=B,
         up_scales=0,
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 
@@ -2367,9 +2591,10 @@ XCD_GROUPED_PARAMS = [
 ]
 
 
+@pytest.mark.parametrize(("USE_BETA", "BETA"), BETA_VARIANTS)
 @pytest.mark.parametrize("BM,TN,LANES_K,WAVES,PF,M,N,K,SPK,UP", XCD_GROUPED_PARAMS)
 def test_gemm_mxfp8_skinny_xcd_grouped_tiles(
-    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, UP
+    BM, TN, LANES_K, WAVES, PF, M, N, K, SPK, UP, USE_BETA, BETA
 ):
     """Every wide tile is computed exactly once when the 3-D launch groups the
     tiles that share scale lines per XCD (a missed tile leaves the D sentinel,
@@ -2385,6 +2610,8 @@ def test_gemm_mxfp8_skinny_xcd_grouped_tiles(
         waves=WAVES,
         pf=PF,
         up_scales=UP,
+        use_beta=USE_BETA,
+        beta=BETA,
     )
 
 

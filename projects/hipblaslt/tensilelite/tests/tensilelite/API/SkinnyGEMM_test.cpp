@@ -25,14 +25,14 @@ using namespace rocm::tensilelite::codegen::test;
 TEST(SkinnyGEMM, KernelNameMatchesTheReference) {
   EXPECT_EQ(skinnyGEMMKernelName({}), "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS0_"
                                       "PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_"
-                                      "GRID_3D1");
+                                      "GRID_3D1_USE_BETA0");
 
   SkinnyGEMMConfig ringless;
   ringless.prefetch = 1;
   ringless.upIters = 1;
   EXPECT_EQ(skinnyGEMMKernelName(ringless),
             "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS1_PARTIAL_STEPS0_PF1_GROUP1_"
-            "NUM_XCDS1_GRID_3D1");
+            "NUM_XCDS1_GRID_3D1_USE_BETA0");
 
   SkinnyGEMMConfig persistent;
   persistent.tn = 4;
@@ -42,14 +42,24 @@ TEST(SkinnyGEMM, KernelNameMatchesTheReference) {
   persistent.grid3d = false;
   EXPECT_EQ(skinnyGEMMKernelName(persistent),
             "gemm_BM1_TN4_LANES_K16_WAVES1_UP_ITERS0_PARTIAL_STEPS2_PF2_GROUP1_"
-            "NUM_XCDS1_GRID_3D0");
+            "NUM_XCDS1_GRID_3D0_USE_BETA0");
 
   SkinnyGEMMConfig grouped;
   grouped.group = 4;
   grouped.numXcds = 8;
   EXPECT_EQ(skinnyGEMMKernelName(grouped),
             "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS0_PARTIAL_STEPS0_PF2_GROUP4_"
-            "NUM_XCDS8_GRID_3D1");
+            "NUM_XCDS8_GRID_3D1_USE_BETA0");
+
+  SkinnyGEMMConfig beta;
+  beta.useBeta = true;
+  EXPECT_EQ(skinnyGEMMKernelName(beta),
+            "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS0_PARTIAL_STEPS0_PF2_GROUP1_"
+            "NUM_XCDS1_GRID_3D1_USE_BETA1");
+  beta.grid3d = false;
+  EXPECT_EQ(skinnyGEMMKernelName(beta),
+            "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS0_PARTIAL_STEPS0_PF2_GROUP1_"
+            "NUM_XCDS1_GRID_3D0_USE_BETA1");
 }
 
 static std::vector<SkinnyGEMMConfig> invalidConfigs() {
@@ -185,7 +195,7 @@ TEST(SkinnyGEMM, AssemblyHasTheReferenceAbi) {
   expectLinesInOrder(
       assembly,
       {".name: gemm_BM1_TN1_LANES_K16_WAVES2_UP_ITERS0_PARTIAL_STEPS0_PF1_"
-       "GROUP1_NUM_XCDS1_GRID_3D1",
+       "GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA0",
        ".kernarg_segment_size: 120", ".group_segment_fixed_size: 0",
        ".max_flat_workgroup_size: 128"});
   // The pointers, the scalars and the hidden arguments of the reference.
@@ -1051,6 +1061,137 @@ TEST(SkinnyGEMM, PersistentNearRegisterLimitConfigEmits) {
   SkinnyGEMMConfig wide = config(6, 3, 16, 1, 1);
   EXPECT_NO_THROW(emitted(persistentConfig(wide)));
   EXPECT_NO_THROW(emitted(persistentConfig(wide, 4, 8)));
+}
+
+// The beta variant keeps the kernarg layout and the segment size, so that one
+// packer serves both variants; only the symbol changes.
+TEST(SkinnyGEMM, BetaVariantSharesTheAbi) {
+  SkinnyGEMMConfig beta = config(1, 1, 16, 2, 1);
+  beta.useBeta = true;
+  std::string assembly = emitted(beta);
+  SCOPED_TRACE("assembly:\n" + assembly);
+  expectLinesInOrder(
+      assembly,
+      {".name: gemm_BM1_TN1_LANES_K16_WAVES2_UP_ITERS0_PARTIAL_STEPS0_PF1_"
+       "GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA1",
+       ".kernarg_segment_size: 120", ".group_segment_fixed_size: 0",
+       ".max_flat_workgroup_size: 128"});
+  expectLinesInOrder(
+      assembly, {".name: D", ".offset: 0", ".name: ws", ".offset: 40",
+                 ".name: C", ".offset: 48", ".name: ldD", ".offset: 56",
+                 ".name: spk", ".offset: 80", ".name: ldC", ".offset: 84",
+                 ".name: alpha", ".offset: 88", ".name: beta", ".offset: 92"});
+  expectLinesInOrder(assembly, {".offset: 96", "hidden_group_size_x",
+                                ".offset: 116", "hidden_block_count_z"});
+}
+
+// Returns the text of assembly from the first occurrence of from to the first
+// later one of to.
+static std::string textBetween(const std::string &assembly,
+                               std::string_view from, std::string_view to) {
+  std::size_t first = assembly.find(from);
+  EXPECT_NE(first, std::string::npos) << from;
+  std::size_t last = assembly.find(to, first);
+  EXPECT_NE(last, std::string::npos) << to;
+  if (first == std::string::npos || last == std::string::npos)
+    return "";
+  return assembly.substr(first, last - first);
+}
+
+// Returns the label that the first line starting with branch (a prefix of the
+// label name included) jumps to.
+static std::string labelOf(const std::string &assembly,
+                           std::string_view branch) {
+  std::size_t first = assembly.find(branch);
+  EXPECT_NE(first, std::string::npos) << branch;
+  if (first == std::string::npos)
+    return "";
+  std::size_t nameStart = assembly.find("label_", first);
+  std::size_t nameEnd = assembly.find('\n', nameStart);
+  return assembly.substr(nameStart, nameEnd - nameStart);
+}
+
+// Without useBeta nothing reads C or beta: no C load, no FMA and no beta test.
+TEST(SkinnyGEMM, WithoutBetaNothingReadsC) {
+  for (const SkinnyGEMMConfig &base :
+       {config(1, 1, 16, 2, 1), config(2, 4, 16, 1, 1),
+        config(3, 2, 16, 2, 1)}) {
+    for (bool grid3d : {true, false}) {
+      SkinnyGEMMConfig plain = base;
+      plain.grid3d = grid3d;
+      std::string assembly = emitted(plain);
+      SCOPED_TRACE("assembly:\n" + assembly);
+      EXPECT_EQ(countLinesContaining(assembly, "buffer_load_ushort"), 0);
+      EXPECT_EQ(countLinesContaining(assembly, "v_fmac_f32"), 0);
+      EXPECT_EQ(countLinesContaining(assembly, "2147483647"), 0);
+    }
+  }
+}
+
+// With useBeta the loads of C sit behind the beta and single-split guards, are
+// issued before the first ring load, and the FMA waits for them behind the beta
+// guard.
+TEST(SkinnyGEMM, BetaVariantLoadsCBehindTheGuard) {
+  for (bool grid3d : {true, false}) {
+    SkinnyGEMMConfig beta = config(1, 1, 16, 2, 1);
+    beta.useBeta = true;
+    beta.grid3d = grid3d;
+    std::string assembly = emitted(beta);
+    SCOPED_TRACE("assembly:\n" + assembly);
+    // The beta test masks the sign bit, so -0.0 counts as zero.
+    expectLinesInOrder(assembly,
+                       {"s_cmp_le_u32", "s_cbranch_scc0", "2147483647",
+                        "s_cmp_eq_u32", "s_cbranch_scc1", "buffer_load_ushort",
+                        "label_c_prefetch_skip", "buffer_load_dword"});
+    std::string guarded = textBetween(
+        assembly, "s_cbranch_scc1 label_c_prefetch_skip",
+        labelOf(assembly, "s_cbranch_scc1 label_c_prefetch_skip") + ":");
+    EXPECT_EQ(countLinesContaining(guarded, "buffer_load_ushort"), 1);
+    EXPECT_EQ(countLinesContaining(assembly, "buffer_load_ushort"), 1);
+    // The first load after the guard is a ring load, so C was issued first.
+    std::size_t cLoad = assembly.find("buffer_load_ushort");
+    std::size_t ringLoad = assembly.find("buffer_load_dwordx4");
+    EXPECT_LT(cLoad, ringLoad);
+
+    std::string consume =
+        textBetween(assembly, "s_cbranch_scc1 label_no_beta", "v_fmac_f32");
+    EXPECT_EQ(countLinesContaining(consume, "s_waitcnt vmcnt(0)"), 1);
+    EXPECT_EQ(countLinesContaining(consume, "buffer_load"), 0);
+    EXPECT_EQ(countLinesContaining(assembly, "v_fmac_f32"), 1);
+  }
+}
+
+// A full tile loads C with the widest vector loads, as the store does, and an
+// edge tile or an odd run per element; both orientations are emitted, and every
+// path adds the beta * C of each tile element.
+TEST(SkinnyGEMM, BetaVariantLoadsCInRuns) {
+  SkinnyGEMMConfig even = config(2, 4, 16, 1, 1);
+  even.useBeta = true;
+  std::string assembly = emitted(even);
+  SCOPED_TRACE("assembly:\n" + assembly);
+  // Runs of 2 (one dword) and 4 (dwordx2) elements, and the masked fallback.
+  EXPECT_NE(assembly.find("buffer_load_dwordx2"), std::string::npos);
+  EXPECT_NE(assembly.find("buffer_load_dword "), std::string::npos);
+  EXPECT_NE(assembly.find("buffer_load_ushort"), std::string::npos);
+  // One FMA per tile element (BM * TN = 8) in each of the vector and the masked
+  // path of each of the two orientations.
+  EXPECT_EQ(countLinesContaining(assembly, "v_fmac_f32"), 2 * 2 * 8);
+  // The high half of a pair is unpacked with a mask, the low half with a shift.
+  EXPECT_NE(assembly.find("v_and_b32"), std::string::npos);
+
+  SkinnyGEMMConfig wide = config(8, 2, 16, 1, 0);
+  wide.useBeta = true;
+  EXPECT_NE(emitted(wide).find("buffer_load_dwordx4"), std::string::npos);
+
+  // BM = 3 and TN = 3 have no even bf16 run: per-element loads and FMAs only,
+  // for each of the two orientations that the f32 workspace stores need.
+  SkinnyGEMMConfig odd = config(3, 3, 16, 1, 1);
+  odd.useBeta = true;
+  std::string oddAssembly = emitted(odd);
+  EXPECT_EQ(countLinesContaining(oddAssembly, "buffer_load_ushort"), 2 * 9);
+  EXPECT_EQ(countLinesContaining(oddAssembly, "v_fmac_f32"), 2 * 9);
+  EXPECT_EQ(countLinesContaining(oddAssembly, "label_c_vector"), 0);
+  EXPECT_EQ(countLinesContaining(oddAssembly, "label_c_masked"), 0);
 }
 
 static bool isLabelOrComment(const std::string &line) {

@@ -85,6 +85,7 @@ def kernelNameOf(p):
         f"gemm_BM{p['bm']}_TN{p['tn']}_LANES_K{p['lanesK']}_WAVES{p['waves']}"
         f"_UP_ITERS{p['upIters']}_PARTIAL_STEPS{p['partialSteps']}_PF{p['prefetch']}"
         f"_GROUP{p['group']}_NUM_XCDS{p['numXcds']}_GRID_3D{int(p['grid3d'])}"
+        f"_USE_BETA{int(p.get('useBeta', False))}"
     )
 
 
@@ -640,7 +641,7 @@ def emittedExplicitArgs(source):
 @needsCodegen
 def test_real_kernel_name():
     assert SkinnyGEMM.kernelName(S1) == (
-        "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS2_PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_GRID_3D1"
+        "gemm_BM1_TN1_LANES_K64_WAVES4_UP_ITERS2_PARTIAL_STEPS0_PF2_GROUP1_NUM_XCDS1_GRID_3D1_USE_BETA0"
     )
     for params in (S1, S2, S3, S4, S5):
         assert SkinnyGEMM.kernelName(params) == kernelNameOf(params)

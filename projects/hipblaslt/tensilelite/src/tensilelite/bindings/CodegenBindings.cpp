@@ -27,23 +27,25 @@ NB_MODULE(tensilelite_codegen, m) {
       "of 4, 8, 16 and 64), waves (WAVES, so a block has 64 * waves lanes), "
       "prefetch (PF, 0 means no ring), upIters (UP_ITERS, 0 rings the scales, "
       "else the up-front vector size), partialSteps (PARTIAL_STEPS, 0, 1 or "
-      "2), group (GROUP), numXcds (NUM_XCDS) and grid3d (GRID_3D, false "
-      "selects a persistent 1-D launch).")
+      "2), group (GROUP), numXcds (NUM_XCDS), grid3d (GRID_3D, false "
+      "selects a persistent 1-D launch) and useBeta (USE_BETA, true prefetches "
+      "C and adds beta * C).")
       .def(
           "__init__",
           [](SkinnyGEMMConfig *self, int32_t bm, int32_t tn, int32_t lanesK,
              int32_t waves, int32_t prefetch, int32_t upIters,
-             int32_t partialSteps, int32_t group, int32_t numXcds,
-             bool grid3d) {
+             int32_t partialSteps, int32_t group, int32_t numXcds, bool grid3d,
+             bool useBeta) {
             new (self) SkinnyGEMMConfig{bm,       tn,      lanesK,       waves,
                                         prefetch, upIters, partialSteps, group,
-                                        numXcds,  grid3d};
+                                        numXcds,  grid3d,  useBeta};
           },
           nb::kw_only(), "bm"_a = defaults.bm, "tn"_a = defaults.tn,
           "lanesK"_a = defaults.lanesK, "waves"_a = defaults.waves,
           "prefetch"_a = defaults.prefetch, "upIters"_a = defaults.upIters,
           "partialSteps"_a = defaults.partialSteps, "group"_a = defaults.group,
-          "numXcds"_a = defaults.numXcds, "grid3d"_a = defaults.grid3d)
+          "numXcds"_a = defaults.numXcds, "grid3d"_a = defaults.grid3d,
+          "useBeta"_a = defaults.useBeta)
       .def_rw("bm", &SkinnyGEMMConfig::bm)
       .def_rw("tn", &SkinnyGEMMConfig::tn)
       .def_rw("lanesK", &SkinnyGEMMConfig::lanesK)
@@ -53,7 +55,8 @@ NB_MODULE(tensilelite_codegen, m) {
       .def_rw("partialSteps", &SkinnyGEMMConfig::partialSteps)
       .def_rw("group", &SkinnyGEMMConfig::group)
       .def_rw("numXcds", &SkinnyGEMMConfig::numXcds)
-      .def_rw("grid3d", &SkinnyGEMMConfig::grid3d);
+      .def_rw("grid3d", &SkinnyGEMMConfig::grid3d)
+      .def_rw("useBeta", &SkinnyGEMMConfig::useBeta);
 
   m.def("skinnyGEMMKernelName", &skinnyGEMMKernelName, "config"_a,
         "Returns the symbol of the GEMM kernel for config, in the format of "

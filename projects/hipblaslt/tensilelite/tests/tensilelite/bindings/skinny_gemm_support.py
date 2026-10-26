@@ -532,6 +532,9 @@ class Problem:
     ldC: int
     alpha: float
     beta: float
+    # Whether the GEMM is the useBeta variant, which adds beta * C itself with a
+    # single split.
+    use_beta: bool = False
 
     @property
     def skinny(self) -> int:
@@ -589,7 +592,7 @@ class Problem:
             f"WAVES={self.waves} PF={self.pf} M={self.m} N={self.n} "
             f"K={self.k} SPK={self.spk} B={self.blocks} "
             f"GROUP={self.group} XCDS={self.xcds} UP={self.up_scales} "
-            f"GRID3D={int(self.grid3d)}"
+            f"GRID3D={int(self.grid3d)} USE_BETA={int(self.use_beta)}"
         )
 
 
@@ -741,6 +744,7 @@ def gemmKernelName(p) -> str:
         ("GROUP", p.group),
         ("NUM_XCDS", p.xcds),
         ("GRID_3D", int(p.grid3d)),
+        ("USE_BETA", int(p.use_beta)),
     )
     return "_".join(["gemm"] + [f"{name}{value}" for name, value in params])
 
@@ -761,6 +765,7 @@ def skinnyConfig(p: Problem):
         group=p.group,
         numXcds=p.xcds,
         grid3d=p.grid3d,
+        useBeta=p.use_beta,
     )
 
 
@@ -837,6 +842,7 @@ def makeProblem(
     paddingC: int = 0,
     alpha: float = 1.0,
     beta: float = 0.0,
+    use_beta: bool = False,
 ) -> Problem:
     """Resolves the knobs (explicit ones win over pickConfig), the block count
     and the leading dimensions, and checks the constraints. The leading
@@ -882,6 +888,7 @@ def makeProblem(
         ldC=alignUp(m, 4) + paddingC,
         alpha=alpha,
         beta=beta,
+        use_beta=use_beta,
     )
     checkConstraints(p)
     return p
@@ -927,8 +934,11 @@ def makeInputs(p: Problem, seed: int, withReference: bool = True) -> Inputs:
     rng = np.random.default_rng(seed=seed)
     a, scalesA, aBuf, sclABuf = makeOperand(rng, p.m, p.k, p.ldA)
     b, scalesB, bBuf, sclBBuf = makeOperand(rng, p.n, p.k, p.ldB)
-    # With beta 0 the C values are NaN, so a kernel that reads C fails.
-    cBits = makeC(rng, p.m, p.n, p.ldC, poison=p.beta == 0)
+    # With beta 0 the C values are NaN, so a kernel that reads C fails; so they
+    # are for the GEMM without useBeta, which never reads C, unless the split-K
+    # reduce needs it.
+    poison = p.beta == 0 or (not p.use_beta and p.splits == 1)
+    cBits = makeC(rng, p.m, p.n, p.ldC, poison=poison)
     if not withReference:
         return Inputs(aBuf, bBuf, sclABuf, sclBBuf, None, cBits)
     expected = referenceProduct(dequant(a, scalesA), dequant(b, scalesB))
@@ -936,7 +946,8 @@ def makeInputs(p: Problem, seed: int, withReference: bool = True) -> Inputs:
 
 
 def scaledProduct(p: Problem, product: np.ndarray) -> np.ndarray:
-    """alpha * product in f32, what the GEMM stores into D with a single split."""
+    """alpha * product in f32, what the GEMM stores into D with a single split
+    unless it adds beta * C."""
     return np.float32(p.alpha) * product
 
 
@@ -1016,11 +1027,21 @@ def launchGemm(
     launchKernel(kernel, p.grid, gemmBlock(p), args)
 
 
+def singleSplitD(p: Problem, inputs: Inputs) -> np.ndarray:
+    """The f32 value the GEMM stores into D with a single split before the bf16
+    truncation: fma(beta, C, alpha * product) for the useBeta variant with a
+    beta that is not zero (-0.0 is zero), else alpha * product, as the GEMM
+    does not read C."""
+    if p.use_beta and p.beta != 0:
+        return expectedD(p, inputs)
+    return scaledProduct(p, inputs.expected)
+
+
 def verifyGemm(p: Problem, inputs: Inputs, dBits: np.ndarray, ws: np.ndarray) -> None:
-    """Checks D (no split, alpha * product: the GEMM does not read C) or the raw
-    workspace sum against the reference."""
+    """Checks D (a single split, see singleSplitD) or the raw workspace sum
+    against the reference."""
     if p.splits == 1:
-        verifyD(dBits, scaledProduct(p, inputs.expected), p.m, p.n, p.ldD, p.label)
+        verifyD(dBits, singleSplitD(p, inputs), p.m, p.n, p.ldD, p.label)
         return
     verifyWorkspace(ws, inputs.expected, p.splits, p.m, p.n, p.label)
 

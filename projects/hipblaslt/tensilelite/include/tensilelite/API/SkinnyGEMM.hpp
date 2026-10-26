@@ -34,12 +34,14 @@ struct SkinnyGEMMConfig {
   int32_t numXcds = 1;
   /// GRID_3D: false selects a persistent 1-D launch.
   bool grid3d = true;
+  /// USE_BETA: whether the kernel computes beta * C, see emitSkinnyGEMM.
+  bool useBeta = false;
 };
 
 /// Returns the symbol of the GEMM kernel, in the reference's format:
 /// gemm_BM<v>_TN<v>_LANES_K<v>_WAVES<v>_UP_ITERS<v>_PARTIAL_STEPS<v>_PF<v>_
-/// GROUP<v>_NUM_XCDS<v>_GRID_3D<v>. Throws std::invalid_argument for invalid
-/// knobs.
+/// GROUP<v>_NUM_XCDS<v>_GRID_3D<v>_USE_BETA<v>. Throws std::invalid_argument
+/// for invalid knobs.
 std::string skinnyGEMMKernelName(const SkinnyGEMMConfig &config);
 
 /// Emits the GEMM kernel as the assembly text of one kernel, for
@@ -51,10 +53,26 @@ std::string skinnyGEMMKernelName(const SkinnyGEMMConfig &config);
 /// n (72), k (76), spk (80) and ldC (84), then the f32 alpha (88) and beta
 /// (92), then the hidden group sizes x, y, z (96 to 104) and block counts x, y,
 /// z (108 to 116), for a segment size of 120. The block is (64 * waves, 1, 1).
-/// With a single split the kernel stores D = the bf16 truncation (top 16 bits)
-/// of alpha * acc, else each split stores its raw f32 slice into the
-/// workspace, which splitk_reduce sums and scales. The kernel does not read C,
-/// ldC or beta. BN = waves * (64 / lanesK) * tn.
+/// BN = waves * (64 / lanesK) * tn. Both values of useBeta share this ABI.
+///
+/// With several splits (k > spk) the kernel stores each split's raw f32 slice
+/// into the workspace, without alpha and without C, which splitk_reduce sums
+/// and scales (with beta and C), whatever useBeta is. With a single split
+/// (k <= spk) the kernel stores D, the bf16 truncation (top 16 bits) of:
+///
+/// useBeta = false: alpha * acc. The kernel never reads C, ldC or beta, which
+/// are only in the ABI so that both variants share it.
+///
+/// useBeta = true: fma(beta, C, alpha * acc) when beta is not zero (the bit
+/// test (beta & 0x7fffffff) != 0, so -0.0 counts as zero), with C bf16 read at
+/// C[j * ldC + i] in the orientation of D. With beta zero the kernel never
+/// loads C and issues no FMA, only a uniform scalar test per tile, and stores
+/// alpha * acc, so C may be uninitialized; the same holds with several splits.
+/// C may alias D. The loads of C are prefetched at the start of each tile into
+/// dedicated VGPRs, after the tile decode and before the prologue loads of the
+/// ring, so that their latency overlaps the K loop; the variant therefore
+/// holds those registers for the whole kernel, which is why useBeta = false
+/// exists.
 ///
 /// grid3d = true: the grid is (ceil(max(m, n) / BN), ceil(min(m, n) / bm),
 /// ceil(k / spk)) and the block (x, y, z) is the tile (tx, ty, kz). group and

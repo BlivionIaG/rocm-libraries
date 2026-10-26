@@ -389,6 +389,13 @@ def makeParser() -> argparse.ArgumentParser:
         help="Blocks of a 1-D persistent grid (default: the 3-D grid)",
     )
     parser.add_argument(
+        "--use-beta",
+        action="store_true",
+        help="Run the useBeta GEMM, which prefetches C and adds beta * C",
+    )
+    parser.add_argument("--alpha", type=float, default=1.0, help="Scale of A * B")
+    parser.add_argument("--beta", type=float, default=0.0, help="Scale of C")
+    parser.add_argument(
         "--sweep",
         choices=sorted(SWEEPS),
         default=None,
@@ -425,6 +432,14 @@ def knobOverrides(args: argparse.Namespace) -> dict:
         if name != "blocks"
     }
     values["blocks"] = args.persistent_blocks
+    # Only the non-default values are passed on, so the sweep header of a run
+    # without them stays as it was.
+    if args.use_beta:
+        values["use_beta"] = True
+    if args.alpha != 1.0:
+        values["alpha"] = args.alpha
+    if args.beta != 0.0:
+        values["beta"] = args.beta
     return {name: value for name, value in values.items() if value is not None}
 
 

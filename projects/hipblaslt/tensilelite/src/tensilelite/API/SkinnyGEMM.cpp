@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -60,6 +61,8 @@ struct SkinnyDims {
   /// GRID_3D; group and numXcds only apply to the persistent launch.
   bool grid3d;
   int32_t group, numXcds;
+  /// USE_BETA: whether the kernel prefetches C and adds beta * C.
+  bool useBeta;
   /// Whether the persistent launch reorders the tiles (GROUP or NUM_XCDS not
   /// 1), which changes the key of the K rotation.
   bool reordered;
@@ -166,11 +169,13 @@ private:
   // SGPRs that only the resources and the path dispatch read; blocksZ, the
   // split count, only exists in the 3-D launch.
   struct ResourceScalars {
-    ResourceScalars(IRBuilder &builder, bool grid3d);
+    ResourceScalars(IRBuilder &builder, bool grid3d, bool useBeta);
     RegisterRange ldD, ldA, ldB, m, n;
     std::optional<RegisterRange> blocksZ;
     RegisterRange aPtr, bPtr, sclAPtr, sclBPtr;
     RegisterRange aBytes, bBytes, sclABytes, sclBBytes;
+    // Only with useBeta.
+    std::optional<RegisterRange> ldC;
   };
 
   // Per-lane values, which only depend on the thread id. In the 3-D launch
@@ -218,7 +223,9 @@ private:
     int32_t boundCtrl;
   };
 
-  // Registers and flags of one epilogue variant.
+  // Registers and flags of one epilogue variant. The C prefetch also builds
+  // one, where red names the C data registers and off, wBase and leader are its
+  // temporaries.
   struct EpilogueState {
     RedLayout layout;
     RegisterRef red;
@@ -280,6 +287,14 @@ private:
 
   // K loop.
   void runTile();
+  void prefetchC();
+  void loadCTile(const EpilogueState &state, const StoreTarget &target);
+  void loadCMasked(const EpilogueState &state, const StoreTarget &target,
+                   const StoreScalars &scalars);
+  void loadCRun(const EpilogueState &state, const StoreTarget &target,
+                const StoreScalars &scalars, int32_t r, int32_t t,
+                int32_t length);
+  void branchIfBetaZero(const std::shared_ptr<rocisa::Label> &label);
   void runNoPrefetchLoop();
   void runPrefetchedLoop();
   void emitPrologue();
@@ -359,7 +374,12 @@ private:
 
   // Epilogue.
   void emitEpilogue();
+  void forEachOrientation(const std::function<void(bool)> &emitVariant);
   void emitEpilogueVariant(bool skinnyContiguous);
+  int32_t cDwords() const;
+  void addBetaC(const EpilogueState &state);
+  void addBetaCVector(const EpilogueState &state, RegisterRef c);
+  void addBetaCMasked(const EpilogueState &state, RegisterRef c);
   RedLayout redLayout(bool skinnyContiguous) const;
   int32_t runLength(bool skinnyContiguous) const;
   int32_t redIndex(RedLayout layout, int32_t r, int32_t t) const;
@@ -415,7 +435,8 @@ private:
 
   // SGPRs that live through the K loop and the epilogue.
   RegisterRange sRsrc, wRsrc, sSclRsrc, wSclRsrc, dRsrc, wsRsrc;
-  // The pair holds alpha in its low dword, as v_pk_mul_f32 needs 2 SGPRs.
+  // The pair holds alpha in its low dword; the high dword is unused and only
+  // forms the 2-SGPR operand pair that v_pk_mul_f32 needs.
   RegisterRange alpha;
   RegisterRange k, spk, mn;
   RegisterRange dStrideS, dStrideW, wsStrideS, wsStrideW;
@@ -439,6 +460,11 @@ private:
   RegisterRange chunkBase;
   std::vector<bool> chunkBaseReady;
   RegisterRange sValid, wValid;
+
+  // Only with useBeta, allocated last so that the other registers keep their
+  // place: the descriptor of C, its strides along the skinny and the wide
+  // dimension, beta, and the VGPRs that the tile-start prefetch loads C into.
+  std::optional<RegisterRange> cRsrc, cStrideS, cStrideW, beta, cData;
 
   // Destinations of the prologue loads in issue order, for the epilogue's
   // write-after-write wait.
@@ -480,7 +506,7 @@ static int32_t loadsIssuedAfter(const SkinnyDims &dims,
 SkinnyDims::SkinnyDims(const SkinnyGEMMConfig &config)
     : bm(config.bm), tn(config.tn), lanesK(config.lanesK), waves(config.waves),
       prefetch(config.prefetch), grid3d(config.grid3d), group(config.group),
-      numXcds(config.numXcds),
+      numXcds(config.numXcds), useBeta(config.useBeta),
       reordered(config.group != 1 || config.numXcds != 1),
       upIters(config.upIters), partialSteps(config.partialSteps) {
   columns = bm + tn;
@@ -528,6 +554,18 @@ static void scaleBytes(IRBuilder &builder, RegisterRef dst, RegisterRef cols,
   builder.muli32(dst, dst, rowGroup);
 }
 
+// Bytes of a column-major bf16 matrix of m rows and n columns with leading
+// dimension ld: ((n - 1) * ld + m) elements, as (2n - 2) * ld + 2m bytes.
+static void bf16MatrixBytes(IRBuilder &builder, RegisterRef dst, RegisterRef n,
+                            RegisterRef ld, RegisterRef m,
+                            RegisterRef scratch) {
+  builder.shli32(dst, n, 1);
+  builder.addi32(dst, dst, -2);
+  builder.muli32(dst, dst, ld);
+  builder.shli32(scratch, m, 1);
+  builder.addi32(dst, dst, scratch);
+}
+
 // The scale base of a column of a row group matrix: (col / 32) * rowGroup +
 // (col mod 16) * 4, before the lane's role offset. Overwrites col.
 static void scaleRowOffset(IRBuilder &builder, RegisterRef dst, RegisterRef col,
@@ -549,7 +587,7 @@ SkinnyGEMMEmitter::SetupScalars::SetupScalars(IRBuilder &builder, bool grid3d)
                     : std::optional<RegisterRange>(builder.allocateSgpr(1))) {}
 
 SkinnyGEMMEmitter::ResourceScalars::ResourceScalars(IRBuilder &builder,
-                                                    bool grid3d)
+                                                    bool grid3d, bool useBeta)
     : ldD(builder.allocateSgpr(1)), ldA(builder.allocateSgpr(1)),
       ldB(builder.allocateSgpr(1)), m(builder.allocateSgpr(1)),
       n(builder.allocateSgpr(1)),
@@ -558,7 +596,9 @@ SkinnyGEMMEmitter::ResourceScalars::ResourceScalars(IRBuilder &builder,
       aPtr(builder.allocateSgpr(2, 2)), bPtr(builder.allocateSgpr(2, 2)),
       sclAPtr(builder.allocateSgpr(2, 2)), sclBPtr(builder.allocateSgpr(2, 2)),
       aBytes(builder.allocateSgpr(1)), bBytes(builder.allocateSgpr(1)),
-      sclABytes(builder.allocateSgpr(1)), sclBBytes(builder.allocateSgpr(1)) {}
+      sclABytes(builder.allocateSgpr(1)), sclBBytes(builder.allocateSgpr(1)),
+      ldC(useBeta ? std::optional<RegisterRange>(builder.allocateSgpr(1))
+                  : std::nullopt) {}
 
 SkinnyGEMMEmitter::SkinnyGEMMEmitter(Kernel &kernel,
                                      const SkinnyGEMMConfig &config,
@@ -597,7 +637,16 @@ SkinnyGEMMEmitter::SkinnyGEMMEmitter(Kernel &kernel,
                  ? std::optional<RegisterRange>(sgpr())
                  : std::nullopt),
       chunkBase(sgpr(4)), chunkBaseReady(4, false),
-      sValid(sgpr(2 * dims.bm, 2)), wValid(sgpr(2 * dims.tn, 2)) {}
+      sValid(sgpr(2 * dims.bm, 2)), wValid(sgpr(2 * dims.tn, 2)),
+      cRsrc(dims.useBeta ? std::optional<RegisterRange>(sgpr(4, 4))
+                         : std::nullopt),
+      cStrideS(dims.useBeta ? std::optional<RegisterRange>(sgpr())
+                            : std::nullopt),
+      cStrideW(dims.useBeta ? std::optional<RegisterRange>(sgpr())
+                            : std::nullopt),
+      beta(dims.useBeta ? std::optional<RegisterRange>(sgpr()) : std::nullopt),
+      cData(dims.useBeta ? std::optional<RegisterRange>(vgpr(cDwords(), 2))
+                         : std::nullopt) {}
 
 RegisterRange SkinnyGEMMEmitter::sgpr(int32_t count, int32_t alignment) {
   return builder.allocateSgpr(count, alignment);
@@ -655,7 +704,7 @@ void SkinnyGEMMEmitter::emit() {
 // The pointers load straight into the words 0 and 1 of the resources of D and
 // the workspace; the others wait in pairs for the path dispatch.
 void SkinnyGEMMEmitter::setupResources(SetupScalars &scalars) {
-  ResourceScalars resources(builder, dims.grid3d);
+  ResourceScalars resources(builder, dims.grid3d, dims.useBeta);
   if (resources.blocksZ)
     kernel.loadArgument(resources.blocksZ->ref(), arguments.blocksZ);
   kernel.loadArgument(scalars.blocksX.ref(), arguments.blocksX);
@@ -675,6 +724,11 @@ void SkinnyGEMMEmitter::setupResources(SetupScalars &scalars) {
   kernel.loadArgument(resources.bPtr.ref(), arguments.b);
   kernel.loadArgument(resources.aPtr.ref(), arguments.a);
   kernel.loadArgument(dRsrc.ref(0, 2), arguments.d);
+  if (dims.useBeta) {
+    kernel.loadArgument(beta->ref(), arguments.beta);
+    kernel.loadArgument(resources.ldC->ref(), arguments.ldC);
+    kernel.loadArgument(cRsrc->ref(0, 2), arguments.c);
+  }
   // Scalar loads return out of order, so only lgkmcnt(0) guarantees any of
   // them.
   builder.createWaitCnt(WaitCounts{.scalarMemory = 0});
@@ -682,6 +736,8 @@ void SkinnyGEMMEmitter::setupResources(SetupScalars &scalars) {
   dispatchPaths(scalars, resources);
   builder.makeRsrc(dRsrc.ref(), dRsrc.ref(0, 2), dRsrc.ref(2));
   builder.makeRsrc(wsRsrc.ref(), wsRsrc.ref(0, 2), wsRsrc.ref(2));
+  if (dims.useBeta)
+    builder.makeRsrc(cRsrc->ref(), cRsrc->ref(0, 2), cRsrc->ref(2));
 }
 
 void SkinnyGEMMEmitter::makeBufferSizes(const SetupScalars &scalars,
@@ -702,13 +758,11 @@ void SkinnyGEMMEmitter::makeBufferSizes(const SetupScalars &scalars,
              scalars.rowGroup.ref());
   scaleBytes(builder, resources.sclBBytes.ref(), resources.n.ref(),
              scalars.rowGroup.ref());
-  // D holds ((n - 1) * ldD + m) bf16 elements, as (2n - 2) * ldD + 2m bytes.
-  RegisterRef dBytes = dRsrc.ref(2);
-  builder.shli32(dBytes, resources.n.ref(), 1);
-  builder.addi32(dBytes, dBytes, -2);
-  builder.muli32(dBytes, dBytes, resources.ldD.ref());
-  builder.shli32(alignedK.ref(), resources.m.ref(), 1);
-  builder.addi32(dBytes, dBytes, alignedK.ref());
+  bf16MatrixBytes(builder, dRsrc.ref(2), resources.n.ref(), resources.ldD.ref(),
+                  resources.m.ref(), alignedK.ref());
+  if (dims.useBeta)
+    bf16MatrixBytes(builder, cRsrc->ref(2), resources.n.ref(),
+                    resources.ldC->ref(), resources.m.ref(), alignedK.ref());
   // The workspace holds splits * m * n f32 elements; the splits are the
   // blocks of the grid's z dimension, or ceilDiv(k, spk) in the 1-D launch.
   RegisterRef splits =
@@ -755,6 +809,10 @@ void SkinnyGEMMEmitter::dispatchPaths(const SetupScalars &scalars,
                     resources.ldA.ref());
   builder.selectb32(dStrideS.ref(), 1, resources.ldD.ref());
   builder.selectb32(dStrideW.ref(), resources.ldD.ref(), 1);
+  if (dims.useBeta) {
+    builder.selectb32(cStrideS->ref(), 1, resources.ldC->ref());
+    builder.selectb32(cStrideW->ref(), resources.ldC->ref(), 1);
+  }
   builder.selectb32(wsStrideS.ref(), 1, resources.m.ref());
   builder.selectb32(wsStrideW.ref(), resources.m.ref(), 1);
   builder.selectb32(contigS.ref(), 1, 0);
@@ -1417,6 +1475,8 @@ RegisterRef SkinnyGEMMEmitter::dataRsrc(int32_t column) const {
 }
 
 void SkinnyGEMMEmitter::runTile() {
+  if (cData)
+    prefetchC();
   if (dims.upIters > 0)
     issueUpFrontScales();
   if (dims.prefetch == 0)
@@ -1437,6 +1497,139 @@ void SkinnyGEMMEmitter::runTile() {
     ringRaw->release();
   scaleVector.reset();
   hoistedScales.clear();
+}
+
+// Prefetches the tile of C into cData, for the epilogue's beta * C, when the
+// tile stores D directly (k <= spk) and beta is not zero; else it only costs
+// the scalar tests. The loads are issued before every scale and ring load of
+// the tile and after everything older, such as the stores of the previous tile
+// of a persistent block, and the temporaries are dead before the ring loads.
+//
+// vmcnt counts the vector memory operations of a wave in issue order. Every
+// wait either allows the N loads issued after its target or drains everything
+// (the vmcnt(0) waits in loadMaskedDword and the persistent shared-scales
+// drain), so the older C loads are complete whenever its target is, and both
+// forms are safe with them.
+// The epilogue consumes C after an explicit vmcnt(0). C may alias D: each lane
+// loads its elements here and stores them in the epilogue, and the tiles are
+// disjoint, so the next tile of a persistent block loads after this tile's
+// epilogue consumed cData.
+void SkinnyGEMMEmitter::prefetchC() {
+  std::shared_ptr<rocisa::Label> skip = builder.createLabel("c_prefetch_skip");
+  builder.create<rocisa::SCmpLeU32>(k.container(), spk.container());
+  builder.create<rocisa::SCBranchSCC0>(skip->getLabelName());
+  branchIfBetaZero(skip);
+  RegisterRange leader = sgpr(2, 2);
+  builder.create<rocisa::VCmpEQI32>(leader.container(), 0,
+                                    kernel.workitemId().container());
+  RegisterRange off = vgpr();
+  std::optional<RegisterRange> wBase;
+  if (!uniformWide())
+    wBase = vgpr();
+  forEachOrientation([&](bool skinnyContiguous) {
+    RegisterRange tileFull = sgpr();
+    bool vector = hasVector(skinnyContiguous, true);
+    if (vector)
+      computeTileFull(tileFull.ref());
+    EpilogueState state{
+        redLayout(skinnyContiguous),
+        cData->ref(),
+        off.ref(),
+        wBase ? std::optional<RegisterRef>(wBase->ref()) : std::nullopt,
+        leader.ref(),
+        vector ? std::optional<RegisterRef>(tileFull.ref()) : std::nullopt};
+    loadCTile(state, StoreTarget{cRsrc->ref(), cStrideS->ref(), cStrideW->ref(),
+                                 std::nullopt, true});
+  });
+  builder.insert(skip);
+}
+
+// Branches to label when beta is zero. The sign bit is masked so that -0.0
+// counts as zero.
+void SkinnyGEMMEmitter::branchIfBetaZero(
+    const std::shared_ptr<rocisa::Label> &label) {
+  RegisterRange magnitude = sgpr();
+  builder.andi32(magnitude.ref(), beta->ref(), 0x7fffffff);
+  builder.create<rocisa::SCmpEQU32>(magnitude.container(), 0);
+  builder.create<rocisa::SCBranchSCC1>(label->getLabelName());
+}
+
+// Elements of a bf16 run in the C registers pack in pairs, each run starting
+// at an even register so that every dwordx2 and dwordx4 load is aligned.
+static int32_t cRunStride(int32_t length) { return (length / 2 + 1) & ~1; }
+
+// Loads the C tile with the addressing of the D store, through the vector
+// loads when the tile lies inside the output and the orientation has even
+// runs, else per element.
+void SkinnyGEMMEmitter::loadCTile(const EpilogueState &state,
+                                  const StoreTarget &target) {
+  StoreScalars scalars = makeStoreScalars(state, target);
+  bool skinnyContiguous = state.layout.skinnyContiguous;
+  if (!state.tileFull || !hasVector(skinnyContiguous, true)) {
+    loadCMasked(state, target, scalars);
+    return;
+  }
+  std::shared_ptr<rocisa::Label> vectorPath = builder.createLabel("c_vector");
+  std::shared_ptr<rocisa::Label> done = builder.createLabel("c_loaded");
+  builder.create<rocisa::SCmpEQU32>(state.tileFull->container(), 1);
+  builder.create<rocisa::SCBranchSCC1>(vectorPath->getLabelName());
+  loadCMasked(state, target, scalars);
+  builder.create<rocisa::SBranch>(done->getLabelName());
+  builder.insert(vectorPath);
+  int32_t runs = skinnyContiguous ? dims.tn : dims.bm;
+  for (int32_t run = 0; run < runs; ++run) {
+    if (skinnyContiguous)
+      loadCRun(state, target, scalars, 0, run, dims.bm);
+    else
+      loadCRun(state, target, scalars, run, 0, dims.tn);
+  }
+  builder.insert(done);
+}
+
+// One zero-extending 16-bit load per element, into dword redIndex of the C
+// registers; the lanes that are not leaders and the elements outside the output
+// load out of range, so they cause no traffic.
+void SkinnyGEMMEmitter::loadCMasked(const EpilogueState &state,
+                                    const StoreTarget &target,
+                                    const StoreScalars &scalars) {
+  RegisterRange mask = sgpr(2, 2);
+  for (int32_t r = 0; r < dims.bm; ++r) {
+    for (int32_t t = 0; t < dims.tn; ++t) {
+      computeOffset(state, target, scalars, r, t);
+      builder.andi64(mask.ref(), sValid.ref(2 * r, 2), wValid.ref(2 * t, 2));
+      builder.andi64(mask.ref(), mask.ref(), state.leader);
+      builder.selectb32(state.off, mask.ref(), state.off, outOfRange);
+      builder.loadBuffer(state.red.slice(redIndex(state.layout, r, t)),
+                         target.rsrc, state.off, 0, MemoryWidth::b16);
+    }
+  }
+}
+
+// Loads the run of length bf16 elements that starts at (r, t) with the widest
+// chunks first, as storeRun does: dwordx4, dwordx2, dword. Chunk first / 2
+// lands at that dword of the run's registers.
+void SkinnyGEMMEmitter::loadCRun(const EpilogueState &state,
+                                 const StoreTarget &target,
+                                 const StoreScalars &scalars, int32_t r,
+                                 int32_t t, int32_t length) {
+  bool skinnyContiguous = state.layout.skinnyContiguous;
+  int32_t run = skinnyContiguous ? t : r;
+  int32_t first = 0;
+  for (int32_t chunk : {8, 4, 2}) {
+    for (; length - first >= chunk; first += chunk) {
+      computeOffset(state, target, scalars, skinnyContiguous ? r + first : r,
+                    skinnyContiguous ? t : t + first);
+      builder.selectb32(state.off, state.leader, state.off, outOfRange);
+      int32_t dwords = chunk / 2;
+      RegisterRef data =
+          state.red.slice(run * cRunStride(length) + first / 2, dwords);
+      MemoryWidth width = dwords == 1   ? MemoryWidth::b32
+                          : dwords == 2 ? MemoryWidth::b64
+                                        : MemoryWidth::b128;
+      builder.loadBuffer(data, target.rsrc, state.off, 0, width);
+    }
+  }
+  assert(first == length && "run length is not a multiple of the chunk");
 }
 
 // dst = sum >= NIfull ? sum - NIfull : sum, the physical iteration of a
@@ -2601,11 +2794,19 @@ int32_t SkinnyGEMMEmitter::redIndex(RedLayout layout, int32_t r,
 }
 
 void SkinnyGEMMEmitter::emitEpilogue() {
+  forEachOrientation(
+      [&](bool skinnyContiguous) { emitEpilogueVariant(skinnyContiguous); });
+}
+
+// Emits the code of the epilogue and of the C prefetch for the orientation of
+// the output, which contigS selects at run time.
+void SkinnyGEMMEmitter::forEachOrientation(
+    const std::function<void(bool)> &emitVariant) {
   bool vectorA = runLength(true) >= 2;
   bool vectorB = runLength(false) >= 2;
   // Without vector stores the two orientations are the same code.
   if (!vectorA && !vectorB) {
-    emitEpilogueVariant(true);
+    emitVariant(true);
     return;
   }
   std::shared_ptr<rocisa::Label> orientationB =
@@ -2613,11 +2814,16 @@ void SkinnyGEMMEmitter::emitEpilogue() {
   std::shared_ptr<rocisa::Label> end = builder.createLabel("epilogue_end");
   builder.create<rocisa::SCmpEQU32>(contigS.container(), 1);
   builder.create<rocisa::SCBranchSCC0>(orientationB->getLabelName());
-  emitEpilogueVariant(true);
+  emitVariant(true);
   builder.create<rocisa::SBranch>(end->getLabelName());
   builder.insert(orientationB);
-  emitEpilogueVariant(false);
+  emitVariant(false);
   builder.insert(end);
+}
+
+// The VGPRs the C prefetch needs: the larger of the two orientations' layouts.
+int32_t SkinnyGEMMEmitter::cDwords() const {
+  return std::max(redLayout(true).total, redLayout(false).total);
 }
 
 void SkinnyGEMMEmitter::emitEpilogueVariant(bool skinnyContiguous) {
@@ -2659,6 +2865,8 @@ void SkinnyGEMMEmitter::emitEpilogueVariant(bool skinnyContiguous) {
   builder.create<rocisa::SCmpLeU32>(k.container(), spk.container());
   builder.create<rocisa::SCBranchSCC0>(workspace->getLabelName());
   scaleByAlpha(state);
+  if (cData)
+    addBetaC(state);
   storeTile(state, StoreTarget{dRsrc.ref(), dStrideS.ref(), dStrideW.ref(),
                                std::nullopt, true});
   builder.create<rocisa::SBranch>(done->getLabelName());
@@ -2668,6 +2876,75 @@ void SkinnyGEMMEmitter::emitEpilogueVariant(bool skinnyContiguous) {
   storeTile(state, StoreTarget{wsRsrc.ref(), wsStrideS.ref(), wsStrideW.ref(),
                                slice.ref(), false});
   builder.insert(done);
+}
+
+// The C halves of a bf16 pair live in one dword, low half first.
+static constexpr int32_t highHalfMask = static_cast<int32_t>(0xFFFF0000);
+
+// red = fma(beta, C, red) for the prefetched C tile, skipped when beta is zero
+// as the prefetch is. The C loads are older than every other load of the tile,
+// so one vmcnt(0) completes them; the temporary is allocated after it because
+// it may reuse a ring register that an unconsumed prologue load writes.
+void SkinnyGEMMEmitter::addBetaC(const EpilogueState &state) {
+  std::shared_ptr<rocisa::Label> noBeta = builder.createLabel("no_beta");
+  branchIfBetaZero(noBeta);
+  waitForVectorLoads(0);
+  RegisterRange c = vgpr();
+  if (!state.tileFull || !hasVector(state.layout.skinnyContiguous, true))
+    addBetaCMasked(state, c.ref());
+  else {
+    std::shared_ptr<rocisa::Label> masked = builder.createLabel("c_masked");
+    std::shared_ptr<rocisa::Label> done = builder.createLabel("c_added");
+    builder.create<rocisa::SCmpEQU32>(state.tileFull->container(), 1);
+    builder.create<rocisa::SCBranchSCC0>(masked->getLabelName());
+    addBetaCVector(state, c.ref());
+    builder.create<rocisa::SBranch>(done->getLabelName());
+    builder.insert(masked);
+    addBetaCMasked(state, c.ref());
+    builder.insert(done);
+  }
+  builder.insert(noBeta);
+}
+
+// c = the f32 of the bf16 in the low or the high half of src.
+static void unpackBf16(IRBuilder &builder, RegisterRef c, RegisterRef src,
+                       bool high) {
+  if (high)
+    builder.andi32(c, highHalfMask, src);
+  else
+    builder.shli32(c, src, 16);
+}
+
+// The vector path loaded runs of dword pairs: element j of run q is the half j
+// % 2 of dword q * stride + j / 2.
+void SkinnyGEMMEmitter::addBetaCVector(const EpilogueState &state,
+                                       RegisterRef c) {
+  bool skinnyContiguous = state.layout.skinnyContiguous;
+  int32_t stride = cRunStride(runLength(skinnyContiguous));
+  for (int32_t r = 0; r < dims.bm; ++r) {
+    for (int32_t t = 0; t < dims.tn; ++t) {
+      int32_t run = skinnyContiguous ? t : r;
+      int32_t position = skinnyContiguous ? r : t;
+      RegisterRef src = cData->ref(run * stride + position / 2, 1);
+      unpackBf16(builder, c, src, position % 2 == 1);
+      builder.create<rocisa::VMacF32>(
+          state.red.slice(redIndex(state.layout, r, t)).container(),
+          beta->container(), c.container());
+    }
+  }
+}
+
+// The masked path loaded one zero-extended element per dword.
+void SkinnyGEMMEmitter::addBetaCMasked(const EpilogueState &state,
+                                       RegisterRef c) {
+  for (int32_t r = 0; r < dims.bm; ++r) {
+    for (int32_t t = 0; t < dims.tn; ++t) {
+      int32_t index = redIndex(state.layout, r, t);
+      unpackBf16(builder, c, cData->ref(index, 1), /*high=*/false);
+      builder.create<rocisa::VMacF32>(state.red.slice(index).container(),
+                                      beta->container(), c.container());
+    }
+  }
 }
 
 // Waits until no prologue load that writes one of the registers in written is
@@ -3212,7 +3489,8 @@ rocm::tensilelite::skinnyGEMMKernelName(const SkinnyGEMMConfig &config) {
          std::to_string(config.prefetch) + "_GROUP" +
          std::to_string(config.group) + "_NUM_XCDS" +
          std::to_string(config.numXcds) + "_GRID_3D" +
-         std::to_string(config.grid3d ? 1 : 0);
+         std::to_string(config.grid3d ? 1 : 0) + "_USE_BETA" +
+         std::to_string(config.useBeta ? 1 : 0);
 }
 
 std::string rocm::tensilelite::emitSkinnyGEMM(const Target &target,

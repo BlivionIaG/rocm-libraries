@@ -30,7 +30,7 @@ GRID_DATA = {"orientations": ["n", "m"], "skinny": [1, 6, 4], "wide": [4096, 102
 def generated_name(knobs):
     bm, tn, lanesK, waves, prefetch, upIters, partialSteps, group, numXcds, grid3d = knobs
     return (f"gemm_BM{bm}_TN{tn}_LANES_K{lanesK}_WAVES{waves}_UP_ITERS{upIters}_PARTIAL_STEPS{partialSteps}"
-            f"_PF{prefetch}_GROUP{group}_NUM_XCDS{numXcds}_GRID_3D{int(grid3d)}")
+            f"_PF{prefetch}_GROUP{group}_NUM_XCDS{numXcds}_GRID_3D{int(grid3d)}_USE_BETA0")
 
 
 def block_text(index, us, kernel):
