@@ -13,3 +13,10 @@ target_sources(tensilelite-host
     PRIVATE
         ${TENSILELITE_HOST_SOURCES}
 )
+
+if(HIPBLASLT_ENABLE_LOCAL_KERNELS)
+    target_sources(tensilelite-host
+        PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/LocalKernelLibrary.cpp"
+    )
+endif()
