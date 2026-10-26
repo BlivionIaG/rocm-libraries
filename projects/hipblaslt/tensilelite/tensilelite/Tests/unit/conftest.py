@@ -28,6 +28,29 @@ def _isolate_rocisa_state():
         yield
 
 
+def pytest_configure(config):
+    """Run the unit tests' ``ParallelMap``/``ParallelMap2`` calls in-process.
+
+    Why here: ``CPUThreadCount()`` sizes its pool from ``globalParameters["CpuThreads"]``
+    (default -1, meaning every CPU the process can see). That is the machine's CPU count,
+    not the CI job's CPU allocation, so each pytest/xdist process launches a pool of
+    roughly that many workers (96 on a 96-CPU host) for tests that map over one or a few
+    items. The pool never speeds those tests up, and it multiplies CPU use by the number
+    of xdist workers. A conftest hook runs once in every pytest process, the controller
+    and each xdist worker, before collection, so no test or CLI flag has to opt in.
+
+    Why both values: ``restoreDefaultGlobalParameters()``, called by the ``Tensile``,
+    ``TensileUpdateLibrary`` and ``TensileRetuneLibrary`` entry points the tests exercise,
+    clears ``globalParameters`` and refills it from ``defaultGlobalParameters``. Setting
+    only the live value is undone by the first such call and the pools come back.
+    A test that needs a different value sets it for itself, as several already do.
+    """
+    from tensilelite.Common import GlobalParameters
+
+    GlobalParameters.globalParameters["CpuThreads"] = 1
+    GlobalParameters.defaultGlobalParameters["CpuThreads"] = 1
+
+
 # Shared toolchain fixtures. Each is one object for the whole run, and the capability
 # maps are read-only (see toolchain_test_helpers): a test that needs to change one takes
 # a copy with copy_isa_info_map.
