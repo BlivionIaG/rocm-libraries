@@ -805,6 +805,13 @@ def test_metadata_arg_cucount_is_compute_units():
     assert _metadataArgToCustomArg(_meta_arg("ComputeUnits", 4))["semantic"] == "ComputeUnits"
 
 
+@pytest.mark.parametrize("dim", ["X", "Y", "Z"])
+def test_metadata_arg_num_work_groups_per_dimension(dim):
+    expected = f"NumWorkGroups{dim}"
+    assert _metadataArgToCustomArg(_meta_arg(f"numWorkGroups{dim}", 4))["semantic"] == expected
+    assert _metadataArgToCustomArg(_meta_arg(expected, 4))["semantic"] == expected
+
+
 def test_metadata_arg_activation_index():
     assert _metadataArgToCustomArg(_meta_arg("activationAlpha", 4)) == {
         "type": "float32", "semantic": "ActivationArg"

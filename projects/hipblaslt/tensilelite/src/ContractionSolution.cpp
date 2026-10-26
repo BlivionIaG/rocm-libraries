@@ -3595,6 +3595,19 @@ namespace TensileLite
                     if(!appendedInternalArgs)
                         rv.args.appendCustomType("NumWorkGroups", getNumWorkGroups(rv), arg.type);
                     break; // handled by InternalArgs via kernelArgs when present
+                // The grid is final here: nothing below modifies rv.numWorkGroups.
+                case CustomArgSemantic::NumWorkGroupsX:
+                    rv.args.appendCustomType(
+                        "NumWorkGroupsX", static_cast<uint32_t>(rv.numWorkGroups.x), arg.type);
+                    break;
+                case CustomArgSemantic::NumWorkGroupsY:
+                    rv.args.appendCustomType(
+                        "NumWorkGroupsY", static_cast<uint32_t>(rv.numWorkGroups.y), arg.type);
+                    break;
+                case CustomArgSemantic::NumWorkGroupsZ:
+                    rv.args.appendCustomType(
+                        "NumWorkGroupsZ", static_cast<uint32_t>(rv.numWorkGroups.z), arg.type);
+                    break;
 
                 // ---- DataParallel scheduling args ----
                 case CustomArgSemantic::ItersPerTile:

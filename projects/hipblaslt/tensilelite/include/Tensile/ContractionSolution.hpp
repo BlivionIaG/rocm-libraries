@@ -180,7 +180,11 @@ namespace TensileLite
         X_MACRO(RR_MagicMultipleWgmMainBlock) \
         X_MACRO(RR_MagicShiftAndSignWgmMainBlock) \
         X_MACRO(AddressScaleZeroA) \
-        X_MACRO(ScaleBlockSizeA)
+        X_MACRO(ScaleBlockSizeA) \
+        /* Per-dimension launched grid; unlike NumWorkGroups they are never flattened. */ \
+        X_MACRO(NumWorkGroupsX) \
+        X_MACRO(NumWorkGroupsY) \
+        X_MACRO(NumWorkGroupsZ)
 
     enum class CustomArgSemantic
     {
