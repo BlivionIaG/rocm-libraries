@@ -141,6 +141,12 @@ NO_BUFFER_OOB_KERNELS = {
     "wvSpltK_bf16_tn_m1": "rocBLAS wvSpltK, global_store only",
     "wvSpltK_bf16_tn_m2": "rocBLAS wvSpltK, global_store only",
     "wvSpltK_bf16_tn_m4": "rocBLAS wvSpltK, global_store only",
+    "gemm_BM4_TN4_LANES_K16_WAVES2_UP_ITERS0_PARTIAL_STEPS1_PF1_GROUP1_NUM_XCDS1_GRID_3D1_SKINNY_N": "skinny MXFP8, exact-size buffer stores",
+    "gemm_BM4_TN4_LANES_K16_WAVES2_UP_ITERS0_PARTIAL_STEPS1_PF1_GROUP1_NUM_XCDS1_GRID_3D1_SKINNY_M": "skinny MXFP8, exact-size buffer stores",
+    "gemm_BM3_TN5_LANES_K64_WAVES1_UP_ITERS0_PARTIAL_STEPS1_PF1_GROUP1_NUM_XCDS1_GRID_3D1_SKINNY_N": "skinny MXFP8, exact-size buffer stores",
+    "gemm_BM3_TN5_LANES_K64_WAVES1_UP_ITERS0_PARTIAL_STEPS1_PF1_GROUP1_NUM_XCDS1_GRID_3D1_SKINNY_M": "skinny MXFP8, exact-size buffer stores",
+    "gemm_BM2_TN2_LANES_K16_WAVES2_UP_ITERS0_PARTIAL_STEPS1_PF1_GROUP1_NUM_XCDS1_GRID_3D1_SKINNY_N": "skinny MXFP8, exact-size buffer stores",
+    "gemm_BM2_TN2_LANES_K16_WAVES2_UP_ITERS0_PARTIAL_STEPS1_PF1_GROUP1_NUM_XCDS1_GRID_3D1_SKINNY_M": "skinny MXFP8, exact-size buffer stores",
 }
 # HIP-compiled W4A16 decode: a single 64-bit global_store, kept inside an exec
 # mask against the free size taken at entry.

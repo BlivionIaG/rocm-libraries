@@ -20,6 +20,7 @@ external manifest.
 | `aiter/`      | External: AITER-sourced GEMM kernels.             |
 | `ck/`         | External: Composable Kernel-sourced kernels.     |
 | `rocblas/`    | External: rocBLAS wvSpltK skinny-GEMM kernels.   |
+| `skinny_mxfp8/` | External: skinny MXFP8 emitter kernels.         |
 | `rocroller/`  | External: rocRoller-sourced kernels.              |
 | `wave/`       | External: Wave (handwritten) kernels.             |
 | `triton/`     | External: Triton-compiled GEMM kernels.           |
