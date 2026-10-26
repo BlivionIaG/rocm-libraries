@@ -23,8 +23,10 @@ the NumPy harness, which is loaded read-only):
     cd projects/hipblaslt/tensilelite && \
         python -m tensilelite.KernelGenerators.SkinnyGEMMLogic [--rows ROWS.yaml] [--output PATH] [--list]
 
-A rows file is a YAML list; one row routes a range of problems (batch fixed to
-1, -1 is an unbounded upper end) to one pool entry:
+The rows default to data/SkinnyGEMMRows.yaml, which SkinnyGEMMTune.py writes (see the
+README of this directory), so the plain command reproduces the committed logic file;
+an empty rows file gives the pool only. A rows file is a YAML list; one row routes a
+range of problems (batch fixed to 1, -1 is an unbounded upper end) to one pool entry:
 
     - range: [m_lo, m_hi, n_lo, n_hi, 1, 1, k_lo, k_hi]
       params: {bm: 1, tn: 1, lanesK: 16, waves: 1, prefetch: 1, upIters: 0, partialSteps: 1, group: 1, numXcds: 1, grid3d: true}
@@ -44,6 +46,7 @@ _TENSILELITE_DIR = Path(__file__).resolve().parents[2]
 
 LOGIC_DIR = _HIPBLASLT_DIR / "library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx950/gfx950"
 ORIGAMI_LOGIC = LOGIC_DIR / "Origami" / f"{_PROBLEM_FILE}.yaml"
+DEFAULT_ROWS = Path(__file__).resolve().parent / "data" / "SkinnyGEMMRows.yaml"
 OUTPUT_LOGIC = LOGIC_DIR / "Range" / f"{_PROBLEM_FILE}_SkinnyGEMM.yaml"
 SUPPORT_MODULE = _TENSILELITE_DIR / "tests/tensilelite/bindings/skinny_gemm_support.py"
 
@@ -81,7 +84,7 @@ def asParams(knobs: Knobs) -> Dict[str, Any]:
     return dict(zip(SkinnyGEMM.PARAMETERS, knobs))
 
 
-def _toKnobs(params: Dict[str, Any]) -> Knobs:
+def to_knobs(params: Dict[str, Any]) -> Knobs:
     return tuple(params[key] for key in SkinnyGEMM.PARAMETERS)
 
 
@@ -226,7 +229,7 @@ def readRoutingRows(path: Path, pool: Pool) -> List[RoutingRow]:
         if not isinstance(row, dict) or set(row) != {"range", "params"}:
             raise ValueError(f"routing row {number} must have exactly the keys range and params")
         key = _checkRowKey(number, row["range"])
-        knobs = _toKnobs(SkinnyGEMM.validateParams(row["params"]))
+        knobs = to_knobs(SkinnyGEMM.validateParams(row["params"]))
         if knobs not in indexOf:
             raise ValueError(f"routing row {number} names a knob set that is not in the pool: {row['params']}")
         routing.append((key, indexOf[knobs]))
@@ -252,11 +255,11 @@ def headerLines(path: Path) -> List[str]:
     return lines
 
 
-def _flowList(values: Sequence[Any]) -> str:
+def flow_list(values: Sequence[Any]) -> str:
     return "[" + ", ".join(str(value) for value in values) + "]"
 
 
-def _renderParams(knobs: Knobs) -> str:
+def render_params(knobs: Knobs) -> str:
     items = (f"{key}: {str(value).lower() if isinstance(value, bool) else value}"
              for key, value in asParams(knobs).items())
     return "{" + ", ".join(items) + "}"
@@ -266,11 +269,11 @@ def _renderSolution(index: int, knobs: Knobs) -> List[str]:
     return [f"- SolutionIndex: {index}",
             "  CustomKernel:",
             "    generator: SkinnyGEMM",
-            f"    generatorParams: {_renderParams(knobs)}"]
+            f"    generatorParams: {render_params(knobs)}"]
 
 
 def _renderRow(key: Sequence[int], index: int) -> List[str]:
-    return [f"- - {_flowList(key)}", f"  - [{index}, 0.0]"]
+    return [f"- - {flow_list(key)}", f"  - [{index}, 0.0]"]
 
 
 def renderLogic(header: Sequence[str], pool: Pool, routingRows: Sequence[RoutingRow]) -> str:
@@ -281,7 +284,7 @@ def renderLogic(header: Sequence[str], pool: Pool, routingRows: Sequence[Routing
     lines.append("Solutions:")
     for index, knobs in enumerate(pool):
         lines += _renderSolution(index, knobs)
-    lines += [f"IndexOrder: {_flowList(range(8))}", "ExactLogic:"]
+    lines += [f"IndexOrder: {flow_list(range(8))}", "ExactLogic:"]
     for key, index in routingRows:
         lines += _renderRow(key, index)
     for index in range(len(pool)):
@@ -304,7 +307,7 @@ def _parseArgs(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Write the skinny MXFP8 GEMM logic file.")
     parser.add_argument("--origami", type=Path, default=ORIGAMI_LOGIC, help="Origami logic that provides the header")
     parser.add_argument("--output", type=Path, default=OUTPUT_LOGIC, help="logic file to write")
-    parser.add_argument("--rows", type=Path, default=None, help="YAML file of routing rows")
+    parser.add_argument("--rows", type=Path, default=DEFAULT_ROWS, help="YAML file of routing rows")
     parser.add_argument("--list", action="store_true", help="print the pool as a Markdown table and exit")
     return parser.parse_args(argv)
 
@@ -315,7 +318,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.list:
         print(renderTable(pool), end="")
         return
-    routingRows = readRoutingRows(args.rows, pool) if args.rows else []
+    routingRows = readRoutingRows(args.rows, pool)
     text = renderLogic(headerLines(args.origami), pool, routingRows)
     args.output.write_text(text, encoding="utf-8")
 

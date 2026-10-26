@@ -153,8 +153,8 @@ class TestRows:
         indexOf = {knobs: index for index, knobs in enumerate(pool)}
         routing = SkinnyGEMMLogic.readRoutingRows(path, pool)
         assert routing == [
-            (row["range"], indexOf[SkinnyGEMMLogic._toKnobs(row["params"])]),
-            (other["range"], indexOf[SkinnyGEMMLogic._toKnobs(other["params"])]),
+            (row["range"], indexOf[SkinnyGEMMLogic.to_knobs(row["params"])]),
+            (other["range"], indexOf[SkinnyGEMMLogic.to_knobs(other["params"])]),
         ]
 
     @pytest.mark.parametrize("change, message", [
@@ -179,7 +179,8 @@ class TestRows:
 class TestMain:
     def test_committed_file_is_current(self, pool):
         header = SkinnyGEMMLogic.headerLines(SkinnyGEMMLogic.ORIGAMI_LOGIC)
-        expected = SkinnyGEMMLogic.renderLogic(header, pool, [])
+        rows = SkinnyGEMMLogic.readRoutingRows(SkinnyGEMMLogic.DEFAULT_ROWS, pool)
+        expected = SkinnyGEMMLogic.renderLogic(header, pool, rows)
         assert SkinnyGEMMLogic.OUTPUT_LOGIC.read_text(encoding="utf-8") == expected
 
     def test_writes_the_output(self, tmp_path, pool):
