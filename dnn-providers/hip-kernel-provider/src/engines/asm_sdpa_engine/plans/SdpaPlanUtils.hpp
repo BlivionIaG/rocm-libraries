@@ -8,12 +8,17 @@
 #include <hip/hip_runtime.h>
 #include <hip_kernel_provider_common/HipDeviceUtils.hpp>
 #include <hipdnn_flatbuffers_sdk/data_objects/sdpa_attributes_generated.h>
+#include <hipdnn_flatbuffers_sdk/data_objects/tensor_attributes_generated.h>
 #include <hipdnn_plugin_sdk/PluginApiDataTypes.h>
 #include <hipdnn_plugin_sdk/PluginException.hpp>
 #include <hipdnn_plugin_sdk/PluginLogging.hpp>
+#include <hipdnn_plugin_sdk/RuntimePassByValue.hpp>
 #include <initializer_list>
+#include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 
 namespace asm_sdpa_engine
 {
@@ -227,12 +232,91 @@ inline std::optional<std::string> tryGetDeviceString(hipStream_t stream, const c
     }
 }
 
+// =============================================================================
+// Attention scale
+// =============================================================================
+
 // The attention scale the kernels apply when the graph has no scale tensor:
 // attn_scale_value, or 1.0 (no scaling, cuDNN's default) when it is unset.
 template <typename SdpaAttrsT>
 float attnScaleOrDefault(const SdpaAttrsT& attrs)
 {
     return attrs.attn_scale_value().value_or(1.0f);
+}
+
+// True when the kernels apply this attention scale correctly: a finite, positive,
+// normal float (FLT_MIN <= scale <= FLT_MAX, so NaN fails). cuDNN and hipDNN
+// accept any scale value, so the engine must decline the others.
+//
+// The kernels write -inf into every masked score (causal and sliding-window masks,
+// and the padding past S_kv in the last K tile) and only then multiply the scores
+// by scale * log2(e). A scale of 0 turns those scores into NaN (-inf * 0), and a
+// negative scale turns them into +inf. The bf16 forward kernels also start the
+// running row max at -FLT_MAX / (scale * log2(e)), which is positive for a negative
+// scale or -0.0, so every exp2 overflows even with no mask. 32-bit denormals are
+// flushed, so a subnormal scale acts as 0. (From the gfx942 .co disassembly; the
+// gfx950 forward kernels contain the same code.)
+inline bool isSupportedAttnScale(float scale)
+{
+    return scale >= std::numeric_limits<float>::min() && scale <= std::numeric_limits<float>::max();
+}
+
+// An attention scale as text, for decline reasons and errors.
+inline std::string attnScaleToString(float scale)
+{
+    std::ostringstream text;
+    text << scale;
+    return text.str();
+}
+
+// The attention scale the kernels will receive, if it is known before execute:
+// attn_scale_value or its default when the graph has no scale tensor, or else the
+// value of a compile-time constant or runtime-with-default pass-by-value scale
+// tensor, which buildPlan bakes. Narrowed to the f32 kernarg, as execute narrows
+// it. std::nullopt for a pure runtime pass-by-value scale tensor, whose value
+// arrives at execute. Throws, as buildPlan would, when the scale tensor's value
+// cannot be read.
+template <typename SdpaAttrsT>
+std::optional<float> attnScaleBeforeExecute(
+    const SdpaAttrsT& attrs,
+    const std::unordered_map<int64_t,
+                             const hipdnn_flatbuffers_sdk::data_objects::TensorAttributes*>&
+        tensorMap)
+{
+    if(!attrs.scale_tensor_uid().has_value())
+    {
+        return attnScaleOrDefault(attrs);
+    }
+    const auto operand = hipdnn_plugin_sdk::makeScalarOperand(
+        tensorMap, attrs.scale_tensor_uid().value(), "attn_scale");
+    if(operand.isRuntimeUserSupplied)
+    {
+        return std::nullopt;
+    }
+    return static_cast<float>(hipdnn_plugin_sdk::toDouble(operand.bakedDefault));
+}
+
+// Resolves the attention scale into the f32 kernarg at execute. Throws
+// HipdnnPluginException(HIPDNN_PLUGIN_STATUS_BAD_PARAM) for a scale the kernels
+// mishandle (see isSupportedAttnScale), so call it before the first launch.
+// isApplicable declines every other such scale, so only a pure runtime
+// pass-by-value scale tensor can fail here.
+inline float resolveSupportedAttnScale(const hipdnn_plugin_sdk::ScalarOperand& attnScale,
+                                       const hipdnnPluginDeviceBuffer_t* deviceBuffers,
+                                       uint32_t numDeviceBuffers,
+                                       const char* caller)
+{
+    const auto scale = static_cast<float>(hipdnn_plugin_sdk::toDouble(
+        hipdnn_plugin_sdk::resolveScalarOperand(attnScale, deviceBuffers, numDeviceBuffers)));
+    if(!isSupportedAttnScale(scale))
+    {
+        throw hipdnn_plugin_sdk::HipdnnPluginException(
+            HIPDNN_PLUGIN_STATUS_BAD_PARAM,
+            std::string(caller)
+                + ": attention scale must be a finite, positive, normal float (Actual value: "
+                + attnScaleToString(scale) + ")");
+    }
+    return scale;
 }
 
 } // namespace plan_utils
