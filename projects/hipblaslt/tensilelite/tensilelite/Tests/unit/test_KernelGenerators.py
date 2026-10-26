@@ -52,6 +52,7 @@ EXPECTED_ARGS = [
     {"type": "address", "semantic": "AddressMXScaleA"},
     {"type": "address", "semantic": "AddressMXScaleB"},
     {"type": "uint64", "semantic": "ConstantZero"},
+    {"type": "address", "semantic": "AddressC"},
     {"type": "int32", "semantic": "StrideD0"},
     {"type": "int32", "semantic": "StrideA0"},
     {"type": "int32", "semantic": "StrideB0"},
@@ -59,6 +60,9 @@ EXPECTED_ARGS = [
     {"type": "int32", "semantic": "SizeFree1"},
     {"type": "int32", "semantic": "SizeSum"},
     {"type": "int32", "semantic": "SizeSum"},
+    {"type": "int32", "semantic": "StrideC0"},
+    {"type": "float32", "semantic": "Alpha"},
+    {"type": "float32", "semantic": "Beta"},
 ]
 
 COMMON_ASSERTS = {
@@ -660,11 +664,12 @@ def test_real_source_is_code_object_v6():
 def test_real_emitted_arguments_match_the_declared_ones(params):
     explicit = emittedExplicitArgs(SkinnyGEMM.emit(params, "gfx950"))
     declared = SkinnyGEMM.args()
-    assert len(explicit) == len(declared) == 13
+    assert len(explicit) == len(declared) == 17
     assert [arg[".name"] for arg in explicit] == [
-        "D", "A", "B", "scalesA", "scalesB", "ws", "ldD", "ldA", "ldB", "m", "n", "k", "spk",
+        "D", "A", "B", "scalesA", "scalesB", "ws", "C", "ldD", "ldA", "ldB", "m", "n", "k", "spk",
+        "ldC", "alpha", "beta",
     ]
-    sizes = {"address": 8, "uint64": 8, "int32": 4}
+    sizes = {"address": 8, "uint64": 8, "int32": 4, "float32": 4}
     offset = 0
     for emitted, arg in zip(explicit, declared):
         assert emitted[".size"] == sizes[arg["type"]]

@@ -37,8 +37,8 @@ namespace {
 
 /// Kernarg offsets of the GEMM kernel's arguments.
 struct SkinnyArguments {
-  int32_t d, a, b, scalesA, scalesB, ws;
-  int32_t ldD, ldA, ldB, m, n, k, spk;
+  int32_t d, a, b, scalesA, scalesB, ws, c;
+  int32_t ldD, ldA, ldB, m, n, k, spk, ldC, alpha, beta;
   int32_t blocksX, blocksY, blocksZ;
 };
 
@@ -372,6 +372,7 @@ private:
   void storeTile(const EpilogueState &state, const StoreTarget &target);
   StoreScalars makeStoreScalars(const EpilogueState &state,
                                 const StoreTarget &target);
+  void scaleByAlpha(const EpilogueState &state);
   void storeMasked(const EpilogueState &state, const StoreTarget &target);
   void storeRun(const EpilogueState &state, const StoreTarget &target,
                 const StoreScalars &scalars, int32_t r, int32_t t,
@@ -414,6 +415,8 @@ private:
 
   // SGPRs that live through the K loop and the epilogue.
   RegisterRange sRsrc, wRsrc, sSclRsrc, wSclRsrc, dRsrc, wsRsrc;
+  // The pair holds alpha in its low dword, as v_pk_mul_f32 needs 2 SGPRs.
+  RegisterRange alpha;
   RegisterRange k, spk, mn;
   RegisterRange dStrideS, dStrideW, wsStrideS, wsStrideW;
   RegisterRange skinnyCols, wideCols, contigS;
@@ -576,10 +579,11 @@ SkinnyGEMMEmitter::SkinnyGEMMEmitter(Kernel &kernel,
       scaleGroup(dims.partialSteps != 0 ? std::optional<RegisterRange>(vgpr())
                                         : std::nullopt),
       sRsrc(sgpr(4, 4)), wRsrc(sgpr(4, 4)), sSclRsrc(sgpr(4, 4)),
-      wSclRsrc(sgpr(4, 4)), dRsrc(sgpr(4, 4)), wsRsrc(sgpr(4, 4)), k(sgpr()),
-      spk(sgpr()), mn(sgpr()), dStrideS(sgpr()), dStrideW(sgpr()),
-      wsStrideS(sgpr()), wsStrideW(sgpr()), skinnyCols(sgpr()),
-      wideCols(sgpr()), contigS(sgpr()), s0(sgpr()), nIterFull(sgpr()),
+      wSclRsrc(sgpr(4, 4)), dRsrc(sgpr(4, 4)), wsRsrc(sgpr(4, 4)),
+      alpha(sgpr(2, 2)), k(sgpr()), spk(sgpr()), mn(sgpr()), dStrideS(sgpr()),
+      dStrideW(sgpr()), wsStrideS(sgpr()), wsStrideW(sgpr()),
+      skinnyCols(sgpr()), wideCols(sgpr()), contigS(sgpr()), s0(sgpr()),
+      nIterFull(sgpr()),
       fitRot(dims.upIters != 1 ? std::optional<RegisterRange>(sgpr())
                                : std::nullopt),
       kBaseIter(sgpr()),
@@ -658,6 +662,7 @@ void SkinnyGEMMEmitter::setupResources(SetupScalars &scalars) {
   if (scalars.blocksY)
     kernel.loadArgument(scalars.blocksY->ref(), arguments.blocksY);
   kernel.loadArgument(spk.ref(), arguments.spk);
+  kernel.loadArgument(alpha.ref(0, 1), arguments.alpha);
   kernel.loadArgument(k.ref(), arguments.k);
   kernel.loadArgument(resources.n.ref(), arguments.n);
   kernel.loadArgument(resources.m.ref(), arguments.m);
@@ -2653,6 +2658,7 @@ void SkinnyGEMMEmitter::emitEpilogueVariant(bool skinnyContiguous) {
   std::shared_ptr<rocisa::Label> done = builder.createLabel("stored");
   builder.create<rocisa::SCmpLeU32>(k.container(), spk.container());
   builder.create<rocisa::SCBranchSCC0>(workspace->getLabelName());
+  scaleByAlpha(state);
   storeTile(state, StoreTarget{dRsrc.ref(), dStrideS.ref(), dStrideW.ref(),
                                std::nullopt, true});
   builder.create<rocisa::SBranch>(done->getLabelName());
@@ -2847,6 +2853,34 @@ void SkinnyGEMMEmitter::computeOffset(const EpilogueState &state,
   builder.movb32(state.off, shifted);
 }
 
+// Multiplies the reduced values by alpha, in f32 and before the bf16
+// truncation, two at a time with v_pk_mul_f32 where the pair is even aligned.
+// The pair reads the low dword of alpha for both halves (op_sel_hi).
+void SkinnyGEMMEmitter::scaleByAlpha(const EpilogueState &state) {
+  int32_t length = state.layout.runs ? runLength(state.layout.skinnyContiguous)
+                                     : dims.accumulators;
+  int32_t segments = dims.accumulators / length;
+  int32_t stride = state.layout.runs ? state.layout.stride : length;
+  for (int32_t segment = 0; segment < segments; ++segment) {
+    for (int32_t i = 0; i < length;) {
+      RegisterRef values = state.red.slice(segment * stride + i);
+      bool pair = i + 1 < length && values.start % 2 == 0;
+      if (!pair) {
+        builder.create<rocisa::VMulF32>(values.container(),
+                                        alpha.ref(0, 1).container(),
+                                        values.container());
+        ++i;
+        continue;
+      }
+      values = state.red.slice(segment * stride + i, 2);
+      builder.create<rocisa::VMulPKF32>(values.container(), alpha.container(),
+                                        values.container(),
+                                        rocisa::VOP3PModifiers({}, {0, 1}));
+      i += 2;
+    }
+  }
+}
+
 // One store per element: bf16 is the truncation, the top 16 bits of the f32.
 void SkinnyGEMMEmitter::storeMasked(const EpilogueState &state,
                                     const StoreTarget &target) {
@@ -2934,10 +2968,14 @@ namespace {
 struct ReduceArguments {
   int32_t d;
   int32_t ws;
+  int32_t c;
   int32_t ldD;
   int32_t m;
   int32_t n;
   int32_t splits;
+  int32_t ldC;
+  int32_t alpha;
+  int32_t beta;
 };
 
 // Emits @splitk_reduce of the MLIR reference, one method per part of it.
@@ -2947,7 +2985,9 @@ public:
       : kernel(kernel), builder(kernel.builder()), offsets(offsets),
         splits(builder.allocateSgpr(1)), n(builder.allocateSgpr(1)),
         m(builder.allocateSgpr(1)), ldD(builder.allocateSgpr(1)),
-        wsRsrc(builder.allocateSgpr(4, 4)), dRsrc(builder.allocateSgpr(4, 4)),
+        ldC(builder.allocateSgpr(1)), alpha(builder.allocateSgpr(1)),
+        beta(builder.allocateSgpr(1)), wsRsrc(builder.allocateSgpr(4, 4)),
+        dRsrc(builder.allocateSgpr(4, 4)), cRsrc(builder.allocateSgpr(4, 4)),
         tmp(builder.allocateSgpr(1)), rowBytes(builder.allocateSgpr(1)),
         sliceBytes(builder.allocateSgpr(1)), split(builder.allocateSgpr(1)),
         savedExec(builder.allocateSgpr(2, 2)), row(builder.allocateVgpr(1)),
@@ -2959,8 +2999,12 @@ public:
     kernel.loadArgument(n.ref(), offsets.n);
     kernel.loadArgument(m.ref(), offsets.m);
     kernel.loadArgument(ldD.ref(), offsets.ldD);
+    kernel.loadArgument(ldC.ref(), offsets.ldC);
+    kernel.loadArgument(alpha.ref(), offsets.alpha);
+    kernel.loadArgument(beta.ref(), offsets.beta);
     kernel.loadArgument(wsRsrc.ref(0, 2), offsets.ws);
     kernel.loadArgument(dRsrc.ref(0, 2), offsets.d);
+    kernel.loadArgument(cRsrc.ref(0, 2), offsets.c);
     computeRows();
     makeResources();
     sumSplits();
@@ -2976,7 +3020,7 @@ private:
     builder.shli32(tmp.ref(), kernel.workgroupIdX().ref(), 8);
     builder.addi32(row.ref(), tmp, tid);
     // Scalar loads return out of order, so only lgkmcnt(0) guarantees any of
-    // the six arguments.
+    // the arguments.
     builder.createWaitCnt(WaitCounts{.scalarMemory = 0});
     builder.create<rocisa::VCmpGtU32>(std::make_shared<rocisa::VCC>(),
                                       m.container(), row.container());
@@ -2986,20 +3030,27 @@ private:
     builder.minsi32(row.ref(), tmp.ref(), row.ref());
   }
 
-  // Descriptors of ws (wsBytes) and D (dBytes), which bound the accesses.
+  // Descriptors of ws (wsBytes), D (dBytes) and C (cBytes), which bound the
+  // accesses.
   void makeResources() {
     builder.shli32(rowBytes.ref(), m.ref(), 2);
     builder.muli32(sliceBytes.ref(), n, rowBytes);
     builder.muli32(wsRsrc.ref(2), splits, sliceBytes);
-    // dBytes = ((n - 1) * ldD + m) * 2, as (2n - 2) * ldD + 2m.
-    RegisterRef dBytes = dRsrc.ref(2);
-    builder.shli32(dBytes, n.ref(), 1);
-    builder.addi32(dBytes, dBytes, -2);
-    builder.muli32(dBytes, dBytes, ldD);
-    builder.shli32(tmp.ref(), m.ref(), 1);
-    builder.addi32(dBytes, dBytes, tmp);
+    columnMajorBytes(dRsrc.ref(2), ldD.ref());
+    columnMajorBytes(cRsrc.ref(2), ldC.ref());
     builder.makeRsrc(wsRsrc.ref(), wsRsrc.ref(0, 2), wsRsrc.ref(2));
-    builder.makeRsrc(dRsrc.ref(), dRsrc.ref(0, 2), dBytes);
+    builder.makeRsrc(dRsrc.ref(), dRsrc.ref(0, 2), dRsrc.ref(2));
+    builder.makeRsrc(cRsrc.ref(), cRsrc.ref(0, 2), cRsrc.ref(2));
+  }
+
+  // bytes = ((n - 1) * ld + m) * 2, as (2n - 2) * ld + 2m, the extent of a
+  // column-major bf16 matrix.
+  void columnMajorBytes(RegisterRef bytes, RegisterRef ld) {
+    builder.shli32(bytes, n.ref(), 1);
+    builder.addi32(bytes, bytes, -2);
+    builder.muli32(bytes, bytes, ld);
+    builder.shli32(tmp.ref(), m.ref(), 1);
+    builder.addi32(bytes, bytes, tmp);
   }
 
   // sum = the f32 sum over the splits. Each lane loads its element of ws at
@@ -3028,26 +3079,21 @@ private:
     builder.create<rocisa::SCBranchSCC1>(loop->getLabelName());
   }
 
-  // Truncates the sum to bf16 and stores it where inRange.
+  // Computes D = bf16(fma(beta, C, alpha * sum)) and stores it where inRange.
   void storeBf16() {
     RegisterRef sum = row.ref();
-    RegisterRef tid = kernel.workitemId().ref();
-    RegisterRef blockX = kernel.workgroupIdX().ref();
-    // truncf keeps the top 16 bits instead of rounding to nearest.
-    builder.shrui32(sum, sum, 16);
+    builder.create<rocisa::VMulF32>(sum.container(), alpha.container(),
+                                    sum.container());
     std::shared_ptr<rocisa::Label> skip = builder.createLabel("skip");
     builder.create<rocisa::SAndSaveExecB64>(savedExec.container(),
                                             std::make_shared<rocisa::VCC>());
     builder.create<rocisa::SCBranchVCCZ>(skip->getLabelName());
-    // dOff = (j * ldD + i) * 2, recomputed from the thread id; the load
-    // address register is dead.
+    addBetaC(sum);
+    // truncf keeps the top 16 bits instead of rounding to nearest.
+    builder.shrui32(sum, sum, 16);
+    // The load address register is dead.
     RegisterRef dOff = value.ref();
-    builder.shli32(dOff, tid, 1);
-    builder.shli32(tmp.ref(), blockX, 9);
-    builder.addi32(dOff, tmp, dOff);
-    builder.muli32(tmp.ref(), kernel.workgroupIdY(), ldD);
-    builder.shli32(tmp.ref(), tmp.ref(), 1);
-    builder.addi32(dOff, tmp, dOff);
+    columnMajorOffset(dOff, ldD.ref());
     builder.storeBuffer(sum, dRsrc.ref(), dOff, 0, MemoryWidth::b16);
     builder.insert(skip);
     builder.create<rocisa::SMovB64>(std::make_shared<rocisa::EXEC>(),
@@ -3055,11 +3101,40 @@ private:
     builder.createEndProgram();
   }
 
+  // sum = fma(beta, C, sum) for the lanes in range, skipped, without loading
+  // C, when beta is zero. The sign bit is masked so that -0.0 counts as zero.
+  void addBetaC(RegisterRef sum) {
+    std::shared_ptr<rocisa::Label> noBeta = builder.createLabel("no_beta");
+    builder.andi32(tmp.ref(), beta.ref(), 0x7fffffff);
+    builder.create<rocisa::SCmpEQU32>(tmp.container(), 0);
+    builder.create<rocisa::SCBranchSCC1>(noBeta->getLabelName());
+    // The load overwrites its address register.
+    RegisterRef c = value.ref();
+    columnMajorOffset(c, ldC.ref());
+    builder.loadBuffer(c, cRsrc.ref(), c, 0, MemoryWidth::b16);
+    builder.createWaitCnt(WaitCounts{.vectorLoads = 0});
+    // bf16 widens to f32 by a left shift, exactly.
+    builder.shli32(c, c, 16);
+    builder.create<rocisa::VMacF32>(sum.container(), beta.container(),
+                                    c.container());
+    builder.insert(noBeta);
+  }
+
+  // off = (j * ld + i) * 2 for the thread's element, from the thread id.
+  void columnMajorOffset(RegisterRef off, RegisterRef ld) {
+    builder.shli32(off, kernel.workitemId().ref(), 1);
+    builder.shli32(tmp.ref(), kernel.workgroupIdX().ref(), 9);
+    builder.addi32(off, tmp, off);
+    builder.muli32(tmp.ref(), kernel.workgroupIdY(), ld);
+    builder.shli32(tmp.ref(), tmp.ref(), 1);
+    builder.addi32(off, tmp, off);
+  }
+
   Kernel &kernel;
   IRBuilder &builder;
   ReduceArguments offsets;
-  RegisterRange splits, n, m, ldD, wsRsrc, dRsrc, tmp, rowBytes, sliceBytes,
-      split, savedExec, row, base, value;
+  RegisterRange splits, n, m, ldD, ldC, alpha, beta, wsRsrc, dRsrc, cRsrc, tmp,
+      rowBytes, sliceBytes, split, savedExec, row, base, value;
 };
 
 } // namespace
@@ -3101,6 +3176,7 @@ static SkinnyArguments declareArguments(KernelSignature &signature) {
   arguments.scalesA = signature.addPointer("scalesA");
   arguments.scalesB = signature.addPointer("scalesB");
   arguments.ws = signature.addPointer("ws");
+  arguments.c = signature.addPointer("C");
   arguments.ldD = signature.addScalar("ldD", 4);
   arguments.ldA = signature.addScalar("ldA", 4);
   arguments.ldB = signature.addScalar("ldB", 4);
@@ -3108,6 +3184,10 @@ static SkinnyArguments declareArguments(KernelSignature &signature) {
   arguments.n = signature.addScalar("n", 4);
   arguments.k = signature.addScalar("k", 4);
   arguments.spk = signature.addScalar("spk", 4);
+  arguments.ldC = signature.addScalar("ldC", 4);
+  // The f32 scalars only need their size: the metadata has no value type.
+  arguments.alpha = signature.addScalar("alpha", 4);
+  arguments.beta = signature.addScalar("beta", 4);
   signature.addHidden(KernelArgumentKind::hiddenGroupSizeX, 4);
   signature.addHidden(KernelArgumentKind::hiddenGroupSizeY, 4);
   signature.addHidden(KernelArgumentKind::hiddenGroupSizeZ, 4);
@@ -3170,10 +3250,14 @@ std::string rocm::tensilelite::emitSplitKReduce(const Target &target) {
   ReduceArguments offsets;
   offsets.d = signature.addPointer("D");
   offsets.ws = signature.addPointer("ws");
+  offsets.c = signature.addPointer("C");
   offsets.ldD = signature.addScalar("ldD", 4);
   offsets.m = signature.addScalar("m", 4);
   offsets.n = signature.addScalar("n", 4);
   offsets.splits = signature.addScalar("splits", 4);
+  offsets.ldC = signature.addScalar("ldC", 4);
+  offsets.alpha = signature.addScalar("alpha", 4);
+  offsets.beta = signature.addScalar("beta", 4);
   signature.addHidden(KernelArgumentKind::hiddenGroupSizeX, 4);
   signature.addHidden(KernelArgumentKind::hiddenGroupSizeY, 4);
   signature.addHidden(KernelArgumentKind::hiddenGroupSizeZ, 4);

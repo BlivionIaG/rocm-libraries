@@ -45,12 +45,16 @@ std::string skinnyGEMMKernelName(const SkinnyGEMMConfig &config);
 /// Emits the GEMM kernel as the assembly text of one kernel, for
 /// assembleToHSACO, replicating the behavior and the schedule of the MLIR
 /// reference, for any upIters and partialSteps (the partial K steps handle a k
-/// or spk that is not a multiple of 64 * lanesK). The kernargs are the pointers
-/// D, A, B, scalesA, scalesB and ws, then ldD, ldA, ldB, m, n, k and spk (i32),
-/// then the hidden group sizes x, y, z and block counts x, y, z, in the layout
-/// of the reference. The block is (64 * waves, 1, 1). With a single split the
-/// kernel stores bf16 into D, else each split stores its f32 slice into the
-/// workspace, which splitk_reduce sums. BN = waves * (64 / lanesK) * tn.
+/// or spk that is not a multiple of 64 * lanesK). The kernargs, with their
+/// byte offsets, are the pointers D (0), A (8), B (16), scalesA (24), scalesB
+/// (32), ws (40) and C (48), then the i32 ldD (56), ldA (60), ldB (64), m (68),
+/// n (72), k (76), spk (80) and ldC (84), then the f32 alpha (88) and beta
+/// (92), then the hidden group sizes x, y, z (96 to 104) and block counts x, y,
+/// z (108 to 116), for a segment size of 120. The block is (64 * waves, 1, 1).
+/// With a single split the kernel stores D = the bf16 truncation (top 16 bits)
+/// of alpha * acc, else each split stores its raw f32 slice into the
+/// workspace, which splitk_reduce sums and scales. The kernel does not read C,
+/// ldC or beta. BN = waves * (64 / lanesK) * tn.
 ///
 /// grid3d = true: the grid is (ceil(max(m, n) / BN), ceil(min(m, n) / bm),
 /// ceil(k / spk)) and the block (x, y, z) is the tile (tx, ty, kz). group and
@@ -72,14 +76,18 @@ std::string skinnyGEMMKernelName(const SkinnyGEMMConfig &config);
 std::string emitSkinnyGEMM(const codegen::Target &target,
                            const SkinnyGEMMConfig &config);
 
-/// Emits the split-K reduction kernel splitk_reduce:
-/// D[i, j] = the bf16 truncation (top 16 bits) of the f32 sum over z = 0..
-/// splits-1 of ws[z * m * n + j * m + i], summed in split order from 0.0. The
-/// kernargs are the pointers D (bf16, column stride ldD) and ws (f32), then
-/// ldD, m, n and splits (i32), then the hidden group sizes x, y, z and block
-/// counts x, y, z (4 bytes each, offsets 32 to 52, segment size 56). The block
-/// is (256, 1, 1) and the grid is (ceil(m / 256), n, 1); splits must be at
-/// least 1.
+/// Emits the split-K reduction kernel splitk_reduce: with sum[i, j] the f32
+/// sum over z = 0..splits-1 of ws[z * m * n + j * m + i], summed in split order
+/// from 0.0, D[i, j] = the bf16 truncation (top 16 bits) of fma(beta, C[i, j],
+/// alpha * sum[i, j]). C is read, as bf16 at C[j * ldC + i], only when beta is
+/// not zero (-0.0 counts as zero), so it may be uninitialized otherwise; it
+/// may alias D, and ldC is its own column stride. The kernargs, with their
+/// byte offsets, are the pointers D (0, bf16, column stride ldD), ws (8, f32)
+/// and C (16), then the i32 ldD (24), m (28), n (32), splits (36) and ldC
+/// (40), then the f32 alpha (44) and beta (48), then the hidden group sizes
+/// x, y, z (52 to 60) and block counts x, y, z (64 to 72), for a segment size
+/// of 80. The block is (256, 1, 1) and the grid is (ceil(m / 256), n, 1);
+/// splits must be at least 1.
 std::string emitSplitKReduce(const codegen::Target &target);
 
 } // namespace rocm::tensilelite

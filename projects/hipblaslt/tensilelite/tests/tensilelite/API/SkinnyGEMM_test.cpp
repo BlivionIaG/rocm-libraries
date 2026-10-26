@@ -186,7 +186,7 @@ TEST(SkinnyGEMM, AssemblyHasTheReferenceAbi) {
       assembly,
       {".name: gemm_BM1_TN1_LANES_K16_WAVES2_UP_ITERS0_PARTIAL_STEPS0_PF1_"
        "GROUP1_NUM_XCDS1_GRID_3D1",
-       ".kernarg_segment_size: 104", ".group_segment_fixed_size: 0",
+       ".kernarg_segment_size: 120", ".group_segment_fixed_size: 0",
        ".max_flat_workgroup_size: 128"});
   // The pointers, the scalars and the hidden arguments of the reference.
   expectLinesInOrder(
@@ -194,16 +194,18 @@ TEST(SkinnyGEMM, AssemblyHasTheReferenceAbi) {
       {".name: D",       ".offset: 0",  ".name: A",       ".offset: 8",
        ".name: B",       ".offset: 16", ".name: scalesA", ".offset: 24",
        ".name: scalesB", ".offset: 32", ".name: ws",      ".offset: 40",
-       ".name: ldD",     ".offset: 48", ".name: ldA",     ".offset: 52",
-       ".name: ldB",     ".offset: 56", ".name: m",       ".offset: 60",
-       ".name: n",       ".offset: 64", ".name: k",       ".offset: 68",
-       ".name: spk",     ".offset: 72"});
-  expectLinesInOrder(assembly, {".offset: 76", "hidden_group_size_x",
-                                ".offset: 80", "hidden_group_size_y",
-                                ".offset: 84", "hidden_group_size_z",
-                                ".offset: 88", "hidden_block_count_x",
-                                ".offset: 92", "hidden_block_count_y",
-                                ".offset: 96", "hidden_block_count_z"});
+       ".name: C",       ".offset: 48", ".name: ldD",     ".offset: 56",
+       ".name: ldA",     ".offset: 60", ".name: ldB",     ".offset: 64",
+       ".name: m",       ".offset: 68", ".name: n",       ".offset: 72",
+       ".name: k",       ".offset: 76", ".name: spk",     ".offset: 80",
+       ".name: ldC",     ".offset: 84", ".name: alpha",   ".offset: 88",
+       ".name: beta",    ".offset: 92"});
+  expectLinesInOrder(assembly, {".offset: 96", "hidden_group_size_x",
+                                ".offset: 100", "hidden_group_size_y",
+                                ".offset: 104", "hidden_group_size_z",
+                                ".offset: 108", "hidden_block_count_x",
+                                ".offset: 112", "hidden_block_count_y",
+                                ".offset: 116", "hidden_block_count_z"});
   EXPECT_NE(assembly.find(".amdhsa_system_sgpr_workgroup_id_y 1"),
             std::string::npos);
   EXPECT_NE(assembly.find(".amdhsa_system_sgpr_workgroup_id_z 1"),
@@ -870,10 +872,15 @@ TEST(SkinnyGEMM, PersistentLaunchAbi) {
             std::string::npos);
   EXPECT_EQ(assembly.find("workgroup_id_y"), std::string::npos);
   EXPECT_EQ(assembly.find("workgroup_id_z"), std::string::npos);
-  EXPECT_NE(assembly.find(".kernarg_segment_size: 104"), std::string::npos);
+  EXPECT_NE(assembly.find(".kernarg_segment_size: 120"), std::string::npos);
+  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 108"), 1);
+  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 112"), 0);
+  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 116"), 0);
+  // The kernel loads alpha but not C, ldC or beta.
   EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 88"), 1);
+  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 84"), 0);
   EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 92"), 0);
-  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 96"), 0);
+  EXPECT_EQ(countLinesContaining(assembly, "s[0:1], 48"), 0);
 }
 
 static std::ptrdiff_t
@@ -1071,35 +1078,66 @@ static std::vector<std::string> bodyMnemonics(const std::string &assembly) {
   return mnemonics;
 }
 
+// The reference schedule, with the alpha scaling after the sum and the beta
+// path (load C, widen, fmac) behind the uniform beta != 0 branch.
 TEST(SplitKReduce, EmitsTheReferenceSchedule) {
   std::string assembly = emitSplitKReduce(Target::get("gfx950"));
   SCOPED_TRACE("assembly:\n" + assembly);
+  // clang-format off
   std::vector<std::string> expected = {
       "s_load_dword",       "s_load_dword",   "s_load_dword",
+      "s_load_dword",       "s_load_dword",   "s_load_dword",
       "s_load_dword",       "s_load_dwordx2", "s_load_dwordx2",
-      "s_lshl_b32",         "v_add_u32",      "s_waitcnt",
-      "v_cmp_gt_u32",       "s_sub_u32",      "v_min_i32",
-      "s_lshl_b32",         "s_mul_i32",      "s_mul_i32",
+      "s_load_dwordx2",     "s_lshl_b32",     "v_add_u32",
+      "s_waitcnt",          "v_cmp_gt_u32",   "s_sub_u32",
+      "v_min_i32",          "s_lshl_b32",     "s_mul_i32",
+      "s_mul_i32",          "s_lshl_b32",     "s_add_u32",
+      "s_mul_i32",          "s_lshl_b32",     "s_add_u32",
       "s_lshl_b32",         "s_add_u32",      "s_mul_i32",
       "s_lshl_b32",         "s_add_u32",      "s_mov_b32",
-      "s_mov_b32",          "v_lshlrev_b32",  "s_mul_i32",
-      "v_add_u32",          "s_mov_b32",      "v_mov_b32",
-      "s_mul_i32",          "v_add_u32",      "buffer_load_dword",
-      "s_waitcnt",          "v_add_f32",      "s_add_u32",
-      "s_cmp_lt_i32",       "s_cbranch_scc1", "v_lshrrev_b32",
-      "s_and_saveexec_b64", "s_cbranch_vccz", "v_lshlrev_b32",
+      "s_mov_b32",          "s_mov_b32",      "v_lshlrev_b32",
+      "s_mul_i32",          "v_add_u32",      "s_mov_b32",
+      "v_mov_b32",          "s_mul_i32",      "v_add_u32",
+      "buffer_load_dword",  "s_waitcnt",      "v_add_f32",
+      "s_add_u32",          "s_cmp_lt_i32",   "s_cbranch_scc1",
+      "v_mul_f32",          "s_and_saveexec_b64", "s_cbranch_vccz",
+      "s_and_b32",          "s_cmp_eq_u32",   "s_cbranch_scc1",
+      "v_lshlrev_b32",      "s_lshl_b32",     "v_add_u32",
+      "s_mul_i32",          "s_lshl_b32",     "v_add_u32",
+      "buffer_load_ushort", "s_waitcnt",      "v_lshlrev_b32",
+      "v_fmac_f32",         "v_lshrrev_b32",  "v_lshlrev_b32",
       "s_lshl_b32",         "v_add_u32",      "s_mul_i32",
       "s_lshl_b32",         "v_add_u32",      "buffer_store_short",
       "s_mov_b64",          "s_endpgm"};
+  // clang-format on
   EXPECT_EQ(bodyMnemonics(assembly), expected);
-  EXPECT_EQ(countLinesContaining(assembly, " offen"), 2);
+  EXPECT_EQ(countLinesContaining(assembly, " offen"), 3);
 
-  expectLinesInOrder(
-      assembly, {"s[0:1], 28", "s[0:1], 24", "s[0:1], 20", "s[0:1], 16",
-                 "s[0:1], 8", "s[0:1], 0", "s_waitcnt lgkmcnt(0)",
-                 "v_cmp_gt_u32 vcc", "buffer_load_dword", "s_waitcnt vmcnt(0)",
-                 "v_lshrrev_b32", "s_and_saveexec_b64", "s_cbranch_vccz",
-                 "buffer_store_short", "s_mov_b64 exec", "s_endpgm"});
+  expectLinesInOrder(assembly, {"s[0:1], 36",
+                                "s[0:1], 32",
+                                "s[0:1], 28",
+                                "s[0:1], 24",
+                                "s[0:1], 40",
+                                "s[0:1], 44",
+                                "s[0:1], 48",
+                                "s[0:1], 8",
+                                "s[0:1], 0",
+                                "s[0:1], 16",
+                                "s_waitcnt lgkmcnt(0)",
+                                "v_cmp_gt_u32 vcc",
+                                "buffer_load_dword",
+                                "s_waitcnt vmcnt(0)",
+                                "v_mul_f32",
+                                "s_and_saveexec_b64",
+                                "s_cbranch_vccz",
+                                "s_cmp_eq_u32",
+                                "buffer_load_ushort",
+                                "s_waitcnt vmcnt(0)",
+                                "v_fmac_f32",
+                                "v_lshrrev_b32",
+                                "buffer_store_short",
+                                "s_mov_b64 exec",
+                                "s_endpgm"});
 }
 
 // The reduce kernel declares the reference's hidden arguments.
@@ -1110,12 +1148,18 @@ TEST(SplitKReduce, DeclaresTheReferenceArguments) {
             std::string::npos);
   EXPECT_EQ(assembly.find("workgroup_id_z 1"), std::string::npos);
   expectLinesInOrder(assembly,
-                     {".name: splitk_reduce", ".kernarg_segment_size: 56",
+                     {".name: splitk_reduce", ".kernarg_segment_size: 80",
                       ".max_flat_workgroup_size: 256"});
-  expectLinesInOrder(assembly, {".offset: 32", "hidden_group_size_x",
-                                ".offset: 36", "hidden_group_size_y",
-                                ".offset: 40", "hidden_group_size_z",
-                                ".offset: 44", "hidden_block_count_x",
-                                ".offset: 48", "hidden_block_count_y",
-                                ".offset: 52", "hidden_block_count_z"});
+  expectLinesInOrder(
+      assembly, {".name: D",      ".offset: 0",  ".name: ws",   ".offset: 8",
+                 ".name: C",      ".offset: 16", ".name: ldD",  ".offset: 24",
+                 ".name: m",      ".offset: 28", ".name: n",    ".offset: 32",
+                 ".name: splits", ".offset: 36", ".name: ldC",  ".offset: 40",
+                 ".name: alpha",  ".offset: 44", ".name: beta", ".offset: 48"});
+  expectLinesInOrder(assembly, {".offset: 52", "hidden_group_size_x",
+                                ".offset: 56", "hidden_group_size_y",
+                                ".offset: 60", "hidden_group_size_z",
+                                ".offset: 64", "hidden_block_count_x",
+                                ".offset: 68", "hidden_block_count_y",
+                                ".offset: 72", "hidden_block_count_z"});
 }

@@ -32,6 +32,8 @@ _ARGS = (
     {"type": "address", "semantic": "AddressMXScaleB"},
     # The split-K workspace: unused with a single split, passed as a null pointer.
     {"type": "uint64", "semantic": "ConstantZero"},
+    # C is declared for the ABI; the GEMM never reads it, the split-K reduce does.
+    {"type": "address", "semantic": "AddressC"},
     {"type": "int32", "semantic": "StrideD0"},
     {"type": "int32", "semantic": "StrideA0"},
     {"type": "int32", "semantic": "StrideB0"},
@@ -40,6 +42,9 @@ _ARGS = (
     {"type": "int32", "semantic": "SizeSum"},
     # The split-K slice length, which is the whole K without split-K.
     {"type": "int32", "semantic": "SizeSum"},
+    {"type": "int32", "semantic": "StrideC0"},
+    {"type": "float32", "semantic": "Alpha"},
+    {"type": "float32", "semantic": "Beta"},
 )
 
 

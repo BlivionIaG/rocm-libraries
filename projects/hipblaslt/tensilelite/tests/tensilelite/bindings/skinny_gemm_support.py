@@ -34,6 +34,9 @@ NAN_BYTE = 0x7F
 # guard must keep the pattern.
 D_SENTINEL = 0x5A5B
 D_GUARD = 64
+# bf16 quiet NaN, stored in the logical elements of C when beta is 0, where no
+# kernel may read C.
+C_POISON = 0x7FC0
 FULL_LANES_K = LANES_K_CHOICES[-1]
 # The assume_range bounds of the GEMM kernel: a value above them is undefined
 # behaviour. ld, k and spk go up to 2^20, ldD >= m bounds m by 2^20, and the D
@@ -233,6 +236,19 @@ def makeOperand(rng: np.random.Generator, cols: int, k: int, ld: int):
     return codes, scales, aligned, preSwizzleScales(scales)
 
 
+def makeC(rng: np.random.Generator, m: int, n: int, ldC: int, poison: bool):
+    """C bits laid out like D (the logical extent plus D_GUARD guard elements,
+    ld padding and guard holding the sentinel), with random bf16 values in the
+    logical elements, or C_POISON when poison is set."""
+    cBits = np.full(dElements(m, n, ldC) + D_GUARD, D_SENTINEL, dtype=np.uint16)
+    index = (np.arange(n)[:, None] * ldC + np.arange(m)).ravel()
+    if poison:
+        cBits[index] = C_POISON
+    else:
+        cBits[index] = truncateToBf16(rng.standard_normal(m * n) * 2)
+    return cBits
+
+
 def makeOutputs(m: int, n: int, ldD: int, splits: int):
     """D bits holding exactly its logical extent plus D_GUARD guard elements,
     filled with the sentinel, and the workspace filled with NaN, so a store the
@@ -397,15 +413,27 @@ def launchKernel(kernel: LoadedKernel, grid, block, args) -> None:
     hipCheck(hip.hipDeviceSynchronize())
 
 
-def reduceArgs(dBuf, wsBuf, ldD: int, m: int, n: int, splits: int) -> tuple:
-    """The explicit kernargs of splitk_reduce."""
+def reduceArgs(
+    dBuf,
+    wsBuf,
+    cBuf,
+    ldD: int,
+    m: int,
+    n: int,
+    splits: int,
+    ldC: int,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> tuple:
+    """The explicit kernargs of splitk_reduce: the pointers D, ws and C, then
+    ldD, m, n, splits and ldC (i32), then alpha and beta (f32)."""
     return (
         dBuf.pointer,
         wsBuf.pointer,
-        ctypes.c_int32(ldD),
-        ctypes.c_int32(m),
-        ctypes.c_int32(n),
-        ctypes.c_int32(splits),
+        cBuf.pointer,
+        *(ctypes.c_int32(value) for value in (ldD, m, n, splits, ldC)),
+        ctypes.c_float(alpha),
+        ctypes.c_float(beta),
     )
 
 
@@ -414,10 +442,24 @@ def reduceLaunchDims(m: int, n: int) -> tuple[tuple, tuple]:
     return (ceilDiv(m, REDUCE_BLOCK), n, 1), (REDUCE_BLOCK, 1, 1)
 
 
-def launchReduce(kernel, dBuf, wsBuf, ldD: int, m: int, n: int, splits: int) -> None:
-    """Runs splitk_reduce: D (bf16 bits) from the f32 workspace."""
+def launchReduce(
+    kernel,
+    dBuf,
+    wsBuf,
+    cBuf,
+    ldD: int,
+    m: int,
+    n: int,
+    splits: int,
+    ldC: int,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> None:
+    """Runs splitk_reduce: D (bf16 bits) = fma(beta, C, alpha * the f32 sum of
+    the workspace)."""
     grid, block = reduceLaunchDims(m, n)
-    launchKernel(kernel, grid, block, reduceArgs(dBuf, wsBuf, ldD, m, n, splits))
+    args = reduceArgs(dBuf, wsBuf, cBuf, ldD, m, n, splits, ldC, alpha, beta)
+    launchKernel(kernel, grid, block, args)
 
 
 # Skinny GEMM configuration, ported from the driver. The pick* functions choose
@@ -487,6 +529,9 @@ class Problem:
     ldD: int
     blocks: int
     grid3d: bool
+    ldC: int
+    alpha: float
+    beta: float
 
     @property
     def skinny(self) -> int:
@@ -789,6 +834,9 @@ def makeProblem(
     up_scales: int | None,
     blocks: int | None,
     padding: tuple,
+    paddingC: int = 0,
+    alpha: float = 1.0,
+    beta: float = 0.0,
 ) -> Problem:
     """Resolves the knobs (explicit ones win over pickConfig), the block count
     and the leading dimensions, and checks the constraints. The leading
@@ -797,7 +845,8 @@ def makeProblem(
     default rule applies, derived from the final spk: up-front only for a split
     of at most UP_FRONT_MAX_SPK and k % spk == 0, while an explicit up_scales = 1
     works for any spk and k. Without an explicit spk one split covers k, rounded
-    up to whole iterations.
+    up to whole iterations. C has its own leading dimension, the smallest
+    multiple of 4 covering m plus paddingC.
     """
     given = Knobs(bm, tn, lanes_k, waves, pf, group, xcds, up_scales)
     overrides = {
@@ -830,6 +879,9 @@ def makeProblem(
         ldD=alignUp(m, 4) + padding[2],
         blocks=blocks,
         grid3d=grid3d,
+        ldC=alignUp(m, 4) + paddingC,
+        alpha=alpha,
+        beta=beta,
     )
     checkConstraints(p)
     return p
@@ -857,14 +909,16 @@ def noKnobProblem(m: int, n: int, k: int, **knobs) -> Problem:
 
 
 class Inputs(NamedTuple):
-    """Host buffers handed to the kernel and the float32 reference result (None
-    when the reference was not computed)."""
+    """Host buffers handed to the kernel, C included, and the float32 reference
+    product (None when the reference was not computed), without alpha and
+    beta."""
 
     aBuf: np.ndarray
     bBuf: np.ndarray
     sclABuf: np.ndarray
     sclBBuf: np.ndarray
     expected: np.ndarray | None
+    cBits: np.ndarray
 
 
 def makeInputs(p: Problem, seed: int, withReference: bool = True) -> Inputs:
@@ -873,10 +927,29 @@ def makeInputs(p: Problem, seed: int, withReference: bool = True) -> Inputs:
     rng = np.random.default_rng(seed=seed)
     a, scalesA, aBuf, sclABuf = makeOperand(rng, p.m, p.k, p.ldA)
     b, scalesB, bBuf, sclBBuf = makeOperand(rng, p.n, p.k, p.ldB)
+    # With beta 0 the C values are NaN, so a kernel that reads C fails.
+    cBits = makeC(rng, p.m, p.n, p.ldC, poison=p.beta == 0)
     if not withReference:
-        return Inputs(aBuf, bBuf, sclABuf, sclBBuf, None)
+        return Inputs(aBuf, bBuf, sclABuf, sclBBuf, None, cBits)
     expected = referenceProduct(dequant(a, scalesA), dequant(b, scalesB))
-    return Inputs(aBuf, bBuf, sclABuf, sclBBuf, expected.astype(np.float32))
+    return Inputs(aBuf, bBuf, sclABuf, sclBBuf, expected.astype(np.float32), cBits)
+
+
+def scaledProduct(p: Problem, product: np.ndarray) -> np.ndarray:
+    """alpha * product in f32, what the GEMM stores into D with a single split."""
+    return np.float32(p.alpha) * product
+
+
+def expectedD(p: Problem, inputs: Inputs) -> np.ndarray:
+    """The [m, n] f32 value of D before the bf16 truncation: fma(beta, C,
+    alpha * product), which the split-K reduce computes; C is not read when beta
+    is 0."""
+    scaled = scaledProduct(p, inputs.expected)
+    if p.beta == 0:
+        return scaled
+    c = bf16ToFloat32(dColumns(inputs.cBits, p.m, p.n, p.ldC)).T
+    fused = np.float64(np.float32(p.beta)) * c.astype(np.float64)
+    return (fused + scaled.astype(np.float64)).astype(np.float32)
 
 
 # Kernels are emitted and loaded once per session; the modules stay loaded
@@ -910,9 +983,10 @@ def reduceKernel() -> LoadedKernel:
     return _kernelCache[REDUCE_KERNEL_NAME]
 
 
-def gemmArgs(p: Problem, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf) -> tuple:
-    """The explicit kernargs of the GEMM kernel: the six pointers, then ldD, ldA,
-    ldB, m, n, k and spk."""
+def gemmArgs(p: Problem, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf) -> tuple:
+    """The explicit kernargs of the GEMM kernel: the pointers D, A, B, scalesA,
+    scalesB, ws and C, then ldD, ldA, ldB, m, n, k, spk and ldC (i32), then alpha
+    and beta (f32)."""
     return (
         dBuf.pointer,
         aBuf.pointer,
@@ -920,10 +994,13 @@ def gemmArgs(p: Problem, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf) -> tuple:
         sclABuf.pointer,
         sclBBuf.pointer,
         wsBuf.pointer,
+        cBuf.pointer,
         *(
             ctypes.c_int32(value)
-            for value in (p.ldD, p.ldA, p.ldB, p.m, p.n, p.k, p.spk)
+            for value in (p.ldD, p.ldA, p.ldB, p.m, p.n, p.k, p.spk, p.ldC)
         ),
+        ctypes.c_float(p.alpha),
+        ctypes.c_float(p.beta),
     )
 
 
@@ -931,34 +1008,45 @@ def gemmBlock(p: Problem) -> tuple[int, int, int]:
     return (64 * p.waves, 1, 1)
 
 
-def launchGemm(p: Problem, kernel, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf) -> None:
+def launchGemm(
+    p: Problem, kernel, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf
+) -> None:
     """Runs the GEMM kernel with its explicit kernargs."""
-    args = gemmArgs(p, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf)
+    args = gemmArgs(p, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf)
     launchKernel(kernel, p.grid, gemmBlock(p), args)
 
 
 def verifyGemm(p: Problem, inputs: Inputs, dBits: np.ndarray, ws: np.ndarray) -> None:
-    """Checks D (no split) or the workspace sum against the reference."""
+    """Checks D (no split, alpha * product: the GEMM does not read C) or the raw
+    workspace sum against the reference."""
     if p.splits == 1:
-        verifyD(dBits, inputs.expected, p.m, p.n, p.ldD, p.label)
+        verifyD(dBits, scaledProduct(p, inputs.expected), p.m, p.n, p.ldD, p.label)
         return
     verifyWorkspace(ws, inputs.expected, p.splits, p.m, p.n, p.label)
 
 
-def executeProblem(p: Problem, inputs: Inputs, iters: int, verifyFn=None) -> np.ndarray:
+def executeProblem(
+    p: Problem, inputs: Inputs, iters: int, verifyFn=None, aliasC: bool = False
+) -> np.ndarray:
     """Launches the GEMM (and the split-K reduction) iters times each, which must
     be idempotent, checks the results against the reference unless the inputs
     carry none, and returns the D bits. verifyFn(inputs, (dBits, ws)) replaces
-    the GEMM check."""
+    the GEMM check. With aliasC, C and D share one buffer that starts as C
+    (ldC == ldD), and a single iteration is allowed since the reduce overwrites
+    C."""
     dBits, ws = makeOutputs(p.m, p.n, p.ldD, p.splits)
+    if aliasC:
+        assert p.ldC == p.ldD and iters == 1, "aliasing needs ldC == ldD, 1 iter"
+        dBits = inputs.cBits.copy()
     arrays = (dBits, inputs.aBuf, inputs.bBuf, inputs.sclABuf, inputs.sclBBuf, ws)
     with ExitStack() as stack:
         dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf = (
             stack.enter_context(DeviceBuffer(array)) for array in arrays
         )
+        cBuf = dBuf if aliasC else stack.enter_context(DeviceBuffer(inputs.cBits))
         kernel = gemmKernel(p)
         for _ in range(iters):
-            launchGemm(p, kernel, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf)
+            launchGemm(p, kernel, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf)
         dBuf.download(dBits)
         wsBuf.download(ws)
         if verifyFn is not None:
@@ -968,10 +1056,22 @@ def executeProblem(p: Problem, inputs: Inputs, iters: int, verifyFn=None) -> np.
         if p.splits > 1:
             reducer = reduceKernel()
             for _ in range(iters):
-                launchReduce(reducer, dBuf, wsBuf, p.ldD, p.m, p.n, p.splits)
+                launchReduce(
+                    reducer,
+                    dBuf,
+                    wsBuf,
+                    cBuf,
+                    p.ldD,
+                    p.m,
+                    p.n,
+                    p.splits,
+                    p.ldC,
+                    p.alpha,
+                    p.beta,
+                )
             dBuf.download(dBits)
             if inputs.expected is not None:
-                verifyD(dBits, inputs.expected, p.m, p.n, p.ldD, p.label)
+                verifyD(dBits, expectedD(p, inputs), p.m, p.n, p.ldD, p.label)
     return dBits
 
 

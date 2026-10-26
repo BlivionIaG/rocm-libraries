@@ -81,7 +81,8 @@ NB_MODULE(tensilelite_codegen, m) {
       },
       "arch"_a = "gfx950",
       "Returns the assembly text of the splitk_reduce kernel: D[i, j] is the "
-      "bf16 truncation of the f32 sum over the splits of ws[z * m * n + j * m "
-      "+ i]. Block (256, 1, 1), grid (ceil(m / 256), n, 1). Raises ValueError "
-      "for an unsupported arch.");
+      "bf16 truncation of fma(beta, C[j * ldC + i], alpha * sum), with sum the "
+      "f32 sum over the splits of ws[z * m * n + j * m + i]; C is read only "
+      "when beta is not zero. Block (256, 1, 1), grid (ceil(m / 256), n, 1). "
+      "Raises ValueError for an unsupported arch.");
 }

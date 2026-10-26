@@ -240,15 +240,23 @@ def benchProblem(
     iteration; with verify the results are checked against the host reference."""
     inputs = support.makeInputs(p, seed=42, withReference=verify)
     dBits, ws = support.makeOutputs(p.m, p.n, p.ldD, p.splits)
-    arrays = (dBits, inputs.aBuf, inputs.bBuf, inputs.sclABuf, inputs.sclBBuf, ws)
+    arrays = (
+        dBits,
+        inputs.aBuf,
+        inputs.bBuf,
+        inputs.sclABuf,
+        inputs.sclBBuf,
+        ws,
+        inputs.cBits,
+    )
     reduceTimes = None
     with ExitStack() as stack:
-        dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf = (
+        dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf = (
             stack.enter_context(DeviceBuffer(array)) for array in arrays
         )
         kernel = gemmKernelFor(stack, p, asmDir)
         flush = stack.enter_context(LlcFlush())
-        args = support.gemmArgs(p, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf)
+        args = support.gemmArgs(p, dBuf, aBuf, bBuf, sclABuf, sclBBuf, wsBuf, cBuf)
         gemmTimes = timeLaunches(
             kernel, p.grid, support.gemmBlock(p), args, iters, flush
         )
@@ -259,11 +267,15 @@ def benchProblem(
         if p.splits > 1:
             reducer = reduceKernelFor(stack, asmDir)
             grid, block = support.reduceLaunchDims(p.m, p.n)
-            args = support.reduceArgs(dBuf, wsBuf, p.ldD, p.m, p.n, p.splits)
+            args = support.reduceArgs(
+                dBuf, wsBuf, cBuf, p.ldD, p.m, p.n, p.splits, p.ldC, p.alpha, p.beta
+            )
             reduceTimes = timeLaunches(reducer, grid, block, args, iters, None)
             if verify:
                 dBuf.download(dBits)
-                support.verifyD(dBits, inputs.expected, p.m, p.n, p.ldD, p.label)
+                support.verifyD(
+                    dBits, support.expectedD(p, inputs), p.m, p.n, p.ldD, p.label
+                )
     return gemmTimes, reduceTimes
 
 

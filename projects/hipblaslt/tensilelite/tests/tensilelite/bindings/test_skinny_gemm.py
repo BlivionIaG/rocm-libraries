@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Tests for the skinny MXFP8 GEMM kernels of the tensilelite_codegen bindings."""
 
+from contextlib import ExitStack
+
 import numpy as np
 import pytest
 import skinny_gemm_support as support
@@ -108,7 +110,7 @@ def test_emit_skinny_gemm_assembles():
     config = codegen.SkinnyGEMMConfig(lanesK=16, waves=1, prefetch=1)
     asm = codegen.emitSkinnyGEMM(config)
     assert f".globl {codegen.skinnyGEMMKernelName(config)}" in asm
-    assert ".kernarg_segment_size: 104" in asm
+    assert ".kernarg_segment_size: 120" in asm
     assert ".group_segment_fixed_size: 0" in asm
     assert jit.assembleToHSACO(asm, support.TARGET)[:4] == ELF_MAGIC
 
@@ -130,7 +132,7 @@ def test_unsupported_arch():
 def test_emit_split_k_reduce_assembles():
     asm = codegen.emitSplitKReduce()
     assert ".globl splitk_reduce" in asm
-    assert ".kernarg_segment_size: 56" in asm
+    assert ".kernarg_segment_size: 80" in asm
     assert jit.assembleToHSACO(asm, support.TARGET)[:4] == ELF_MAGIC
 
 
@@ -211,21 +213,46 @@ REDUCE_CASES = [
 ]
 
 
-def runReduce(kernel, m, n, ldD, splits, seed):
+def runReduce(
+    kernel, m, n, ldD, splits, seed, ldC=None, alpha=1.0, beta=0.0, aliasC=False
+):
+    """Runs splitk_reduce on random partials and a random C (NaN when beta is 0,
+    so a read of C fails) and returns (ws, cBits, dBits). With aliasC, C and D
+    are one buffer."""
     rng = np.random.default_rng(seed)
     exponent = rng.integers(-8, 9, size=splits * m * n)
     ws = (rng.standard_normal(splits * m * n) * 2.0**exponent).astype(np.float32)
+    ldC = ldD if ldC is None else ldC
+    cBits = support.makeC(rng, m, n, ldC, poison=beta == 0)
     dBits, _ = support.makeOutputs(m, n, ldD, splits)
-    with support.DeviceBuffer(dBits) as dBuf, support.DeviceBuffer(ws) as wsBuf:
-        support.launchReduce(kernel, dBuf, wsBuf, ldD, m, n, splits)
+    if aliasC:
+        assert ldC == ldD
+        dBits = cBits.copy()
+    with ExitStack() as stack:
+        dBuf = stack.enter_context(support.DeviceBuffer(dBits))
+        wsBuf = stack.enter_context(support.DeviceBuffer(ws))
+        cBuf = dBuf if aliasC else stack.enter_context(support.DeviceBuffer(cBits))
+        support.launchReduce(
+            kernel, dBuf, wsBuf, cBuf, ldD, m, n, splits, ldC, alpha, beta
+        )
         dBuf.download(dBits)
-    return ws, dBits
+    return ws, cBits, dBits
+
+
+def reduceExpected(ws, cBits, m, n, splits, ldC, alpha, beta):
+    """fma(beta, C, alpha * sum) in f32, the reduce's value before truncation."""
+    scaled = np.float32(alpha) * support.reduceReference(ws, splits, m, n)
+    if beta == 0:
+        return scaled
+    c = support.bf16ToFloat32(support.dColumns(cBits, m, n, ldC)).T
+    fused = np.float64(np.float32(beta)) * c.astype(np.float64)
+    return (fused + scaled.astype(np.float64)).astype(np.float32)
 
 
 @pytest.mark.parametrize(("m", "n", "ldDPad", "splits"), REDUCE_CASES)
 def test_splitk_reduce(reduceKernel, m, n, ldDPad, splits):
     ldD = support.alignUp(m, 4) + ldDPad
-    ws, dBits = runReduce(reduceKernel, m, n, ldD, splits, seed=m * 31 + n)
+    ws, _, dBits = runReduce(reduceKernel, m, n, ldD, splits, seed=m * 31 + n)
     expected = support.reduceReference(ws, splits, m, n)
     label = f"m={m} n={n} ldD={ldD} splits={splits}"
     # Bit exact against the truncation of the in-order f32 sum, then through the
@@ -239,11 +266,61 @@ def test_splitk_reduce(reduceKernel, m, n, ldDPad, splits):
 
 def test_splitk_reduce_truncates_instead_of_rounding(reduceKernel):
     m, n, ldD, splits = 1000, 4, 1000, 2
-    ws, dBits = runReduce(reduceKernel, m, n, ldD, splits, seed=7)
+    ws, _, dBits = runReduce(reduceKernel, m, n, ldD, splits, seed=7)
     expected = support.reduceReference(ws, splits, m, n)
     nearest = np.rint(expected.view(np.uint32).astype(np.float64) / 65536.0)
     actual = support.dColumns(dBits, m, n, ldD).T
     assert (nearest.astype(np.uint32) != actual).any()
+
+
+REDUCE_SCALAR_CASES = [(1.0, 0.0), (0.75, 0.0), (1.0, 1.5), (0.75, -2.0), (-0.5, 1.5)]
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "ldDPad", "splits"), [(300, 4, 12, 5), (1, 5120, 0, 2)]
+)
+@pytest.mark.parametrize(("alpha", "beta"), REDUCE_SCALAR_CASES)
+def test_splitk_reduce_alpha_beta(reduceKernel, m, n, ldDPad, splits, alpha, beta):
+    """D = bf16(fma(beta, C, alpha * sum)) with ldC != ldD (padded C)."""
+    ldD = support.alignUp(m, 4) + ldDPad
+    ldC = ldD + 8
+    ws, cBits, dBits = runReduce(
+        reduceKernel,
+        m,
+        n,
+        ldD,
+        splits,
+        seed=m * 31 + n,
+        ldC=ldC,
+        alpha=alpha,
+        beta=beta,
+    )
+    expected = reduceExpected(ws, cBits, m, n, splits, ldC, alpha, beta)
+    label = f"m={m} n={n} alpha={alpha} beta={beta}"
+    support.verifyD(dBits, expected, m, n, ldD, label)
+
+
+@pytest.mark.parametrize("beta", [0.0, -0.0])
+def test_splitk_reduce_beta_zero_does_not_read_c(reduceKernel, beta):
+    """C is NaN: with beta +0 or -0 the reduce must not read it."""
+    m, n, ldD, splits = 300, 4, 300, 3
+    ws, cBits, dBits = runReduce(
+        reduceKernel, m, n, ldD, splits, seed=5, alpha=0.75, beta=beta
+    )
+    assert np.isnan(support.bf16ToFloat32(cBits[:m])).all()
+    actual = support.bf16ToFloat32(support.dColumns(dBits, m, n, ldD))
+    assert np.isfinite(actual).all()
+    expected = reduceExpected(ws, cBits, m, n, splits, ldD, 0.75, 0.0)
+    support.verifyD(dBits, expected, m, n, ldD, f"beta={beta}")
+
+
+def test_splitk_reduce_c_aliases_d(reduceKernel):
+    m, n, ldD, splits = 300, 4, 304, 3
+    ws, cBits, dBits = runReduce(
+        reduceKernel, m, n, ldD, splits, seed=9, alpha=0.75, beta=1.5, aliasC=True
+    )
+    expected = reduceExpected(ws, cBits, m, n, splits, ldD, 0.75, 1.5)
+    support.verifyD(dBits, expected, m, n, ldD, "C aliases D")
 
 
 # The skinny GEMM tests of the aster driver.
@@ -254,8 +331,11 @@ def resolve(m, n, k, **knobs):
     pickConfig unless given, tight leading dimensions."""
     resolved = {name: knobs.pop(name, None) for name in support.KNOB_OVERRIDE_NAMES}
     padding = knobs.pop("padding", (0, 0, 0))
+    scalars = {
+        name: knobs.pop(name) for name in ("paddingC", "alpha", "beta") if name in knobs
+    }
     assert not knobs, f"unknown knobs {sorted(knobs)}"
-    return support.makeProblem(m, n, k, padding=padding, **resolved)
+    return support.makeProblem(m, n, k, padding=padding, **resolved, **scalars)
 
 
 def skipUnlessRunnable(*problems):
@@ -642,6 +722,88 @@ def test_gemm_mxfp8_skinny(BM, TN, LANES_K, WAVES, PF, M, N, K, SPK):
     run(
         M, N, K, spk=SPK, bm=BM, tn=TN, lanes_k=LANES_K, waves=WAVES, pf=PF, up_scales=0
     )
+
+
+# Single-split shapes with vector and masked stores, both paths, odd tiles.
+ALPHA_PARAMS = [
+    (1, 4, 16, 1, 1, 1, 256, 1024, 1024),
+    (4, 4, 16, 2, 1, 512, 4, 2048, 2048),
+    (2, 2, 16, 1, 1, 3, 100, 2048, 2048),
+    (3, 7, 16, 1, 0, 3, 56, 1024, 1024),
+]
+
+
+@pytest.mark.parametrize("ALPHA", [1.0, -0.5, 3.0])
+@pytest.mark.parametrize("BM,TN,LANES_K,WAVES,PF,M,N,K,SPK", ALPHA_PARAMS)
+def test_gemm_mxfp8_skinny_alpha(ALPHA, BM, TN, LANES_K, WAVES, PF, M, N, K, SPK):
+    """D = bf16(alpha * acc); C is NaN (beta 0), so a read of C would show."""
+    run(
+        M,
+        N,
+        K,
+        spk=SPK,
+        bm=BM,
+        tn=TN,
+        lanes_k=LANES_K,
+        waves=WAVES,
+        pf=PF,
+        up_scales=0,
+        alpha=ALPHA,
+    )
+
+
+# Split-K x4 on path A and a masked one on path B: the reduce applies alpha, beta.
+SPLIT_ALPHA_BETA_PARAMS = [
+    (1, 4, 16, 1, 2, 2, 256, 8192, 2048),
+    (2, 2, 16, 1, 1, 301, 5, 4096, 2048),
+]
+
+
+@pytest.mark.parametrize(
+    "ALPHA,BETA", [(1.0, 0.0), (0.75, 0.0), (1.0, 1.5), (0.75, -2.0)]
+)
+@pytest.mark.parametrize("BM,TN,LANES_K,WAVES,PF,M,N,K,SPK", SPLIT_ALPHA_BETA_PARAMS)
+def test_gemm_mxfp8_skinny_split_k_alpha_beta(
+    ALPHA, BETA, BM, TN, LANES_K, WAVES, PF, M, N, K, SPK
+):
+    """Split-K stores raw partials and the reduce computes bf16(alpha * sum +
+    beta * C); with a padded C (ldC != ldD)."""
+    run(
+        M,
+        N,
+        K,
+        spk=SPK,
+        bm=BM,
+        tn=TN,
+        lanes_k=LANES_K,
+        waves=WAVES,
+        pf=PF,
+        up_scales=0,
+        alpha=ALPHA,
+        beta=BETA,
+        paddingC=8,
+    )
+
+
+def test_gemm_mxfp8_skinny_split_k_reduce_aliases_c():
+    """C and D are one buffer: every element is read, then written, by one thread."""
+    p = resolve(
+        2,
+        256,
+        8192,
+        spk=2048,
+        bm=1,
+        tn=4,
+        lanes_k=16,
+        waves=1,
+        pf=2,
+        up_scales=0,
+        alpha=0.75,
+        beta=1.5,
+    )
+    skipUnlessRunnable(p)
+    assert p.ldC == p.ldD
+    support.executeProblem(p, support.makeInputs(p, 42), 1, aliasC=True)
 
 
 @pytest.mark.parametrize("BM,TN,LANES_K,WAVES,PF,M,N,K,SPK", PADDED_PARAMS)
