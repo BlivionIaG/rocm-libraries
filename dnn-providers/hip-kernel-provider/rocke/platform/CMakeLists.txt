@@ -531,6 +531,20 @@ if(ROCKE_INSTALL_TESTS)
              "  LABELS \"ckc\\;python\\;quick\"\n"
              "  ENVIRONMENT \"${_ROCKE_PYTEST_ENVIRONMENT}\${_rocke_compiler_env}\"\n"
              "  TIMEOUT 300)\n")
+
+      # The tiling package's tests live inside the package (rocke/tests/helpers/tiling), so
+      # rocke_pytest above, which collects the installed tests/ tree, never sees them. Run
+      # them from the installed package, the way the arch-domain gate reads its package data.
+      # Their GPU tests skip without a usable GPU. _rocke_compiler_env is the compiler PATH
+      # the rocke_pytest entry above defines in the generated file.
+      set(_ROCKE_TILING_TESTS "${_ROCKE_INSTALLED_PYTHONPATH}/rocke/tests/helpers/tiling")
+      string(APPEND _ROCKE_INSTALLED_CTEST_ENTRIES
+             "add_test(rocke_tiling_pytest python -m pytest \"${_ROCKE_TILING_TESTS}\" -v -rs --timeout=120)\n")
+      string(APPEND _ROCKE_INSTALLED_CTEST_ENTRIES
+             "set_tests_properties(rocke_tiling_pytest PROPERTIES\n"
+             "  LABELS \"ckc\\;python\\;quick\"\n"
+             "  ENVIRONMENT \"PYTHONPATH=${_ROCKE_INSTALLED_PYTHONPATH}\${_rocke_compiler_env}\"\n"
+             "  TIMEOUT 1800)\n")
     endif()
 
     # Library conv CPU tests (no GPU required; dispatch selection + signature guards).
