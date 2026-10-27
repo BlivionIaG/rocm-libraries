@@ -84,8 +84,10 @@ extern "C" {
  *    end, which changes sizeof and with it the stride of every ops[] array a
  *    catalog hands out.
  * 4: rocke_param_opts_t gained the integer facts (rocke_int_facts_t) at its end,
- *    which changes its size. */
-#define ROCKE_ABI_VERSION 4
+ *    which changes its size.
+ * 5: rocke_int_bound_t gained a Value bound (value_bound) at its end, which
+ *    changes the size of rocke_int_facts_t and rocke_param_opts_t. */
+#define ROCKE_ABI_VERSION 5
 
 /* Wire ABI: the CBOR recipe/bundle/guard vocabulary this engine understands.
  * 2: list-tagged ("l") kernel attrs such as cluster_dims; level-1 engines drop them. */
