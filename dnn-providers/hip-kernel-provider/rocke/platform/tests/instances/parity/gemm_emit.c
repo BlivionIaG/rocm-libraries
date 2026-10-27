@@ -531,6 +531,32 @@ static int make_spec(int idx, rocke_gemm_universal_spec_t* spec)
         spec->batched = false;
         break;
     }
+    case 27: /* the only bf8 config: bf8 x bf8 K=64 atom, TDM ping-pong */
+        spec->name = "test_wmma_bf8_k64";
+        spec->tile = (rocke_gemm_tile_spec_t){.tile_m = 128,
+                                              .tile_n = 128,
+                                              .tile_k = 128,
+                                              .warp_m = 2,
+                                              .warp_n = 2,
+                                              .warp_k = 1,
+                                              .warp_tile_m = 16,
+                                              .warp_tile_n = 16,
+                                              .warp_tile_k = 64};
+        spec->trait.pipeline = "mem";
+        spec->trait.scheduler = "intrawave";
+        spec->trait.epilogue = "cshuffle";
+        spec->trait.tdm = true;
+        spec->trait.tdm_depth = 2;
+        spec->trait.lds_k_pad = 16;
+        spec->data.dtype_a = "bf8e5m2";
+        spec->data.dtype_b = "bf8e5m2";
+        spec->data.dtype_c = "bf16";
+        spec->data.dtype_acc = "fp32";
+        spec->data.layout = "RCR";
+        spec->wave_size = 32;
+        spec->block_size = 128;
+        spec->batched = false;
+        break;
     default:
         return -1;
     }
@@ -538,7 +564,7 @@ static int make_spec(int idx, rocke_gemm_universal_spec_t* spec)
     return 0;
 }
 
-/* Config 9 exercises gfx942; configs 11-26 gfx1250; the rest use the
+/* Config 9 exercises gfx942; configs 11-27 gfx1250; the rest use the
  * gfx950 baseline. */
 static const char* arch_for(int idx)
 {
@@ -546,7 +572,7 @@ static const char* arch_for(int idx)
     {
         return "gfx942";
     }
-    if(idx >= 11 && idx <= 26)
+    if(idx >= 11 && idx <= 27)
     {
         return "gfx1250";
     }

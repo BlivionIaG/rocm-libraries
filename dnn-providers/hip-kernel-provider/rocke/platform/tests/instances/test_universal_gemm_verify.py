@@ -39,7 +39,14 @@ from rocke.examples.common.universal_gemm_verify import (
     _pick_atom,
     build_manifest,
 )
-from rocke.instances.common.manifest_runner.gemm import _gemm_is_bf16
+from rocke.instances.common.manifest_runner.gemm import (
+    _F8_ENCODERS,
+    _bf8e5m2_decode_table,
+    _bf8e5m2_encode,
+    _fp8e4m3_encode,
+    _gemm_f8_dtype,
+    _gemm_is_bf16,
+)
 
 # make_gemm_manifest reads exactly these three attributes off the artifact.
 _ARTIFACT = SimpleNamespace(
@@ -67,6 +74,9 @@ _ARCH_F8_ATOM = {
     "gfx950": ("mfma", (16, 16, 32)),
     "gfx1250": ("wmma", (16, 16, 64)),
 }
+# Where the largest-K atom differs by 8-bit dtype: gfx1250 fp8 has the dense
+# 16x16x128 f8f6f4 atom, bf8 only the K=64 one.
+_ARCH_F8_ATOM_OVERRIDE = {("gfx1250", "fp8e4m3"): (16, 16, 128)}
 
 
 def _manifest(dtype, arch="gfx950"):
@@ -198,8 +208,9 @@ class TestEightBitManifest(unittest.TestCase):
             for dtype in ("fp8e4m3", "bf8e5m2"):
                 with self.subTest(arch=arch, dtype=dtype):
                     target = ArchTarget.from_gfx(arch)
-                    self.assertEqual(_pick_atom(target, dtype, None), atom)
-                    m, n, k = atom
+                    want = _ARCH_F8_ATOM_OVERRIDE.get((arch, dtype), atom)
+                    self.assertEqual(_pick_atom(target, dtype, None), want)
+                    m, n, k = want
                     self.assertEqual(
                         _manifest(dtype, arch=arch)["atoms"][0],
                         f"{family}_f32_{m}x{n}x{k}_{dtype}_{dtype}",
@@ -208,12 +219,81 @@ class TestEightBitManifest(unittest.TestCase):
     def test_gfx1250_eight_bit_atom_is_twice_the_k_of_its_bf16_atom(self):
         # Half-width operands, double the K per instruction. This is the whole
         # reason the fp8 path needed its own lane map rather than reusing the
-        # bf16 one, so it is asserted rather than assumed.
+        # bf16 one, so it is asserted rather than assumed. bf8 has only this
+        # K=64 atom; fp8 additionally has the dense f8f6f4 one at four times.
         target = ArchTarget.from_gfx("gfx1250")
-        self.assertEqual(
-            _pick_atom(target, "fp8e4m3", None)[2],
-            2 * _pick_atom(target, "bf16", None)[2],
-        )
+        bf16_k = _pick_atom(target, "bf16", None)[2]
+        self.assertEqual(_pick_atom(target, "bf8e5m2", None)[2], 2 * bf16_k)
+        self.assertEqual(_pick_atom(target, "fp8e4m3", None)[2], 4 * bf16_k)
+
+
+class TestEightBitEncoders(unittest.TestCase):
+    """The gemm_fp8 runner must hand each kernel bytes in its own format.
+
+    A bf8 kernel fed e4m3 bytes decodes nonsense, so a correct kernel fails
+    nearly every element and the verify lane cannot pass for bf8 at all.
+    """
+
+    def test_e5m2_table_matches_the_format(self):
+        import numpy as np
+
+        t = _bf8e5m2_decode_table(np)
+        for code, want in (
+            (0x3C, 1.0),
+            (0xBC, -1.0),
+            (0x45, 5.0),
+            (0x7B, 57344.0),  # largest finite
+            (0x04, 2.0**-14),  # smallest normal
+            (0x01, 2.0**-16),  # smallest subnormal
+        ):
+            with self.subTest(code=hex(code)):
+                self.assertEqual(float(t[code]), want)
+        # e == 0x1F is inf / NaN; none of those codes may be encodable.
+        self.assertTrue(np.isnan(t[0x7C:0x80]).all())
+        self.assertTrue(np.isnan(t[0xFC:0x100]).all())
+
+    def test_e5m2_encode_round_trips_every_finite_code(self):
+        import numpy as np
+
+        t = _bf8e5m2_decode_table(np)
+        finite = np.flatnonzero(np.isfinite(t) & (np.arange(256) != 0x80))
+        codes = _bf8e5m2_encode(np, t[finite])
+        self.assertTrue(np.array_equal(codes, finite.astype(np.uint8)))
+
+    def test_encoders_reject_what_their_format_cannot_hold(self):
+        import numpy as np
+
+        # 1.125 needs three significand bits: exact in e4m3, not in e5m2.
+        x = np.array([1.125], dtype=np.float32)
+        self.assertEqual(int(_fp8e4m3_encode(np, x)[0]), 0x39)
+        with self.assertRaisesRegex(ValueError, "bf8e5m2"):
+            _bf8e5m2_encode(np, x)
+
+    def test_test_inputs_are_exact_in_both_formats(self):
+        import numpy as np
+
+        x = np.arange(-5, 6, dtype=np.float32)
+        for dtype, encode in _F8_ENCODERS.items():
+            with self.subTest(dtype=dtype):
+                encode(np, x)  # raises if any input is inexact
+
+    def test_runner_picks_the_encoder_from_the_manifest(self):
+        for dtype in ("fp8e4m3", "bf8e5m2"):
+            with self.subTest(dtype=dtype):
+                self.assertEqual(
+                    _gemm_f8_dtype(_manifest(dtype, arch="gfx1250")), dtype
+                )
+        with self.assertRaisesRegex(ValueError, "A pointer type"):
+            _gemm_f8_dtype(_manifest("bf16", arch="gfx1250"))
+
+    def test_each_dtype_maps_to_its_own_encoder(self):
+        import numpy as np
+
+        # 1.0 is 0x38 in e4m3 and 0x3C in e5m2; the mapping is the bug.
+        one = np.array([1.0], dtype=np.float32)
+        for dtype, code in (("fp8e4m3", 0x38), ("bf8e5m2", 0x3C)):
+            with self.subTest(dtype=dtype):
+                self.assertEqual(int(_F8_ENCODERS[dtype](np, one)[0]), code)
 
 
 if __name__ == "__main__":

@@ -171,15 +171,68 @@ def _fp8e4m3_decode_table(np):
     return val
 
 
+def _bf8e5m2_decode_table(np):
+    """All 256 OCP e5m2 codes decoded to f32, built from the format.
+
+    ``s.eeeee.mm``, bias 15. ``e == 0`` is subnormal — ``(-1)^s * 2^-14 * m/4``;
+    otherwise ``(-1)^s * 2^(e-15) * (1 + m/4)``. Unlike e4m3 the format is
+    IEEE-like: ``e == 0x1F`` holds the infinities (``m == 0``) and NaNs, so the
+    largest finite magnitude is 57344. Those codes decode to NaN here, which
+    keeps them out of the encoder's table.
+    """
+    code = np.arange(256, dtype=np.uint32)
+    sign = np.where((code >> 7) & 1, np.float32(-1.0), np.float32(1.0))
+    exp = ((code >> 2) & 0x1F).astype(np.int32)
+    man = (code & 0x3).astype(np.float32)
+    sub = np.float32(2.0**-14) * (man / np.float32(4.0))
+    nor = np.ldexp(np.float32(1.0) + man / np.float32(4.0), exp - 15)
+    val = (sign * np.where(exp == 0, sub, nor)).astype(np.float32)
+    val[exp == 0x1F] = np.float32("nan")
+    return val
+
+
 def _fp8e4m3_encode(np, x):
-    """Encode f32 values to OCP e4m3 bytes, rejecting anything inexact.
+    """Encode f32 values to OCP e4m3 bytes, rejecting anything inexact."""
+    return _encode_exact(np, x, _fp8e4m3_decode_table(np), "fp8e4m3")
+
+
+def _bf8e5m2_encode(np, x):
+    """Encode f32 values to OCP e5m2 bytes, rejecting anything inexact."""
+    return _encode_exact(np, x, _bf8e5m2_decode_table(np), "bf8e5m2")
+
+
+# The 8-bit operand dtype (as spelled in the manifest's ``A`` pointer type) ->
+# its exact encoder. The kernel decodes the bytes in its own format, so feeding
+# a bf8 kernel e4m3 bytes fails every element of a correct kernel.
+_F8_ENCODERS = {"fp8e4m3": _fp8e4m3_encode, "bf8e5m2": _bf8e5m2_encode}
+
+
+def _gemm_f8_dtype(manifest: dict) -> str:
+    """The 8-bit A/B dtype of a ``gemm_fp8`` manifest, per the ``A`` ptr type.
+
+    Raises on anything else rather than guessing: the encoder must match what
+    the kernel decodes.
+    """
+    sig = manifest.get("args_signature", [])
+    ptr_type = next((a.get("type", "") for a in sig if a.get("name") == "A"), "")
+    for dtype in _F8_ENCODERS:
+        if dtype in ptr_type:
+            return dtype
+    raise ValueError(
+        f"gemm_fp8 manifest: A pointer type {ptr_type!r} is not one of "
+        f"{', '.join(_F8_ENCODERS)}"
+    )
+
+
+def _encode_exact(np, x, table, name):
+    """Encode f32 values to the 8-bit codes of ``table``, rejecting anything
+    inexact.
 
     This runner's verification argument rests on the device seeing exactly the
     numbers the reference multiplies, so a silent round here would quietly
     demote the gate to a tolerance check. Vectorised via the inverted decode
     table — a Python loop over a 4096x8192 operand is not viable.
     """
-    table = _fp8e4m3_decode_table(np)
     keep = np.isfinite(table)
     vals = table[keep]
     codes = np.arange(256, dtype=np.uint8)[keep]
@@ -192,17 +245,19 @@ def _fp8e4m3_encode(np, x):
     xf = np.ascontiguousarray(x, dtype=np.float32).ravel()
     idx = np.minimum(np.searchsorted(uniq, xf), uniq.size - 1)
     if not np.array_equal(uniq[idx], xf):
-        raise ValueError("fp8e4m3 encode: value not exactly representable in e4m3")
+        raise ValueError(f"{name} encode: value not exactly representable in {name}")
     return uniq_codes[idx].reshape(np.shape(x))
 
 
 def run_gemm_fp8_manifest_problem(
     manifest: dict, shape: Optional[Tuple[int, int, int]], verify: bool
 ) -> tuple:
-    """fp8 WMMA GEMM (e4m3 A/B in, bf16 C out): ``C = A @ B.T``, exact.
+    """8-bit WMMA GEMM (fp8 e4m3 or bf8 e5m2 A/B in, bf16 C out): ``C = A @ B.T``,
+    exact.
 
-    Inputs are integers in -5..5, every one of which is exact in e4m3 (four
-    significand bits). With ``|sum| <= 25 * K`` the fp32 accumulator is exact
+    The operand format comes from the manifest's ``A`` pointer type. Inputs are
+    integers in -5..5, every one of which is exact in e4m3 (four significand
+    bits) and in e5m2 (three). With ``|sum| <= 25 * K`` the fp32 accumulator is exact
     for any K below ~670k, so summation order cannot change the result and the
     only rounding left is the kernel's final deterministic RNE to bf16 — which
     the reference reproduces. Hence an exact compare rather than a tolerance.
@@ -218,11 +273,12 @@ def run_gemm_fp8_manifest_problem(
             f"gemm_fp8 verify: K={K} overflows the exact-fp32-accumulate "
             f"argument (25*K must stay below 2^24); lower K or widen the check"
         )
+    encode = _F8_ENCODERS[_gemm_f8_dtype(manifest)]
     rng = np.random.default_rng(0xC0FFEE)
     A_f32 = rng.integers(-5, 6, size=(M, K), dtype=np.int16).astype(np.float32)
     B_f32 = rng.integers(-5, 6, size=(N, K), dtype=np.int16).astype(np.float32)
-    A = _fp8e4m3_encode(np, A_f32)
-    B = _fp8e4m3_encode(np, B_f32)
+    A = encode(np, A_f32)
+    B = encode(np, B_f32)
     # C is bf16; carry the raw halves as uint16 so no float16 view lies about
     # the encoding on the way to and from the device.
     C = np.empty((M, N), dtype=np.uint16)

@@ -603,6 +603,46 @@ def _spec(idx: int) -> UniversalGemmSpec:
             ),
             "gfx1250",
         )
+    if idx == 27:
+        # The only bf8 GEMM config. bf8 e5m2 shares every code path with fp8
+        # e4m3 except the operand dtype, which selects the bf8 x bf8 K=64 WMMA
+        # intrinsic and the operand element type -- exactly what an fp8 config
+        # cannot catch. TDM ping-pong + cshuffle, the shape the fp8 work ships.
+        return (
+            UniversalGemmSpec(
+                name="test_wmma_bf8_k64",
+                tile=TileSpec(
+                    tile_m=128,
+                    tile_n=128,
+                    tile_k=128,
+                    warp_m=2,
+                    warp_n=2,
+                    warp_k=1,
+                    warp_tile_m=16,
+                    warp_tile_n=16,
+                    warp_tile_k=64,
+                ),
+                trait=TraitSpec(
+                    pipeline="mem",
+                    scheduler="intrawave",
+                    epilogue="cshuffle",
+                    tdm=True,
+                    tdm_depth=2,
+                    lds_k_pad=16,
+                ),
+                data=DataSpec(
+                    dtype_a="bf8e5m2",
+                    dtype_b="bf8e5m2",
+                    dtype_c="bf16",
+                    dtype_acc="fp32",
+                    layout="RCR",
+                ),
+                wave_size=32,
+                block_size=128,
+                batched=False,
+            ),
+            "gfx1250",
+        )
     raise SystemExit(f"unknown config index {idx}")
 
 
@@ -638,7 +678,7 @@ def main() -> int:
     return run_emit(
         _spec,
         build_universal_gemm,
-        usage="usage: gemm_emit.py <config_index 0..26>\n",
+        usage="usage: gemm_emit.py <config_index 0..27>\n",
     )
 
 
