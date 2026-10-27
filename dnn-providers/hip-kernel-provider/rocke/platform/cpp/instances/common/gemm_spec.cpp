@@ -208,6 +208,9 @@ rocke_gemm_universal_spec_t rocke_gemm_universal_spec_default(void)
     s.trait.cshuffle_no_alias = false; /* default: alias cshuffle C onto A/B */
     s.trait.ab_load_elem_bytes_set = false; /* Python None (dtype-resolved) */
     s.trait.ab_load_elem_bytes = 0;
+    s.trait.split_barrier = false;
+    s.trait.tdm_alternate_issuers = false;
+    s.trait.tdm_early_refill = false;
 
     /* DataSpec defaults. */
     s.data.dtype_a = "fp16"; /* default "fp16" */
@@ -824,6 +827,54 @@ bool rocke_gemm_universal_is_valid_spec(const rocke_gemm_universal_spec_t* spec,
     if(spec->trait.tdm_depth != 1 && !spec->trait.tdm)
     {
         CK_GEMM_REJECT("tdm_depth is only meaningful with tdm=True");
+    }
+    /* The signal is raised from inside the WMMA phase of the TDM ping-pong
+     * (depth 2) or ring (depth >= 3) loop. Any other loop shape would wait on
+     * a barrier nothing signals, which hangs the GPU rather than failing,
+     * hence the narrow gate. */
+    if(spec->trait.split_barrier)
+    {
+        if(strcmp(family, "wmma") != 0 || strcmp(spec->trait.pipeline, "mem") != 0)
+        {
+            CK_GEMM_REJECT("split_barrier needs the WMMA 'mem' pipeline");
+        }
+        if(!spec->trait.tdm || spec->trait.tdm_depth < 2)
+        {
+            CK_GEMM_REJECT("split_barrier needs tdm=True with tdm_depth >= 2");
+        }
+        if(spec->trait.split_k != 1)
+        {
+            CK_GEMM_REJECT("split_barrier does not support split_k");
+        }
+    }
+
+    /* The issuer of a half is chosen per fill, which only keeps one fill per
+     * issuer outstanding (and so every TENSORcnt wait exact) in the ping-pong. */
+    if(spec->trait.tdm_alternate_issuers)
+    {
+        if(!spec->trait.tdm || spec->trait.tdm_depth != 2)
+        {
+            CK_GEMM_REJECT("tdm_alternate_issuers needs tdm=True with tdm_depth == 2");
+        }
+        if(spec->block_size / spec->wave_size < 4)
+        {
+            CK_GEMM_REJECT("tdm_alternate_issuers needs at least four waves");
+        }
+    }
+
+    /* The early refill pairs every wait with the split-barrier signal and
+     * relies on the alternating issuers to keep one fill per issuer
+     * outstanding. */
+    if(spec->trait.tdm_early_refill)
+    {
+        if(!(spec->trait.split_barrier && spec->trait.tdm_alternate_issuers))
+        {
+            CK_GEMM_REJECT("tdm_early_refill needs split_barrier and tdm_alternate_issuers");
+        }
+        if(spec->trait.tdm_depth != 2)
+        {
+            CK_GEMM_REJECT("tdm_early_refill needs tdm_depth == 2");
+        }
     }
 
     /* Geometry divisibility. */

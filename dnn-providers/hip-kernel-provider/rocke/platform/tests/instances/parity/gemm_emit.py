@@ -558,6 +558,51 @@ def _spec(idx: int) -> UniversalGemmSpec:
             ),
             "gfx1250",
         )
+    if idx in _TDM_SYNC_CONFIGS:
+        # The gfx1250 TDM K-loop synchronisation traits, on config 21's
+        # geometry (four waves, so the alternating issuers have two pairs).
+        # Each trait reshapes a different loop -- the depth-2 ping-pong, the
+        # depth >= 3 ring, the issuer gates of the load phase, and the two-tile
+        # early-refill loop -- so each needs its own config to be compared.
+        name, depth, split, alt, early = _TDM_SYNC_CONFIGS[idx]
+        return (
+            UniversalGemmSpec(
+                name=name,
+                tile=TileSpec(
+                    tile_m=128,
+                    tile_n=128,
+                    tile_k=256,
+                    warp_m=2,
+                    warp_n=2,
+                    warp_k=1,
+                    warp_tile_m=16,
+                    warp_tile_n=16,
+                    warp_tile_k=128,
+                ),
+                trait=TraitSpec(
+                    pipeline="mem",
+                    scheduler="intrawave",
+                    epilogue="cshuffle",
+                    tdm=True,
+                    tdm_depth=depth,
+                    lds_k_pad=48,
+                    split_barrier=split,
+                    tdm_alternate_issuers=alt,
+                    tdm_early_refill=early,
+                ),
+                data=DataSpec(
+                    dtype_a="fp8e4m3",
+                    dtype_b="fp8e4m3",
+                    dtype_c="bf16",
+                    dtype_acc="fp32",
+                    layout="RCR",
+                ),
+                wave_size=32,
+                block_size=128,
+                batched=False,
+            ),
+            "gfx1250",
+        )
     raise SystemExit(f"unknown config index {idx}")
 
 
@@ -578,11 +623,22 @@ _TDM_CONFIGS = {
 }
 
 
+# idx -> (name, tdm_depth, split_barrier, tdm_alternate_issuers,
+# tdm_early_refill). Appended after config 21 so no existing index moves.
+_TDM_SYNC_CONFIGS = {
+    22: ("test_tdm_split_barrier_d2", 2, True, False, False),
+    23: ("test_tdm_split_barrier_d3_ring", 3, True, False, False),
+    24: ("test_tdm_alternate_issuers", 2, False, True, False),
+    25: ("test_tdm_split_alternate", 2, True, True, False),
+    26: ("test_tdm_early_refill", 2, True, True, True),
+}
+
+
 def main() -> int:
     return run_emit(
         _spec,
         build_universal_gemm,
-        usage="usage: gemm_emit.py <config_index 0..21>\n",
+        usage="usage: gemm_emit.py <config_index 0..26>\n",
     )
 
 

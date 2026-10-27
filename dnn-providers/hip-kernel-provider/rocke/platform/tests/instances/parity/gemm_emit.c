@@ -479,6 +479,58 @@ static int make_spec(int idx, rocke_gemm_universal_spec_t* spec)
         spec->block_size      = 128;
         spec->batched         = false;
         break;
+    case 22: /* TDM sync traits on config 21's geometry */
+    case 23:
+    case 24:
+    case 25:
+    case 26:
+    {
+        /* idx -> (name, tdm_depth, split_barrier, tdm_alternate_issuers,
+         * tdm_early_refill); mirrors _TDM_SYNC_CONFIGS in gemm_emit.py. */
+        static const struct
+        {
+            const char* name;
+            int depth;
+            bool split;
+            bool alt;
+            bool early;
+        } sync_cfgs[] = {
+            {"test_tdm_split_barrier_d2", 2, true, false, false},
+            {"test_tdm_split_barrier_d3_ring", 3, true, false, false},
+            {"test_tdm_alternate_issuers", 2, false, true, false},
+            {"test_tdm_split_alternate", 2, true, true, false},
+            {"test_tdm_early_refill", 2, true, true, true},
+        };
+        int c = idx - 22;
+        spec->name = sync_cfgs[c].name;
+        spec->tile = (rocke_gemm_tile_spec_t){.tile_m = 128,
+                                              .tile_n = 128,
+                                              .tile_k = 256,
+                                              .warp_m = 2,
+                                              .warp_n = 2,
+                                              .warp_k = 1,
+                                              .warp_tile_m = 16,
+                                              .warp_tile_n = 16,
+                                              .warp_tile_k = 128};
+        spec->trait.pipeline = "mem";
+        spec->trait.scheduler = "intrawave";
+        spec->trait.epilogue = "cshuffle";
+        spec->trait.tdm = true;
+        spec->trait.tdm_depth = sync_cfgs[c].depth;
+        spec->trait.lds_k_pad = 48;
+        spec->trait.split_barrier = sync_cfgs[c].split;
+        spec->trait.tdm_alternate_issuers = sync_cfgs[c].alt;
+        spec->trait.tdm_early_refill = sync_cfgs[c].early;
+        spec->data.dtype_a = "fp8e4m3";
+        spec->data.dtype_b = "fp8e4m3";
+        spec->data.dtype_c = "bf16";
+        spec->data.dtype_acc = "fp32";
+        spec->data.layout = "RCR";
+        spec->wave_size = 32;
+        spec->block_size = 128;
+        spec->batched = false;
+        break;
+    }
     default:
         return -1;
     }
@@ -486,7 +538,7 @@ static int make_spec(int idx, rocke_gemm_universal_spec_t* spec)
     return 0;
 }
 
-/* Config 9 exercises gfx942; configs 11-21 gfx1250; the rest use the
+/* Config 9 exercises gfx942; configs 11-26 gfx1250; the rest use the
  * gfx950 baseline. */
 static const char* arch_for(int idx)
 {
@@ -494,7 +546,7 @@ static const char* arch_for(int idx)
     {
         return "gfx942";
     }
-    if(idx >= 11 && idx <= 21)
+    if(idx >= 11 && idx <= 26)
     {
         return "gfx1250";
     }

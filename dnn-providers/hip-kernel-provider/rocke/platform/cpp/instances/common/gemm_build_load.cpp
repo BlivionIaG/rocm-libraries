@@ -409,7 +409,8 @@ static void rocke_gemm_tdm_issue(rocke_gemm_build_ctx_t* ctx,
                                  rocke_value_t* batch_off,
                                  rocke_value_t* k_off,
                                  rocke_value_t* k_remaining,
-                                 rocke_value_t* zero)
+                                 rocke_value_t* zero,
+                                 rocke_gemm_emit_hook_t before_issue)
 {
     rocke_ir_builder_t* b = ctx->b;
     rocke_value_t* origin
@@ -439,6 +440,8 @@ static void rocke_gemm_tdm_issue(rocke_gemm_build_ctx_t* ctx,
     {
         return;
     }
+    if(before_issue.fn != NULL)
+        before_issue.fn(ctx, before_issue.user);
     rocke_b_tensor_load_to_lds(b, groups[0], groups[1], groups[2], groups[3], groups[4], 0);
 }
 
@@ -448,6 +451,18 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
                                 rocke_value_t* k_off,
                                 int parity_imm,
                                 rocke_value_t* parity_v)
+{
+    rocke_gemm_emit_hook_t none = {NULL, NULL};
+    rocke_gemm_emit_load_phase_ex(ctx, A_dst, B_dst, k_off, parity_imm, parity_v, none);
+}
+
+void rocke_gemm_emit_load_phase_ex(rocke_gemm_build_ctx_t* ctx,
+                                   rocke_value_t* A_dst,
+                                   rocke_value_t* B_dst,
+                                   rocke_value_t* k_off,
+                                   int parity_imm,
+                                   rocke_value_t* parity_v,
+                                   rocke_gemm_emit_hook_t before_issue)
 {
     rocke_ir_builder_t* b = ctx->b;
     const rocke_gemm_universal_spec_t* spec = ctx->spec;
@@ -496,8 +511,26 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
         /* tensor_load_to_lds is wave-level; one wave owns each operand. */
         if(ctx->tdm_waves > 1)
         {
-            rocke_if_t a_gate
-                = rocke_b_scf_if(b, rocke_b_cmp_eq(b, ctx->tdm_wave_id, zero));
+            /* Waves 2p / 2p+1 own the fills of half p with
+             * tdm_alternate_issuers; waves 0 / 1 otherwise. The default emits
+             * the B-wave constant after the A gate, where it always has. */
+            rocke_value_t* a_wave = zero;
+            rocke_value_t* b_wave = NULL;
+            if(spec->trait.tdm_alternate_issuers)
+            {
+                if(parity_v != NULL)
+                {
+                    rocke_value_t* c2 = rocke_b_const_i32(b, 2);
+                    a_wave = rocke_b_mul(b, parity_v, c2);
+                }
+                else
+                {
+                    a_wave = rocke_b_const_i32(b, 2 * parity_imm);
+                }
+                rocke_value_t* c1 = rocke_b_const_i32(b, 1);
+                b_wave = rocke_b_add(b, a_wave, c1);
+            }
+            rocke_if_t a_gate = rocke_b_scf_if(b, rocke_b_cmp_eq(b, ctx->tdm_wave_id, a_wave));
             rocke_b_region_enter(b, a_gate.then_region);
             rocke_gemm_tdm_issue(ctx,
                                  ctx->A,
@@ -508,11 +541,12 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
                                  ctx->batch_off_a,
                                  k_off,
                                  k_remaining,
-                                 zero);
+                                 zero,
+                                 before_issue);
             rocke_b_region_leave(b);
-            rocke_value_t* one = rocke_b_const_i32(b, 1);
-            rocke_if_t b_gate
-                = rocke_b_scf_if(b, rocke_b_cmp_eq(b, ctx->tdm_wave_id, one));
+            if(b_wave == NULL)
+                b_wave = rocke_b_const_i32(b, 1);
+            rocke_if_t b_gate = rocke_b_scf_if(b, rocke_b_cmp_eq(b, ctx->tdm_wave_id, b_wave));
             rocke_b_region_enter(b, b_gate.then_region);
             rocke_gemm_tdm_issue(ctx,
                                  ctx->Bp,
@@ -523,7 +557,8 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
                                  ctx->batch_off_b,
                                  k_off,
                                  k_remaining,
-                                 zero);
+                                 zero,
+                                 before_issue);
             rocke_b_region_leave(b);
         }
         else
@@ -537,7 +572,8 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
                                  ctx->batch_off_a,
                                  k_off,
                                  k_remaining,
-                                 zero);
+                                 zero,
+                                 before_issue);
             rocke_gemm_tdm_issue(ctx,
                                  ctx->Bp,
                                  ctx->block_n_off,
@@ -547,7 +583,8 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
                                  ctx->batch_off_b,
                                  k_off,
                                  k_remaining,
-                                 zero);
+                                 zero,
+                                 before_issue);
         }
         return;
     }
@@ -974,6 +1011,25 @@ void rocke_gemm_emit_wmma_phase(rocke_gemm_build_ctx_t* ctx,
                                 rocke_value_t* parity_v,
                                 rocke_value_t** out_accs)
 {
+    rocke_gemm_emit_hook_t none = {NULL, NULL};
+    rocke_gemm_emit_wmma_phase_ex(
+        ctx, A_src, B_src, iter_vars, num_iter_vars, parity_imm, parity_v, out_accs, none, none);
+}
+
+/* after_last_reads is emitted once the last k-atom's fragment loads are issued
+ * and before its WMMAs -- the earliest point at which this wave has no further
+ * reads of the tile (the split-barrier signal). */
+void rocke_gemm_emit_wmma_phase_ex(rocke_gemm_build_ctx_t* ctx,
+                                   rocke_value_t* A_src,
+                                   rocke_value_t* B_src,
+                                   rocke_value_t* const* iter_vars,
+                                   int num_iter_vars,
+                                   int parity_imm,
+                                   rocke_value_t* parity_v,
+                                   rocke_value_t** out_accs,
+                                   rocke_gemm_emit_hook_t after_last_reads,
+                                   rocke_gemm_emit_hook_t after_first_row)
+{
     rocke_ir_builder_t* b = ctx->b;
     const rocke_gemm_tile_spec_t* t = &ctx->spec->tile;
     (void)num_iter_vars;
@@ -1048,6 +1104,9 @@ void rocke_gemm_emit_wmma_phase(rocke_gemm_build_ctx_t* ctx,
             b_cols[ni] = rocke_gemm_emit_frag_smem_load(
                 ctx, B_src, b_col_in_atom, b_k_in_atom, atom_row, k_tile_base, ctx->b_per_lane);
         }
+        bool last_k_atom = kk == ctx->k_atoms - 1;
+        if(after_last_reads.fn != NULL && last_k_atom)
+            after_last_reads.fn(ctx, after_last_reads.user);
         int flat = 0;
         for(int mi = 0; mi < ctx->mfmas_m; ++mi)
         {
@@ -1057,6 +1116,8 @@ void rocke_gemm_emit_wmma_phase(rocke_gemm_build_ctx_t* ctx,
                     = rocke_gemm_emit_mma(b, ctx->op, a_rows[mi], b_cols[ni], out_accs[flat]);
                 ++flat;
             }
+            if(after_first_row.fn != NULL && last_k_atom && mi == 0)
+                after_first_row.fn(ctx, after_first_row.user);
         }
     }
 }

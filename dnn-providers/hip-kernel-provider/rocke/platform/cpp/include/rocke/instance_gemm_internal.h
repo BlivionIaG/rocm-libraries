@@ -361,6 +361,24 @@ void rocke_gemm_emit_load_phase(rocke_gemm_build_ctx_t* ctx,
                                 int parity_imm,
                                 rocke_value_t* parity_v);
 
+/* An emission hook: the C form of the Python Optional[Callable[[], None]]
+ * arguments of emit_load_phase / _emit_wmma_phase. NULL fn == Python None. */
+typedef struct rocke_gemm_emit_hook
+{
+    void (*fn)(rocke_gemm_build_ctx_t* ctx, void* user);
+    void* user;
+} rocke_gemm_emit_hook_t;
+
+/* emit_load_phase with before_issue: on the TDM path, emitted after each
+ * descriptor is built and right before its tensor_load_to_lds. */
+void rocke_gemm_emit_load_phase_ex(rocke_gemm_build_ctx_t* ctx,
+                                   rocke_value_t* A_dst,
+                                   rocke_value_t* B_dst,
+                                   rocke_value_t* k_off,
+                                   int parity_imm,
+                                   rocke_value_t* parity_v,
+                                   rocke_gemm_emit_hook_t before_issue);
+
 /* _emit_frag_smem_load(ctx, src, mn_in_atom, k_in_atom, atom_mn_base,
  * k_tile_base, frag_len): one frag_len-wide operand fragment from a row-major
  * LDS tile (8-wide chunked + vec_concat for wide WMMA frags). */
@@ -383,6 +401,20 @@ void rocke_gemm_emit_wmma_phase(rocke_gemm_build_ctx_t* ctx,
                                 int parity_imm,
                                 rocke_value_t* parity_v,
                                 rocke_value_t** out_accs);
+
+/* _emit_wmma_phase with its two hooks. after_last_reads is emitted once the
+ * last k-atom's fragment loads are issued and before its WMMAs; after_first_row
+ * after that k-atom's first row (mi == 0) of WMMAs. */
+void rocke_gemm_emit_wmma_phase_ex(rocke_gemm_build_ctx_t* ctx,
+                                   rocke_value_t* A_src,
+                                   rocke_value_t* B_src,
+                                   rocke_value_t* const* iter_vars,
+                                   int num_iter_vars,
+                                   int parity_imm,
+                                   rocke_value_t* parity_v,
+                                   rocke_value_t** out_accs,
+                                   rocke_gemm_emit_hook_t after_last_reads,
+                                   rocke_gemm_emit_hook_t after_first_row);
 
 /* emit_mfma_phase(ctx, A_src, B_src, iter_vars[n], parity_imm, parity_v,
  * out_accs[n]): one K-tile of MMAs across every per-warp atom position + K
@@ -414,6 +446,10 @@ void rocke_gemm_emit_kloop_prefetch(rocke_gemm_build_ctx_t* ctx);
 
 /* _emit_kloop_tdm_ring(ctx): TDM depth >= 3 modular-ring K-loop. */
 void rocke_gemm_emit_kloop_tdm_ring(rocke_gemm_build_ctx_t* ctx);
+
+/* _emit_kloop_tdm_early_refill(ctx): depth-2 TDM ping-pong that refills each
+ * half as soon as it has been read (trait.tdm_early_refill). */
+void rocke_gemm_emit_kloop_tdm_early_refill(rocke_gemm_build_ctx_t* ctx);
 
 /* _emit_epilogue(ctx): dispatch to the cshuffle or default epilogue using
  * ctx->for_results and the captured warp/lane/offset Values. */

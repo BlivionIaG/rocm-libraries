@@ -273,7 +273,12 @@ void fill_universal_spec(rocke_gemm_universal_spec_t* spec,
                               "active_tile_skip",
                               "lds_k_pad",
                               "lds_swizzle",
-                              "ab_load_elem_bytes"};
+                              "ab_load_elem_bytes",
+                              "tdm",
+                              "tdm_depth",
+                              "split_barrier",
+                              "tdm_alternate_issuers",
+                              "tdm_early_refill"};
         for(const char* k : keys)
         {
             py::dict got = pick(trait, k);
@@ -317,6 +322,13 @@ void fill_universal_spec(rocke_gemm_universal_spec_t* spec,
             spec->trait.ab_load_elem_bytes_set = true;
             spec->trait.ab_load_elem_bytes = tr["ab_load_elem_bytes"].cast<int>();
         }
+        spec->trait.tdm = dict_bool(tr, "tdm", spec->trait.tdm);
+        spec->trait.tdm_depth = dict_int(tr, "tdm_depth", spec->trait.tdm_depth);
+        spec->trait.split_barrier = dict_bool(tr, "split_barrier", spec->trait.split_barrier);
+        spec->trait.tdm_alternate_issuers
+            = dict_bool(tr, "tdm_alternate_issuers", spec->trait.tdm_alternate_issuers);
+        spec->trait.tdm_early_refill
+            = dict_bool(tr, "tdm_early_refill", spec->trait.tdm_early_refill);
     }
 
     /* ---- data ---- */
@@ -433,7 +445,12 @@ SpecHolder build_spec(const py::dict& root)
                               "active_tile_skip",
                               "lds_k_pad",
                               "lds_swizzle",
-                              "ab_load_elem_bytes"};
+                              "ab_load_elem_bytes",
+                              "tdm",
+                              "tdm_depth",
+                              "split_barrier",
+                              "tdm_alternate_issuers",
+                              "tdm_early_refill"};
         for(const char* k : keys)
         {
             py::dict got = pick(trait, k);
@@ -478,6 +495,13 @@ SpecHolder build_spec(const py::dict& root)
             h.spec.trait.ab_load_elem_bytes_set = true;
             h.spec.trait.ab_load_elem_bytes = tr["ab_load_elem_bytes"].cast<int>();
         }
+        h.spec.trait.tdm = dict_bool(tr, "tdm", h.spec.trait.tdm);
+        h.spec.trait.tdm_depth = dict_int(tr, "tdm_depth", h.spec.trait.tdm_depth);
+        h.spec.trait.split_barrier = dict_bool(tr, "split_barrier", h.spec.trait.split_barrier);
+        h.spec.trait.tdm_alternate_issuers
+            = dict_bool(tr, "tdm_alternate_issuers", h.spec.trait.tdm_alternate_issuers);
+        h.spec.trait.tdm_early_refill
+            = dict_bool(tr, "tdm_early_refill", h.spec.trait.tdm_early_refill);
     }
 
     /* ---- data ---- */

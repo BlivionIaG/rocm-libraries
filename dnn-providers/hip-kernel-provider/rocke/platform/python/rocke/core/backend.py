@@ -462,6 +462,11 @@ def universal_gemm_spec_to_dict(spec: Any) -> Dict[str, Any]:
         lds_k_pad=tr.lds_k_pad,
         lds_swizzle=tr.lds_swizzle,
         ab_load_elem_bytes=tr.ab_load_elem_bytes,
+        tdm=tr.tdm,
+        tdm_depth=tr.tdm_depth,
+        split_barrier=tr.split_barrier,
+        tdm_alternate_issuers=tr.tdm_alternate_issuers,
+        tdm_early_refill=tr.tdm_early_refill,
         # data
         dtype_a=d.dtype_a,
         dtype_b=d.dtype_b,
@@ -661,6 +666,11 @@ def _gemm_subspec_to_dict(spec: Any) -> Dict[str, Any]:
         lds_k_pad=tr.lds_k_pad,
         lds_swizzle=tr.lds_swizzle,
         ab_load_elem_bytes=tr.ab_load_elem_bytes,
+        tdm=tr.tdm,
+        tdm_depth=tr.tdm_depth,
+        split_barrier=tr.split_barrier,
+        tdm_alternate_issuers=tr.tdm_alternate_issuers,
+        tdm_early_refill=tr.tdm_early_refill,
         wave_size=spec.wave_size,
         block_size=spec.block_size,
     )

@@ -134,6 +134,20 @@ typedef struct rocke_gemm_trait_spec
      * on f16/bf16, which resolve to 2 either way. */
     bool ab_load_elem_bytes_set; /* false => Python None (dtype-resolved) */
     int ab_load_elem_bytes;
+    /* Split the per-K-tile workgroup barrier of the TDM K-loop (depth-2
+     * ping-pong or depth >= 3 ring) into a signal, raised once the wave's last
+     * fragment reads of the tile have drained, and a wait at the top of the
+     * next iteration. WMMA `mem` pipeline with tdm and tdm_depth >= 2 only.
+     * Python TraitSpec.split_barrier. */
+    bool split_barrier; /* default false */
+    /* Waves 2p / 2p+1 issue the TDM fills of LDS half p instead of always
+     * waves 0 / 1. tdm with tdm_depth == 2 and >= 4 waves only.
+     * Python TraitSpec.tdm_alternate_issuers. */
+    bool tdm_alternate_issuers; /* default false */
+    /* Refill each LDS half as soon as every wave has read it: two K-tiles per
+     * iteration with static parity. Needs split_barrier and
+     * tdm_alternate_issuers. Python TraitSpec.tdm_early_refill. */
+    bool tdm_early_refill; /* default false */
 } rocke_gemm_trait_spec_t;
 
 /* ------------------------------------------------------------------ DataSpec */
