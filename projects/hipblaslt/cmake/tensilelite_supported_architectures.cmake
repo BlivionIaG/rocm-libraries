@@ -49,7 +49,7 @@ set(BASE_ARCHITECTURES)
 # but are NOT included in the default "all" build in hipBLASLt. This is because "extops" builds are not supported
 # for legacy devices. Including these architectures would result in build failures or incomplete feature support.
 #
-# gfx1030 (RDNA2) can be built: it has no matrix instructions, so it uses the
+# The RDNA2 family can be built: it has no matrix instructions, so it uses the
 # non-MatrixInstruction (V_DOT2 / FMA) kernel path, and the ExtOp device-library
 # generators (Amax, LayerNorm, Softmax) already list gfx1030 among the
 # architectures they emit for.

@@ -109,21 +109,14 @@ ARCH_BUILD_ALIASES = {
 # The architecture whose tuned logic a device name is built from, when it is
 # not the one it is named after.
 #
-# RDNA2 is one ISA with several names.  gfx1030 is Navi 21, gfx1031 is
-# Navi 22, gfx1032 is Navi 23, gfx1034 is Navi 24 and gfx1035 is the
-# Rembrandt and Phoenix integrated GPUs.  They execute the same
-# instructions, so they run one solution set, and rocBLAS ships a single
-# navi21 library for the whole family.
-#
-# The library files cannot be shared the same way: the runtime looks a library
-# up by the name the device reports, so a gfx1031 part reads
+# The library files cannot be shared the way rocBLAS shares them: the runtime
+# looks a library up by the name the device reports, so a gfx1031 part reads
 # TensileLibrary_lazy_gfx1031 and not the gfx1030 one.  Each name therefore
 # gets its own library file, built from Navi 21's logic and keyed under the
 # name the device reports.
 #
 # This is not the build-alias table: an alias there names a target no compiler
-# knows, while these are compiler targets in their own right, with their own
-# ISA, their own capabilities and their own code object.
+# knows, while these are compiler targets in their own right.
 ARCH_TUNING_ARCHES = {
     "gfx1031": "gfx1030",
     "gfx1032": "gfx1030",
