@@ -1964,7 +1964,7 @@
           patch=0,
         ),
       ]),
-      'len': 25,
+      'len': 29,
       'type': 'list',
     }),
     'InitCIterWmma': dict({

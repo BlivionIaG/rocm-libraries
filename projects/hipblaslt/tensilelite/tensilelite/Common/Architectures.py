@@ -58,6 +58,15 @@ architectureMap = {
     "gfx1011": "navi12",
     "gfx1012": "navi14",
     "gfx1030": "navi21",
+    # The rest of RDNA2: the same ISA under the other product names -- Navi 22
+    # (gfx1031), Navi 23 (gfx1032), Navi 24 (gfx1034) and the Rembrandt and
+    # Phoenix integrated GPUs (gfx1035).  They execute the same instructions
+    # as Navi 21, so they run Navi 21's solution set, and the logic files they
+    # read are the navi21 ones.
+    "gfx1031": "navi21",
+    "gfx1032": "navi21",
+    "gfx1034": "navi21",
+    "gfx1035": "navi21",
     "gfx1100": "navi31",
     "gfx1101": "navi32",
     "gfx1102": "navi33",
@@ -97,6 +106,31 @@ ARCH_BUILD_ALIASES = {
     },
 }
 
+# The architecture whose tuned logic a device name is built from, when it is
+# not the one it is named after.
+#
+# RDNA2 is one ISA with several names.  gfx1030 is Navi 21, gfx1031 is
+# Navi 22, gfx1032 is Navi 23, gfx1034 is Navi 24 and gfx1035 is the
+# Rembrandt and Phoenix integrated GPUs.  They execute the same
+# instructions, so they run one solution set, and rocBLAS ships a single
+# navi21 library for the whole family.
+#
+# The library files cannot be shared the same way: the runtime looks a library
+# up by the name the device reports, so a gfx1031 part reads
+# TensileLibrary_lazy_gfx1031 and not the gfx1030 one.  Each name therefore
+# gets its own library file, built from Navi 21's logic and keyed under the
+# name the device reports.
+#
+# This is not the build-alias table: an alias there names a target no compiler
+# knows, while these are compiler targets in their own right, with their own
+# ISA, their own capabilities and their own code object.
+ARCH_TUNING_ARCHES = {
+    "gfx1031": "gfx1030",
+    "gfx1032": "gfx1030",
+    "gfx1034": "gfx1030",
+    "gfx1035": "gfx1030",
+}
+
 
 def _buildAlias(spec: str) -> Optional[dict]:
     return ARCH_BUILD_ALIASES.get(baseArchName(spec))
@@ -112,7 +146,11 @@ def compilerTargetOf(spec: str) -> str:
 def tuningArchOf(spec: str) -> str:
     """The architecture whose logic and capability overrides a spec builds; the spec itself unless aliased."""
     alias = _buildAlias(spec)
-    return alias["tuningArch"] if alias else spec
+    if alias:
+        return alias["tuningArch"]
+    # A name that tunes from another architecture's logic, and not from its
+    # own: the RDNA2 family shares Navi 21's solution set.
+    return ARCH_TUNING_ARCHES.get(baseArchName(spec), spec)
 
 
 def deviceTargetFeaturesOf(spec: str) -> List[str]:
@@ -175,6 +213,14 @@ SUPPORTED_ISA = [
     IsaVersion(10, 1, 1),
     IsaVersion(10, 1, 2),
     IsaVersion(10, 3, 0),
+    # The rest of RDNA2: Navi 22 (gfx1031), Navi 23 (gfx1032), Navi 24
+    # (gfx1034) and the Rembrandt and Phoenix integrated GPUs (gfx1035).
+    # Same instructions as Navi 21, so same capabilities; each is its own ISA
+    # because the driver gives each part its own name.
+    IsaVersion(10, 3, 1),
+    IsaVersion(10, 3, 2),
+    IsaVersion(10, 3, 4),
+    IsaVersion(10, 3, 5),
     IsaVersion(11, 0, 0),
     IsaVersion(11, 0, 1),
     IsaVersion(11, 0, 2),
@@ -450,6 +496,11 @@ def isaCollisionFreeGroups(specs: List[str]) -> List[List[str]]:
         (``gfx942:xnack+`` and ``gfx942:xnack-``) share both the ISA and the
         name, and one run covers them together. Only a differing name over the
         same ISA -- a stepping beside what it steps from -- has to split.
+
+        Sharing a tuned tree is a second reason to split. One run renames the
+        tree it builds to the name it is building for, so two names that tune
+        from one tree cannot both be served by it: the second would get the
+        first's library and the first none.
         """
         name = baseArchName(spec)
         isa = gfxToIsa(name)
@@ -457,6 +508,12 @@ def isaCollisionFreeGroups(specs: List[str]) -> List[List[str]]:
             # Names no ISA, so it collides with nothing. The run that has to make
             # sense of it rejects it; the partitioning does not.
             return False
+        tuning = tuningArchOf(name)
+        if any(
+            tuningArchOf(baseArchName(o)) == tuning and baseArchName(o) != name
+            for o in group
+        ):
+            return True
         return any(
             gfxToIsa(baseArchName(o)) == isa and baseArchName(o) != name for o in group
         )
