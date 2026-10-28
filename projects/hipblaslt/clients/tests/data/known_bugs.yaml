@@ -63,18 +63,19 @@ Known bugs:
   # size-1 M or N free dim.
   # REMOVE once gfx950 gets a width-1 NT complex kernel.
   - { name: matmul_batch_complex_general_batch_edge, function: matmul, transA: N, transB: T, known_bug_platforms: gfx950 }
-  # The gfx1030 (RDNA2) int8 GEMM path.
+  # The int8 GEMM path on the RDNA2 names that have no int8 logic tree yet.
   #
-  # The int8 dot4 code path in tensilelite works after #4, but no gfx1030 int8
-  # logic tree selects it yet.  The tree lands in the RDNA2 PR of this series,
-  # and that PR removes this entry.
+  # The int8 dot4 code path in tensilelite works after the kernel-path PR, and
+  # gfx1030 has an int8 logic tree that selects it.  The other four RDNA2
+  # names do not have one yet; their trees land in the pull request that adds
+  # the RDNA2 family, and that pull request removes this entry.
   #
-  # Until the tree lands, the int8 matmul case has no correct solution on the
-  # RDNA2 family: the device library has no int8 solution at all.  If the
-  # RDNA2 PR is merged on its own, its int8 tree is built with the unfixed
-  # generator, which returns a wrong result rather than no solution, so the
-  # entry also holds the lane in that order.
+  # Until their trees land, the int8 matmul case has no correct solution on
+  # those four: the device library has no int8 solution at all.  If the
+  # family pull request is merged on its own, its int8 trees are built with
+  # the unfixed generator, which returns a wrong result rather than no
+  # solution, so the entry also holds the lane in that order.
   #
-  # Tracked by #3.  REMOVE this entry when the gfx1030 int8 logic tree lands.
-  # Review by 2026-12-15.
-  - { function: matmul, a_type: i8_r, b_type: i8_r, known_bug_platforms: "gfx1030, gfx1031, gfx1032, gfx1034, gfx1035" }
+  # Tracked by #3.  REMOVE this entry when the RDNA2 family's int8 logic
+  # trees land.  Review by 2026-12-15.
+  - { function: matmul, a_type: i8_r, b_type: i8_r, known_bug_platforms: "gfx1031, gfx1032, gfx1034, gfx1035" }
