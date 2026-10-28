@@ -1067,12 +1067,14 @@ class Solution(collections.abc.Mapping):
         reject(state, printRejectionReason, "MacroTile mismatch")
 
     # dot2: currently only support fp16 with HPA on gfx942 or fp16 &bf16 on gfx950/gfx11
-    # gfx1030 (RDNA2) has v_dot2_f32_f16 / v_dot2c_f32_f16 but no matrix instruction,
-    # so it needs the dot2 path as much as gfx11 does.
+    # RDNA2 (ISA 10.3) has v_dot2_f32_f16 / v_dot2c_f32_f16 but no matrix instruction,
+    # so it needs the dot2 path as much as gfx11 does.  The whole ISA counts,
+    # not just gfx1030: gfx1031, gfx1032, gfx1034 and gfx1035 are the same
+    # instructions under different names.
     state["UseDotInstruction"] = (not state["EnableMatrixInstruction"]) \
       and state["ProblemType"]["HighPrecisionAccumulate"] \
       and ((state["ISA"] == IsaVersion(9,4,2) and state["ProblemType"]["DataType"].isHalf()) \
-      or ((state["ISA"] == IsaVersion(9,5,0) or state["ISA"][0] == 11 or state["ISA"] == IsaVersion(10,3,0)) \
+      or ((state["ISA"] == IsaVersion(9,5,0) or state["ISA"][0] == 11 or state["ISA"][:2] == (10, 3)) \
           and (state["ProblemType"]["DataType"].isBFloat16() or state["ProblemType"]["DataType"].isHalf())))
     if state["UseDotInstruction"]:
       # need modification for dot4 or dot8
@@ -7198,7 +7200,8 @@ class Solution(collections.abc.Mapping):
       # if not bufferLoad or not state["GuaranteeNoPartialA"]:
       # Restrict GRVW/VW combos so shift-ptr logic will work.
       # gfx11 dot2 with K-contiguous operands reads along K and never shifts pointers.
-      gfx11Dot = state["UseDotInstruction"] and (state["ISA"][0] == 11 or state["ISA"] == IsaVersion(10,3,0))
+      # RDNA2's dot2 path (ISA 10.3) reads the same way.
+      gfx11Dot = state["UseDotInstruction"] and (state["ISA"][0] == 11 or state["ISA"][:2] == (10, 3))
       dotNoShiftA = gfx11Dot and not state["ProblemType"]["TLUA"]
       dotNoShiftB = gfx11Dot and not state["ProblemType"]["TLUB"]
       if state["GlobalReadVectorWidthA"] > 1 and not dotNoShiftA \
