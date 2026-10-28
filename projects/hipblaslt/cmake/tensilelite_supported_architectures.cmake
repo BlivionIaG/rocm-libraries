@@ -8,6 +8,14 @@ set(SUPPORTED_ARCHITECTURES
     "gfx942"
     "gfx950"
     "gfx1030"
+    # The rest of RDNA2: Navi 22 (gfx1031) and Navi 23 (gfx1032), plus the
+    # XT parts of both the driver reports as gfx1034 and gfx1035.  Same
+    # instructions as Navi 21, so they run Navi 21's solution set, but each
+    # gets its own library file, keyed by the name the device reports.
+    "gfx1031"
+    "gfx1032"
+    "gfx1034"
+    "gfx1035"
     "gfx1100"
     "gfx1101"
     "gfx1102"
