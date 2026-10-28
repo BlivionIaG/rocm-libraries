@@ -73,6 +73,12 @@ GFX1250 = "gfx1250"
 GFX1250_STRICT = "gfx1250-strict"
 ISA_GFX1250 = IsaVersion(12, 5, 0)
 
+# RDNA2 is five architecture names over one ISA family, and they share one
+# tuned tree. A run renames the tree it builds to the name it is building for,
+# so two names that tune from one tree cannot be served by the same run: the
+# second would get the first's library and the first none.
+RDNA2_FAMILY = ["gfx1030", "gfx1031", "gfx1032", "gfx1034", "gfx1035"]
+
 # The two capabilities v0 lacks. Absent from the probed table, so every consumer
 # reads them with a True default and no other architecture changes behavior.
 # HasTDMMulticast is architectural (archCaps); HasWMMA_f4_32x16 is an opcode (asmCaps).
@@ -1791,6 +1797,36 @@ _STRICT_LOGIC = (GFX1250_STRICT, GFX1250_STRICT)
 _OTHER_ARCH_LOGIC = ("gfx942", "aquavanjaram")
 
 
+def _assert_stepping_and_family_are_partitioned(groups):
+    """The two things a default build's partition has to get right.
+
+    The stepping has to reach a run that does not hold the architecture it
+    steps from: in the same run, one of the two would be renamed out of the
+    way, and the default build would ship no gfx1250-strict code objects at
+    all.
+
+    The RDNA2 family has to reach a run per name: the five share one tuned
+    tree, and a run renames the tree it builds to the name it is building for.
+
+    The number of groups is not pinned. It follows from how many names the
+    default build covers, and a family added to it changes the count without
+    changing what has to be true of the partition.
+    """
+    stepping = [g for g in groups if GFX1250_STRICT in g]
+    assert len(stepping) == 1, f"the stepping must reach exactly one run: {groups}"
+    assert GFX1250 not in stepping[0], (
+        f"the stepping shares a run with the architecture it steps from: {groups}"
+    )
+    assert GFX1250 in groups[0] and "gfx942" in groups[0]
+
+    for name in RDNA2_FAMILY:
+        holders = [g for g in groups if name in g]
+        assert len(holders) == 1, f"{name} must reach exactly one run: {groups}"
+        assert all(
+            other not in holders[0] for other in RDNA2_FAMILY if other != name
+        ), f"{name} shares a run with another name of the family: {groups}"
+
+
 def test_strict_build_selects_only_the_steppings_logic(
     monkeypatch, tmp_path, restore_global_parameters
 ):
@@ -1828,9 +1864,12 @@ def test_all_build_fans_out_to_cover_the_stepping(
 ):
     """``all`` is the default distribution build -- ``install.sh`` passes it --
     and it covers the stepping, which no single run can name beside the
-    architecture it steps from. So it must reach the selection twice, once per
-    group, rather than once with the stepping quietly dropped: dropped, the
-    default build ships no gfx1250-strict code objects at all.
+    architecture it steps from. So it must reach a run that does not hold that
+    architecture, rather than being dropped: dropped, the default build ships
+    no gfx1250-strict code objects at all.
+
+    It also covers the RDNA2 family, whose five names share one tuned tree and
+    so each need a run of their own.
 
     What each of those runs then selects is pinned by the two tests above.
     """
@@ -1842,9 +1881,7 @@ def test_all_build_fans_out_to_cover_the_stepping(
     )
 
     groups = captured["groups"]
-    assert len(groups) == 2
-    assert GFX1250 in groups[0] and "gfx942" in groups[0]
-    assert groups[1] == [GFX1250_STRICT]
+    _assert_stepping_and_family_are_partitioned(groups)
 
 
 def test_stepping_selection_spares_other_architectures(
@@ -2572,9 +2609,7 @@ def test_all_is_expanded_before_partitioning():
 
     groups = isaCollisionFreeGroups(["all", GFX1250_STRICT])
 
-    assert len(groups) == 2
-    assert GFX1250 in groups[0] and "gfx942" in groups[0]
-    assert groups[1] == [GFX1250_STRICT]
+    _assert_stepping_and_family_are_partitioned(groups)
 
 
 # =========================================================================== #
