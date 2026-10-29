@@ -8,6 +8,15 @@ set(SUPPORTED_ARCHITECTURES
     "gfx942"
     "gfx950"
     "gfx1030"
+    # The rest of RDNA2, the same ISA under the other product names: Navi 22
+    # (gfx1031), Navi 23 (gfx1032), Navi 24 (gfx1034) and the Rembrandt and
+    # Phoenix integrated GPUs (gfx1035).  Same instructions as Navi 21, so
+    # same capabilities; each is its own ISA because the driver gives each
+    # part its own name.  They are built from Navi 21's logic.
+    "gfx1031"
+    "gfx1032"
+    "gfx1034"
+    "gfx1035"
     "gfx1100"
     "gfx1101"
     "gfx1102"
@@ -40,7 +49,7 @@ set(BASE_ARCHITECTURES)
 # but are NOT included in the default "all" build in hipBLASLt. This is because "extops" builds are not supported
 # for legacy devices. Including these architectures would result in build failures or incomplete feature support.
 #
-# gfx1030 (RDNA2) can be built: it has no matrix instructions, so it uses the
+# The RDNA2 family can be built: it has no matrix instructions, so it uses the
 # non-MatrixInstruction (V_DOT2 / FMA) kernel path, and the ExtOp device-library
 # generators (Amax, LayerNorm, Softmax) already list gfx1030 among the
 # architectures they emit for.

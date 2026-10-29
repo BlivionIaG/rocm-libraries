@@ -3019,6 +3019,27 @@ namespace
         {
             return TensileLite::LazyLoadingInit::gfx1030;
         }
+        else if(deviceString.find("gfx1031") != std::string::npos)
+        {
+            // The rest of RDNA2: Navi 22, Navi 23, Navi 24 and the
+            // Rembrandt and Phoenix integrated GPUs.  They execute the same
+            // instructions as Navi 21 and run its solution set, but the
+            // library is keyed by the name the device reports, so each of
+            // them loads its own.
+            return TensileLite::LazyLoadingInit::gfx1031;
+        }
+        else if(deviceString.find("gfx1032") != std::string::npos)
+        {
+            return TensileLite::LazyLoadingInit::gfx1032;
+        }
+        else if(deviceString.find("gfx1034") != std::string::npos)
+        {
+            return TensileLite::LazyLoadingInit::gfx1034;
+        }
+        else if(deviceString.find("gfx1035") != std::string::npos)
+        {
+            return TensileLite::LazyLoadingInit::gfx1035;
+        }
         else if(deviceString.find("gfx1100") != std::string::npos)
         {
             return TensileLite::LazyLoadingInit::gfx1100;
@@ -3190,8 +3211,9 @@ namespace
             std::filesystem::path path;
 
             // The name of the current GPU platform.  The library is keyed by
-            // the name the device reports, so a device reads the library
-            // built for its own architecture.
+            // the name the device reports, so the whole RDNA2 family reads
+            // its own library file even though they all run Navi 21's
+            // solution set.
             std::string processor = rocblaslt_internal_get_arch_name();
 
             // ROCM-26729 / SEC-00896: use the privilege-aware accessor so a
