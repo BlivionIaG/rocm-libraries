@@ -43,7 +43,8 @@
     || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) // test device
 #define USE_GFX_BUFFER_INTRINSIC
 #define BUFFER_RESOURCE_3RD_DWORD 0x00020000
-#elif defined(__gfx1030__) // special device
+#elif defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) \
+    || defined(__gfx1034__) || defined(__gfx1035__) // RDNA2: one ISA, five names
 #define USE_GFX_BUFFER_INTRINSIC
 #define BUFFER_RESOURCE_3RD_DWORD 0x31014000
 #elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) \

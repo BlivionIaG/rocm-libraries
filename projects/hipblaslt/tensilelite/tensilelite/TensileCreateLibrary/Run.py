@@ -124,6 +124,14 @@ def _baseArchs(archs: Collection[str]) -> List[str]:
 # other run owns build_tmp outright and clears it as it always did.
 _GROUP_BUILD_ENV = "TENSILE_GROUP_BUILD"
 
+# Names the fan-out group a child belongs to, so each group gets a scratch
+# directory of its own. The groups build concurrently into the same output
+# directory, and what they write outside library/ collides: a kernel basename
+# comes from the solution, not from the architecture, so two groups building
+# the same solutions under different names write the same .s and .o into the
+# same place.
+_GROUP_SCRATCH_ENV = "TENSILE_GROUP_SCRATCH"
+
 
 def buildTmpRoot(outputPath: Union[str, Path]) -> Path:
     """The scratch parent every run writing into one output directory shares.
@@ -149,6 +157,14 @@ def buildTmpDir(outputPath: Union[str, Path], archs: Collection[str]) -> Path:
     never share a group, and steppings of different base architectures share no
     ISA, so they arrive together in one group.
 
+    A fan-out group is named apart too, by the environment its parent gave it.
+    The groups build concurrently into one output directory, and the collision
+    above does not need a shared ISA to happen: a kernel basename comes from
+    the solution, not from the architecture, so two groups that build the same
+    solutions under different names write the same .s and .o into the same
+    place. The RDNA2 family is that case -- five architecture names over one
+    tuning tree, so one run per name, all of them building the same solutions.
+
     Only names the architecture table knows become path components. A spec is
     otherwise free text -- gfxToIsa reads the leading gfx digits and ignores the
     rest -- so "gfx1250/.." would smuggle a segment into a name handed to rmtree.
@@ -163,7 +179,12 @@ def buildTmpDir(outputPath: Union[str, Path], archs: Collection[str]) -> Path:
     # A stem can be empty (Path("/").stem), and "<root>" / "" is <root> itself --
     # a run would then take the shared parent as its own scratch directory.
     stem = Path(outputPath).stem.upper() or "SCRATCH"
-    return buildTmpRoot(outputPath) / (f"{stem}-{steppings[0]}" if steppings else stem)
+    if steppings:
+        return buildTmpRoot(outputPath) / f"{stem}-{steppings[0]}"
+    group = os.environ.get(_GROUP_SCRATCH_ENV)
+    if group:
+        return buildTmpRoot(outputPath) / f"{stem}-{group}"
+    return buildTmpRoot(outputPath) / stem
 
 
 def removeScratch(outputPath: Union[str, Path], buildTmpPath: Path) -> bool:
@@ -1288,6 +1309,17 @@ def _argvForArchitectures(argv: List[str], specs: List[str], jobs: int) -> List[
     return kept
 
 
+def _groupScratchName(group: List[str]) -> str:
+    """A scratch-directory name that tells one fan-out group from another.
+
+    The groups are disjoint, and an architecture name belongs to one ISA, so
+    the base names of a group are unique across the groups of a run.  They are
+    the names the architecture table knows, which is what keeps a path
+    component from smuggling in anything else.
+    """
+    return "_".join(_baseArchs(group))
+
+
 def _childEnvironment() -> Dict[str, str]:
     """This process's environment, with Tensile importable by the children.
 
@@ -1331,12 +1363,19 @@ def _buildGroupsSeparately(groups: List[List[str]], requestedJobs: int) -> None:
     procs = []
     try:
         for group, groupJobs in zip(groups, jobs):
+            # Each group gets its own scratch directory. They build
+            # concurrently, and the kernel basenames they write do not carry
+            # the architecture, so a shared scratch directory has them
+            # overwriting each other's objects and deleting each other's
+            # scratch.
+            groupEnv = dict(env)
+            groupEnv[_GROUP_SCRATCH_ENV] = _groupScratchName(group)
             procs.append((
                 group,
                 subprocess.Popen(
                     [sys.executable, "-m", "Tensile.TensileCreateLibrary"]
                     + _argvForArchitectures(argv, group, groupJobs),
-                    env=env,
+                    env=groupEnv,
                 ),
             ))
         failed = [group for group, proc in procs if proc.wait() != 0]
