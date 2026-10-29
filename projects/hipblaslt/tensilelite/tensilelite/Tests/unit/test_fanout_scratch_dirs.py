@@ -12,12 +12,16 @@ groups building the same solutions under different names write the same .s and
 objects with it.
 
 Each group is therefore given a scratch directory of its own.
+
+The RDNA2 family is the case that needs it: five architecture names over one
+tuning tree, so one run per name, and all five build the same solutions.
 """
 
 import os
 
 import pytest
 
+from tensilelite.Common.Architectures import isaCollisionFreeGroups
 from tensilelite.TensileCreateLibrary.Run import (
     _GROUP_SCRATCH_ENV,
     _groupScratchName,
@@ -58,3 +62,9 @@ def test_a_stepping_keeps_the_scratch_directory_it_had(tmp_path, monkeypatch):
     monkeypatch.setenv(_GROUP_SCRATCH_ENV, "gfx1031")
     path = buildTmpDir(tmp_path / "Tensile", ["gfx1250-strict"])
     assert path.name == "TENSILE-gfx1250-strict"
+
+
+def test_the_rdna2_family_is_split_into_one_group_per_name():
+    groups = isaCollisionFreeGroups(RDNA2_FAMILY)
+    assert len(groups) == len(RDNA2_FAMILY)
+    assert sorted(g[0] for g in groups) == sorted(RDNA2_FAMILY)
