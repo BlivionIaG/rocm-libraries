@@ -513,7 +513,8 @@ Tests:
   scaleAlpha_vector: [0, 1]
   activation_type: [relu, sigmoid]
   unit_check: 1
-  gpu_arch: '1[1-2]\d{2}'
+  # gfx1030 ships both int8 destination kinds; both were measured on a V620.
+  gpu_arch: '1030|1[1-2]\d{2}'
 
 - name: matmul_gemm_i8_dst_i32_1xxx_smoke
   category: smoke
@@ -527,7 +528,8 @@ Tests:
   scaleAlpha_vector: [0, 1]
   activation_type: [relu, sigmoid]
   unit_check: 1
-  gpu_arch: '1[1-2]\d{2}'
+  # gfx1030 ships both int8 destination kinds; both were measured on a V620.
+  gpu_arch: '1030|1[1-2]\d{2}'
 
 - name: matmul_gemm_tn_mxf4_dst_bf16_1250_smoke
   category: smoke
