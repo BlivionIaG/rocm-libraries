@@ -1117,6 +1117,11 @@ validParameters = { # we need to make sure this matches develop
     # Group together unroll iterations inside the unroll loop.
     # For example, InnerUnroll=2 will fetch LDS for two unroll iterations
     "InnerUnroll": [1, 2, 4, 8, 16, 32, 64],
+    # Arrange elements in LDS so N elements consecutive in U-dim are adjacent in LDS.
+    # 1 is default and results in no interleaving.
+    # LocalDotLayout=4 selects the int8 dot4 MAC (v_dot4c_i32_i8), which needs
+    # four consecutive K elements of a row in one VGPR.
+    "LocalDotLayout": [1, 2, 4, 8],
     # Enable CP preload kernel arguments feature
     # It can reduce time of loading kernel arguments by s_load.
     # It needs new complier and vbios to support this feature.
@@ -1277,6 +1282,9 @@ validParameters = { # we need to make sure this matches develop
     #      wave 2, MXSB on wave 3, B on every wave. NumWaves==4.
     #   3  {B,MXSA,MXSB} + {A}, the mirror of 2: B on waves 0-1, MXSA on
     #      wave 2, MXSB on wave 3, A on every wave. NumWaves==4.
+    #
+    # th/scope/nv are instruction-wide: at 1/2/3 the data tensor's (A or B) hints decide and the
+    # scale tensors' are ignored; at 0 a field is emitted only if the members of a set agree.
     #
     # This list and Components/TDMFuse.TDM_FUSE_GROUPING must name the same integers.
     "TDMFuse": [0, 1, 2, 3],

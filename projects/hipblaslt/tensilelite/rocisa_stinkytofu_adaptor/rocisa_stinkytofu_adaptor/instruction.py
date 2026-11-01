@@ -1707,6 +1707,8 @@ VSubU32 = _make_scalar_alu_class("VSubU32", "v_sub_nc_u32", InstType.INST_U32)
 VMulF32 = _make_scalar_alu_class("VMulF32", "v_mul_f32", InstType.INST_F32)
 # logicalIR: VMulLOU32
 VMulLOU32 = _make_scalar_alu_class("VMulLOU32", "v_mul_lo_u32", InstType.INST_LO_U32)
+# logicalIR: VMacF16
+VMacF16 = _make_scalar_alu_class("VMacF16", "v_mac_f16", InstType.INST_F16)
 # logicalIR: VMulHIU32
 VMulHIU32 = _make_scalar_alu_class("VMulHIU32", "v_mul_hi_u32", InstType.INST_HI_U32)
 # logicalIR: VMulHII32
@@ -3846,6 +3848,10 @@ VMadI32I24 = _make_ternary_class("VMadI32I24", "v_mad_i32_i24", InstType.INST_I3
 VMadU32U24 = _make_ternary_class("VMadU32U24", "v_mad_u32_u24", InstType.INST_U32)
 # logicalIR: VMadMixF32
 VMadMixF32 = _make_ternary_class("VMadMixF32", "v_mad_mix_f32", InstType.INST_F32)
+# logicalIR: VDot4I32I8
+VDot4I32I8 = _make_ternary_class("VDot4I32I8", "v_dot4_i32_i8", InstType.INST_I32)
+# logicalIR: VDot4CI32I8
+VDot4CI32I8 = _make_scalar_alu_class("VDot4CI32I8", "v_dot4c_i32_i8", InstType.INST_I32)
 # logicalIR: VExpF16
 VExpF16 = _make_scalar_unary_class("VExpF16", "v_exp_f16", InstType.INST_F16)
 # logicalIR: VExpF32
@@ -5284,17 +5290,18 @@ class SAtomicUmaxX2(Instruction):
         return dup
 
 
-# --- TensorLoadToLds: rocisa(group0, group1, group2, group3, comment) ---
+# --- TensorLoadToLds: rocisa(group0, group1, group2, group3, comment, tensor) ---
 def _make_tensor_load_class():
     def __init__(self, group0: Any = None, group1: Any = None,
                  group2: Any = None, group3: Any = None,
-                 comment: str = "", **kw):
+                 comment: str = "", tensor: Any = None, **kw):
         _ = kw
         CommonInstruction.__init__(
             self, instType=InstType.INST_NOTYPE, dst=group0,
             srcs=[group1, group2, group3], dpp=None, sdwa=None,
             vop3=None, comment=comment)
         self.setInst("tensor_load_to_lds")
+        self.tensor = tensor
 
     def getArgStr(self) -> str:
         # Native getParams drops group2 and group3 unless both are set.
@@ -5304,7 +5311,11 @@ def _make_tensor_load_class():
         operands = [self.dst, self.srcs[0]]
         if group2 is not None and group3 is not None:
             operands.extend((group2, group3))
-        return ", ".join(_input_to_str(operand) for operand in operands if operand is not None)
+        argStr = ", ".join(_input_to_str(operand) for operand in operands if operand is not None)
+        tensor = getattr(self, "tensor", None)
+        if tensor is not None and hasattr(tensor, "toString"):
+            argStr += tensor.toString()
+        return argStr
 
     def to_stinky_logical(self) -> Any:
         import stinkytofu as _st
@@ -5323,6 +5334,10 @@ def _make_tensor_load_class():
             _to_stinky_register(self.dst),
             _to_stinky_register(self.srcs[0]),
             **kwargs)
+        tensor = getattr(self, "tensor", None)
+        if tensor is not None:
+            logical.set_tensor(scope=int(tensor.scope), th=int(tensor.th),
+                               nv=int(tensor.nv) != 0, is_store=bool(tensor.isStore))
         return logical
 
     def __deepcopy__(self, memo):

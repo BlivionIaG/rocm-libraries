@@ -55,7 +55,8 @@ from ..Components.DecouplePGR import pgrLevelsForTensors, ldsBlocksForPgrLevel, 
                                        pgrAutoPairRequested, \
                                        resolvePrefetchGlobalReadSpecialValues
 from ..Components.TDMFuse import tdmBothTensors, tdmGroupingAccepted, \
-                                       tdmGroupingName, tdmPapRejectReason
+                                       tdmGroupingName, tdmPapRejectReason, \
+                                       tdmWavePartition, tdmWaveSeparated
 from ..Common.TypeValidationErrors import ConfigTypeError
 from ..CustomKernels import isCustomKernelConfig, supportsUserSgprKernargPreload, validateCustomPersistentArgs
 from ..SolutionStructs.LdsPadding import get_fp4_mt_config, get_fp8_mt_config, get_mxs_mt_config, \
@@ -66,6 +67,7 @@ from ..SolutionStructs.LdsPadding import get_fp4_mt_config, get_fp8_mt_config, g
 from ..Common.GlobalParameters import defaultSolution, \
                                             defaultInternalSupportParams, \
                                             globalParameters
+from ..Common.MxScaleLayout import mxFreePhase, mxFreeTile, mxLdsAlign, mxLdsNumBytes, mxTdmTileM
 from ..Common.ValidParameters import validParameters, \
                                             _getExpectedTypes, \
                                             _expectedParamTypes, \
@@ -213,6 +215,23 @@ def _deriveAndValidateMXScaleLayoutAndTransport(state, asmCaps, archCaps, printR
   return True
 
 
+def _validateMXBlock128Arch(state, asmCaps, printRejectionReason):
+  """Reject MXBlock 128 and 2D MX scales off gfx1250.
+
+  Only the WMMA_V3 path splats one scale byte per WMMA and indexes 2D scale
+  rows; elsewhere (e.g. gfx950) these solutions fail kernel generation.
+  """
+  if asmCaps.get("HasWMMA_V3", False):
+    return True
+  for tc in ("A", "B"):
+    mxBlock = state["ProblemType"][f"MXBlock{tc}"]
+    if mxBlock == 128 or (mxBlock and state["ProblemType"][f"MXBlockFree{tc}"] > 1):
+      reject(state, printRejectionReason,
+             f"MXBlock{tc} 128 and 2D MX scales require WMMA_V3 (gfx1250)")
+      return False
+  return True
+
+
 def _validateMXLocalReadWidth(state, asmCaps, printRejectionReason):
   """Reject invalid MX scale units and undersized M-major local reads.
 
@@ -253,6 +272,166 @@ def _validateMXLocalReadWidth(state, asmCaps, printRejectionReason):
           f"got {vectorWidth}")
       return False
 
+  return True
+
+
+def _validateMX2DFreeTile(state, printRejectionReason):
+  """Reject 2D MX tiles whose scale rows the TDM / LRA codegen misplaces.
+
+  The 2D scale path loads ``mxTdmTileM(MT, MXBlockFree)`` scale rows, enough for
+  the worst workgroup phase, from ``(wg*MT)/MXBlockFree`` and picks a row with
+  ``(phase + localM) >> log2(MXBlockFree)``. A MacroTile neither a multiple nor a
+  divisor of MXBlockFree starts WGs partway into a row; _validateMXFreePhase
+  checks the phase fixup can index it.
+
+  2D also requires ``MXBlock == MatrixInstK`` (one scale byte per row along K);
+  the TDM, LRA and local-read 2D paths do not handle ``mxUnit > 1``.
+
+  2D supports ``MXBlockFree == 128`` only (``[128, 128]``). The 2D local read
+  address has no lane term, so one scale row must cover a wave's whole free
+  extent; smaller free blocks read row 0's scale for every row (e.g. ``[32, 128]``
+  with VW 8 gets 75% of A rows wrong).
+
+  2D also requires ``MXBlock == MatrixInstK`` (one scale byte per row along K);
+  the TDM, LRA and local-read 2D paths do not handle ``mxUnit > 1``.
+
+  The wave-separated TDM M-split gives each of ``numComp`` components
+  ``scaleRows // numComp`` rows; a remainder is never loaded, and an unaligned
+  MT puts MT/numComp off a row boundary. Fewer rows than components is fine
+  (every component loads the full tile).
+  """
+  for tc, tile01 in (("A", 0), ("B", 1)):
+    mxTile = state["ProblemType"][f"MXBlockFree{tc}"]
+    # 1 is the 1D layout; 2D is validated for [128, 128] only.
+    if state["ProblemType"][f"MXBlock{tc}"] and mxTile not in (1, 128):
+      reject(state, printRejectionReason,
+             f"2D MX scale for {tc} supports MXBlockFree{tc} 128 only, got {mxTile}")
+      return False
+    if mxTile <= 1:
+      continue
+    # 2D addressing (TDM wg offset, LRA wave offset, the one-VGPR local read)
+    # assumes one scale byte per scale row along K, i.e. MXBlock == MatrixInstK.
+    mxBlock = state["ProblemType"][f"MXBlock{tc}"]
+    mxUnit = state["MatrixInstK"] // mxBlock if mxBlock else 1
+    if mxUnit != 1:
+      reject(state, printRejectionReason,
+             f"2D MX scale for {tc} requires MXBlock{tc} == MatrixInstK ({state['MatrixInstK']}), "
+             f"got mxUnit {mxUnit}")
+      return False
+  return True
+
+
+def _validateMX2DTdmMSplit(state, printRejectionReason):
+  """Reject a 2D MX wave-separated TDM M-split that drops scale rows.
+
+  The M-split gives each of ``numComp`` components ``scaleRows // numComp`` rows;
+  a remainder is never loaded, and an unaligned MT puts MT/numComp off a row
+  boundary. Fewer rows than components is fine (every component loads the full
+  tile). Whether the TDM splits M or K depends on DepthU, so this
+  runs once DepthU is resolved.
+  """
+  waveSeparated = tdmWaveSeparated(state) and not state.get("UseSubtileImpl") \
+      and state["ProblemType"]["MXBlockA"] and state["ProblemType"]["MXBlockB"]
+  if not waveSeparated:
+    return True
+  for tc, tile01 in (("A", 0), ("B", 1)):
+    mxTile = state["ProblemType"][f"MXBlockFree{tc}"]
+    if mxTile <= 1:
+      continue
+    mxBlock = state["ProblemType"][f"MXBlock{tc}"]
+    mxUnit = state["MatrixInstK"] // mxBlock
+    if mxUnit <= 0:
+      continue  # _validateMXLocalReadWidth rejects it
+    numMxKGroups = (state["DepthU"] // mxBlock) // mxUnit
+    numComp, _ = tdmWavePartition(state, f"MXS{tc}")
+    mt = state[f"MacroTile{tile01}"]
+    scaleRows = mxTdmTileM(mt, mxTile)
+    if numMxKGroups < numComp and scaleRows >= numComp \
+        and (mt % mxTile != 0 or scaleRows % numComp != 0):
+      reject(state, printRejectionReason,
+             f"2D MX TDM M-split for {tc} requires MacroTile{tile01} ({mt}) aligned to "
+             f"MXBlockFree{tc} ({mxTile}) and scale rows ({scaleRows}) a multiple of TDM "
+             f"components ({numComp}); otherwise rows are dropped")
+      return False
+  return True
+
+
+def _validateMXFreePhase(state, printRejectionReason):
+  """Reject 2D MX tiles whose workgroup phase the kernel cannot index.
+
+  A MacroTile that is neither a multiple nor a divisor of MXBlockFree starts
+  workgroups partway into a scale row (e.g. MT=224 puts WG1 at N=224, 96 into
+  row 1). KernelWriterAssembly.mxPhaseLraFixup adds that phase per tile and
+  gives each WaveTile vector its own LocalReadAddr. It counts free elements,
+  so it needs a one-byte LDS tile-stride (swizzled, MatrixInstK == MXBlock),
+  needs LRA rebuilt by setupNewTile every tile, and keeps one scale per
+  vector, so a vector's MI * VW columns must not straddle a row at any phase.
+
+  The one-scale-per-vector read holds for aligned 2D tiles as well, so a vector
+  wider than ``MXBlockFree`` (e.g. 256-column vectors, MI 16 * VW 16) is
+  rejected there too.
+  """
+  for tc in ("A", "B"):
+    mxTc = "MXS" + tc
+    mxBlock = state["ProblemType"]["MXBlock%s" % tc]
+    mxTile = mxFreeTile(state, mxTc)
+    if not mxBlock or mxTile <= 1:
+      continue
+    mt = state["MacroTile%s" % mxTc]
+    miT = state["MatrixInstM"] * state["MatrixInstBM"] if tc == "A" else state["MatrixInstN"] * state["MatrixInstBN"]
+    vecCols = miT * state["VectorWidth%s" % tc]
+    if not mxFreePhase(state, mxTc):
+      # Aligned tiles read one scale per WaveTile vector too, so a vector wider than a
+      # scale row would take one row's scale for all of them.
+      if math.gcd(mt, mxTile) % vecCols:
+        reject(state, printRejectionReason,
+               "2D MX scale for %s: a WaveTile vector (%u columns) spans more than one "
+               "MXBlockFree%s %u scale row; the 2D local read loads one scale per vector"
+               % (tc, vecCols, tc, mxTile))
+        return False
+      continue
+    why = None
+    if state["MXScaleFormat"] not in ("InMemorySwizzle", "HostPreSwizzle") \
+        or state["MatrixInstK"] // mxBlock != 1:
+      why = "a swizzled scale with MatrixInstK == MXBlock%s" % tc
+    elif state["UseSubtileImpl"] or state["PrefetchAcrossPersistent"] or state["DirectToVgpr%s" % mxTc]:
+      why = "no UseSubtileImpl, PrefetchAcrossPersistent or DirectToVgpr%s" % mxTc
+    else:
+      if math.gcd(mt, mxTile) % vecCols:
+        why = "WaveTile vectors (%u columns) dividing gcd(MT, MXBlockFree) = %u" % (vecCols, math.gcd(mt, mxTile))
+    if why:
+      reject(state, printRejectionReason,
+             "MacroTile%s %u is not aligned to MXBlockFree%s %u; the workgroup phase needs %s"
+             % (tc, mt, tc, mxTile, why))
+      return False
+  return True
+
+
+def _validateMXFreePhaseReadOffset(state, printRejectionReason):
+  """Reject a 2D MX workgroup phase whose scale reads need offsets of 64K or more.
+
+  The per-vector LocalReadAddr of the phase fixup replaces the +64K
+  LocalReadAddr fan-out, so every scale ds_load offset must stay below 64K.
+  The offset is the read position inside one MXS buffer plus, under
+  ExpandPointerSwap without StoreSwapAddr, the buffer swap LdsOffsetA_Blk.
+  """
+  if not state["ExpandPointerSwap"] or state["StoreSwapAddr"]:
+    return True
+  for tc in ("A", "B"):
+    mxTc = "MXS" + tc
+    mxBlock = state["ProblemType"]["MXBlock%s" % tc]
+    if not mxBlock or not mxFreePhase(state, mxTc):
+      continue
+    bufferBytes = mxLdsNumBytes(state["MacroTile%s" % mxTc], state["DepthU"], mxBlock,
+                                mxTile=mxFreeTile(state, mxTc), ldsPad=state["LdsPad%s" % mxTc],
+                                unrollMajor=state["UnrollMajorLDS%s" % mxTc],
+                                padInterval=state["LdsBlockSizePerPad%s" % mxTc])
+    if state["LdsOffsetA_Blk"] + bufferBytes > 65536:
+      reject(state, printRejectionReason,
+             "%s 2D workgroup phase (MacroTile not aligned to MXBlockFree) needs scale read "
+             "offsets below 64K; ExpandPointerSwap without StoreSwapAddr adds LdsOffsetA_Blk (%u)"
+             % (mxTc, state["LdsOffsetA_Blk"]))
+      return False
   return True
 
 
@@ -1101,14 +1280,63 @@ class Solution(collections.abc.Mapping):
         reject(state, printRejectionReason, "MacroTile mismatch")
 
     # dot2: currently only support fp16 with HPA on gfx942 or fp16 &bf16 on gfx950/gfx11
+    # gfx1030 (RDNA2) has v_dot2_f32_f16 / v_dot2c_f32_f16 but no matrix instruction,
+    # so it needs the dot2 path as much as gfx11 does.
     state["UseDotInstruction"] = (not state["EnableMatrixInstruction"]) \
       and state["ProblemType"]["HighPrecisionAccumulate"] \
       and ((state["ISA"] == IsaVersion(9,4,2) and state["ProblemType"]["DataType"].isHalf()) \
-      or ((state["ISA"] == IsaVersion(9,5,0) or state["ISA"][0] == 11) \
+      or ((state["ISA"] == IsaVersion(9,5,0) or state["ISA"][0] == 11 or state["ISA"] == IsaVersion(10,3,0)) \
           and (state["ProblemType"]["DataType"].isBFloat16() or state["ProblemType"]["DataType"].isHalf())))
     if state["UseDotInstruction"]:
       # need modification for dot4 or dot8
       state["NumDotElements"] = 2
+    # int8 dot4: LocalDotLayout=4 asks for the four-way signed 8-bit dot product
+    # (v_dot4c_i32_i8), which needs four consecutive K elements of a row in one
+    # VGPR.  gfx1030 (ISA 10.3) has v_dot4c_i32_i8.
+    #
+    # The classic non-matrix-instruction int8 path (FMA_I8_HPA: unpack each
+    # byte to int32, then v_mad_i32_i24) is broken in TensileLite 5: the
+    # local-read/local-write layout it generates for packed int8 does not
+    # match the register layout that MAC assumes, so only one byte in every
+    # four reaches the accumulator.  It is the path upstream's own navi21
+    # int8 kernels used to take, and AMD's shipped gfx1030 int8 kernel is
+    # built with v_dot4c_i32_i8 instead.  So on an architecture that has
+    # v_dot4c_i32_i8 the dot4 path is not an optimisation, it is the only
+    # correct one, and a solution that cannot take it is dropped rather than
+    # built with the broken MAC.
+    int8Dot4Candidate = (not state["EnableMatrixInstruction"]) \
+      and (not state["UseDotInstruction"]) \
+      and state["ProblemType"]["HighPrecisionAccumulate"] \
+      and state["ProblemType"]["DataType"].isInt8() \
+      and state.get("LocalDotLayout", 1) == 4 \
+      and isaInfoMap[state["ISA"]].asmCaps.get("v_dot4c_i32_i8", False)
+    if int8Dot4Candidate:
+        state["UseDotInstruction"] = True
+        state["NumDotElements"] = 4
+        # One dot4 group per inner unroll step, so that
+        # LocalReadVectorWidth == NumDotElements * InnerUnroll holds.
+        state["InnerUnroll"] = 1
+        # The dot path needs K contiguous in LDS; TransposeLDS 2 selects
+        # UnrollMajorLDS.  The shipped int8 logic files do not select it.
+        state["TransposeLDS"] = 2
+        # The dot path's local read address assignment only handles a scalar
+        # global read, the same restriction the fp16 dot2 path has.
+        state["VectorWidthA"] = 1
+        state["VectorWidthB"] = 1
+        state["GlobalReadVectorWidthA"] = 1
+        state["GlobalReadVectorWidthB"] = 1
+        # One dot4 group per local read; LocalReadVectorWidth has to match
+        # NumDotElements * InnerUnroll.
+        state["LocalReadVectorWidth"] = 4
+        state["LocalReadVectorWidthA"] = 4
+        state["LocalReadVectorWidthB"] = 4
+        # The dot4 group is four consecutive K elements of one row, so the LDS
+        # must hold them one byte apart (the "2" variants would give every
+        # element a two byte slot and break the group).
+        state["LocalRead2A"] = False
+        state["LocalWrite2A"] = False
+        state["LocalRead2B"] = False
+        state["LocalWrite2B"] = False
     if not state["UseDotInstruction"] and state["WaveSplitK"]:
       reject(state, "WaveSplitK currently only support dot2 kernel.")
       return
@@ -2829,6 +3057,28 @@ class Solution(collections.abc.Mapping):
         state["MIWaveTileA"] = state["MIWaveTile"][1]
         state["MIWaveTileB"] = state["MIWaveTile"][0]
 
+    if not state["EnableMatrixInstruction"]:
+      # A non-MI (mac/dot) kernel has no matrix instruction, but the assembly
+      # writer's packed (<4 byte) data path still reads the matrix-tile state:
+      # KernelWriterAssembly sizes the packed value registers with
+      #   ceil(VectorWidthA * bpe / bpr) * MIWaveTileA // VectorWidthA
+      # over MIInputPerThreadA elements, and Solution's own register budget
+      # uses MIWaveTileA * MIInputPerThreadA * bpe // bpr.
+      #
+      # Without a matrix instruction there is exactly one wave tile, and each
+      # thread holds ThreadTileA (resp. ThreadTileB) elements of the operand.
+      # Setting those keeps the packed path's arithmetic identical to the
+      # non-MI valu allocation, which is ThreadTileA * bpe // bpr.
+      #
+      # This is what a wave32 architecture without any matrix instruction
+      # needs -- gfx1030 (RDNA2) has V_DOT2 but no MFMA and no WMMA -- and
+      # there is no such logic file in the tree to have exercised it before.
+      state["MIWaveTileA"] = 1
+      state["MIWaveTileB"] = 1
+      state["MIInputPerThread"] = state["ThreadTileA"]
+      state["MIInputPerThreadA"] = state["ThreadTileA"]
+      state["MIInputPerThreadB"] = state["ThreadTileB"]
+
     if state["ProblemType"]["Sparse"] == 2 and state["DirectToVgprSparseMetadata"]:
       reject(state, printRejectionReason, "Sparse B does not supprot DirectToVgprSparseMetadata")
       return
@@ -2865,6 +3115,14 @@ class Solution(collections.abc.Mapping):
       state["DirectToLdsMetadata"] = 0
       state["MIWaveTileMetadata"] = 0
 
+    # An unsuffixed NonTemporal sets A, B, C, D, Gate and Metadata only; MXSA, MXSB, E and WS need
+    # their own NonTemporal<tensor> key. (An unsuffixed TemporalHint or NonVolatile, above, is
+    # expanded over every tensor.)
+    # Under TDMFuse=1/2/3 a data tensor (A or B) and its scale tensor(s) share one tensor_load_to_lds
+    # whose th/scope/nv bits are instruction-wide. The data tensor decides: its TemporalHint,
+    # NonTemporal and NonVolatile are emitted and the scale tensors' are ignored for that
+    # instruction (see tdmHintDeciders), so the generated asm follows A/B. Under TDMFuse=0 a field
+    # is emitted only when the members of each set ({A,B}, {MXSA,MXSB}) agree.
     if state["NonTemporal"] != -1:
       state["NonTemporalA"] = state["NonTemporal"]
       state["NonTemporalB"] = state["NonTemporal"]
@@ -3400,6 +3658,13 @@ class Solution(collections.abc.Mapping):
       if not isaInfoMap[isa].asmCaps["HasMovRelsD2B32"]:
         reject(state, printRejectionReason, "This arch does not support CompactLoopStore (no v_movrelsd_2_b32)")
         return
+      # The CLS store reads acc VGPRs through M0-relative v_movrelsd_2_b32 and turns
+      # the per-batch row advance into a delayed primer chain; both are defined only
+      # by the MFMA acc->arch mapping, so there is nothing to compact on a VALU
+      # kernel. Clearing it here keeps every downstream site testing CompactLoopStore
+      # alone.
+      if not state["EnableMatrixInstruction"]:
+        state["CompactLoopStore"] = False
 
     # MX scale layout + transport derivation and validation. See
     # _deriveAndValidateMXScaleLayoutAndTransport for the full set of rules.
@@ -3587,6 +3852,8 @@ class Solution(collections.abc.Mapping):
         reject(state, printRejectionReason,
                "TDMFuse=%d grouping %s was declined" % (tdmFuse, tdmGroupingName(state)))
         return
+    if not _validateMX2DFreeTile(state, printRejectionReason):
+      return
 
     # Check PAP after TDMFuse-specific errors.
     if state.get("PrefetchAcrossPersistent", 0) and state["enableTDMA"] and state["enableTDMB"]:
@@ -3902,6 +4169,14 @@ class Solution(collections.abc.Mapping):
 
     state["ESMRuntimeGate"] = tuple(state["ISA"])[:2] == (12, 0)
 
+    # A 2D scaling tile divides the free dimension of the scale tensor, so a
+    # partial last tile would need a scale covering fewer than MXBlockFree
+    # rows/columns; require the free dimension to be tile-aligned instead.
+    # Free0 is M (A's free index), Free1 is N, as in the 6-bit branch above.
+    # Both extents default to 1, making this a no-op for 1xMXBlock scaling.
+    state["AssertFree0ElementMultiple"] = max(state["ProblemType"]["MXBlockFreeA"], state["AssertFree0ElementMultiple"])
+    state["AssertFree1ElementMultiple"] = max(state["ProblemType"]["MXBlockFreeB"], state["AssertFree1ElementMultiple"])
+
     # We have the real "1LDSBuffer" value now, so we have to test the rejection condition here
     # TODO-
     #  On gfx1250, i8, f8, it seem working for 1LDSBuffer=0 "BUT EPS=0", haven't checked for other archs/types, so we still reject by 1LDSBuffer only
@@ -4067,6 +4342,17 @@ class Solution(collections.abc.Mapping):
 
       state["_DepthU"] = depthU
       state["DepthU"] = depthU
+
+      # One K-group of scales per MXBlock: a DepthU below it has no scale to load
+      # (DepthU // MXBlock is 0 and later divides by zero).
+      for tc in ("A", "B"):
+        mxBlock = state["ProblemType"][f"MXBlock{tc}"]
+        if mxBlock and depthU < mxBlock:
+          reject(state, printRejectionReason,
+                 f"MX scale for {tc} requires DepthU >= MXBlock{tc} ({depthU} < {mxBlock})")
+          return
+      if not _validateMX2DTdmMSplit(state, printRejectionReason):
+        return
 
       state["_DepthUA"] = depthUA# internal — data SRD advance
       if state["ProblemType"]["MXBlockA"]:
@@ -4604,13 +4890,25 @@ class Solution(collections.abc.Mapping):
         ldsAlign = int(64 / state["ProblemType"]["MacDataType%s"%tc].numRegisters())
         ldsAlign = 64 if state["ProblemType"]["MacDataType%s"%tc].is6bitFloat() else ldsAlign
 
-        if state["UnrollMajorLDS%s"%mxTc]:
+        if "MXS" in mxTc:
+          mxTile = mxFreeTile(state, mxTc)
+          ldsAlign = mxLdsAlign(mxTile, ldsAlign)
+          ldsNumBytes = mxLdsNumBytes(
+            state["MacroTile%s"%mxTc],
+            state["DepthU"],
+            state["ProblemType"]["MXBlock%s"%tc],
+            mxTile=mxTile,
+            ldsPad=ldsPad,
+            unrollMajor=state["UnrollMajorLDS%s"%mxTc],
+            padInterval=LdsBlockSizePerPad,
+          )
+        elif state["UnrollMajorLDS%s"%mxTc]:
           ldsNumBytes = int((state["_DepthU%s"%mxTc] + ldsPad) * state["MacroTile%s"%mxTc] * bpe)
         else:
           ldsNumBytes = int(state["_DepthU%s"%mxTc] * (state["MacroTile%s"%mxTc] + ldsPad) * bpe)
         padInterval = LdsBlockSizePerPad
 
-        if padInterval != 0:
+        if "MXS" not in mxTc and padInterval != 0:
           ldsNumBytes = int((state["_DepthU%s"%mxTc] * state["MacroTile%s"%mxTc] * bpe) / padInterval * (padInterval + ldsPad * bpe))
         ldsNumBytesAligned = roundUpToNearestMultiple(ldsNumBytes, ldsAlign)
 
@@ -4885,8 +5183,14 @@ class Solution(collections.abc.Mapping):
       else:
         calLRVW()
 
+      if not _validateMXBlock128Arch(state, isaInfoMap[isa].asmCaps, printRejectionReason):
+        return
+
       if not _validateMXLocalReadWidth(
           state, isaInfoMap[isa].asmCaps, printRejectionReason):
+        return
+
+      if not _validateMXFreePhase(state, printRejectionReason):
         return
 
       # An explicitly wide local read cannot be reduced by the auto-width
@@ -5502,9 +5806,10 @@ class Solution(collections.abc.Mapping):
       if not bufferLoad:
         reject(state, "dot2 kernel only support bufferLoad!")
       if not ((isaInfoMap[isa].asmCaps['v_dot2_f32_f16'] and state["ProblemType"]["DataType"].isHalf()) \
-      or (isaInfoMap[isa].asmCaps['v_dot2_f32_bf16'] and state["ProblemType"]["DataType"].isBFloat16())) \
+      or (isaInfoMap[isa].asmCaps['v_dot2_f32_bf16'] and state["ProblemType"]["DataType"].isBFloat16()) \
+      or (isaInfoMap[isa].asmCaps.get('v_dot4c_i32_i8', False) and state["ProblemType"]["DataType"].isInt8())) \
       and state["ProblemType"]["HighPrecisionAccumulate"]:
-        reject(state, "dot2 kernel only support DataType fp16 or bf16 with HPA")
+        reject(state, "dot kernel only support DataType fp16, bf16 or int8 with HPA")
       if state["InnerUnroll"] not in [1,2,4]:
         reject(state, "dot2 kernel requires InnerUnroll = 1,2 or 4")
       if state["NumWaveSplitK"] not in [1,2,4,8,16,32,64]:
@@ -6606,6 +6911,15 @@ class Solution(collections.abc.Mapping):
     else:
       ldsNumBytesAB = state["LdsOffsetB"] + ldsNumBytesB
     state["NumLdsBlk"] = numLdsBlk
+    # 3+ LDS buffers rebuild LocalReadAddr from one LocalReadAddrOrig, which the
+    # per-vector 2D MXS phase addresses do not have.
+    if numLdsBlk >= 3:
+      for mxTc in ("MXSA", "MXSB"):
+        if state["ProblemType"]["MXBlock%s" % mxTc[-1]] and mxFreePhase(state, mxTc):
+          reject(state, printRejectionReason,
+                 "%s 2D workgroup phase (MacroTile not aligned to MXBlockFree) does not support "
+                 "%u LDS buffers" % (mxTc, numLdsBlk))
+          return
 
     # Defer resolving if the oracle only blocked on an unresolved 1LDSBuffer(-1) (resolved later, then re-evaluated).
     _segRequested = state["LDSSegmentInterleave"]
@@ -7329,6 +7643,9 @@ class Solution(collections.abc.Mapping):
     if state["ExpandPointerSwap"] == 1 and state["LDSTrInst"]:
       reject(state, printRejectionReason, "LDSTrInst + ExpandPointerSwap not supported")
 
+    if not _validateMXFreePhaseReadOffset(state, printRejectionReason):
+      return
+
     # guard against out of bounds reads
     # None: don't guard against ou
     # ShiftPtr: shift read pointers to be in bounds, then unshift registers (source & assembly),
@@ -7371,7 +7688,7 @@ class Solution(collections.abc.Mapping):
       # if not bufferLoad or not state["GuaranteeNoPartialA"]:
       # Restrict GRVW/VW combos so shift-ptr logic will work.
       # gfx11 dot2 with K-contiguous operands reads along K and never shifts pointers.
-      gfx11Dot = state["UseDotInstruction"] and state["ISA"][0] == 11
+      gfx11Dot = state["UseDotInstruction"] and (state["ISA"][0] == 11 or state["ISA"] == IsaVersion(10,3,0))
       dotNoShiftA = gfx11Dot and not state["ProblemType"]["TLUA"]
       dotNoShiftB = gfx11Dot and not state["ProblemType"]["TLUB"]
       if state["GlobalReadVectorWidthA"] > 1 and not dotNoShiftA \
