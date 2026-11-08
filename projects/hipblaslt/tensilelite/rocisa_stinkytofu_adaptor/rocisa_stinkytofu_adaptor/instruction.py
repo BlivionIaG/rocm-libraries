@@ -968,7 +968,6 @@ def _apply_mubuf(inst: Any, item: Any) -> None:
         scope=scope,
         th=th,
         nv=nv,
-        has_mubuf_const=bool(caps.get("HasMUBUFConst", 0)),
         has_glc_modifier=bool(caps.get("HasGLCModifier", 0)),
         has_sc0_modifier=bool(caps.get("HasSC0Modifier", 0)),
     )
@@ -1707,6 +1706,8 @@ VSubU32 = _make_scalar_alu_class("VSubU32", "v_sub_nc_u32", InstType.INST_U32)
 VMulF32 = _make_scalar_alu_class("VMulF32", "v_mul_f32", InstType.INST_F32)
 # logicalIR: VMulLOU32
 VMulLOU32 = _make_scalar_alu_class("VMulLOU32", "v_mul_lo_u32", InstType.INST_LO_U32)
+# logicalIR: VMacF16
+VMacF16 = _make_scalar_alu_class("VMacF16", "v_mac_f16", InstType.INST_F16)
 # logicalIR: VMulHIU32
 VMulHIU32 = _make_scalar_alu_class("VMulHIU32", "v_mul_hi_u32", InstType.INST_HI_U32)
 # logicalIR: VMulHII32
@@ -3846,6 +3847,10 @@ VMadI32I24 = _make_ternary_class("VMadI32I24", "v_mad_i32_i24", InstType.INST_I3
 VMadU32U24 = _make_ternary_class("VMadU32U24", "v_mad_u32_u24", InstType.INST_U32)
 # logicalIR: VMadMixF32
 VMadMixF32 = _make_ternary_class("VMadMixF32", "v_mad_mix_f32", InstType.INST_F32)
+# logicalIR: VDot4I32I8
+VDot4I32I8 = _make_ternary_class("VDot4I32I8", "v_dot4_i32_i8", InstType.INST_I32)
+# logicalIR: VDot4CI32I8
+VDot4CI32I8 = _make_scalar_alu_class("VDot4CI32I8", "v_dot4c_i32_i8", InstType.INST_I32)
 # logicalIR: VExpF16
 VExpF16 = _make_scalar_unary_class("VExpF16", "v_exp_f16", InstType.INST_F16)
 # logicalIR: VExpF32
@@ -4803,9 +4808,55 @@ GlobalLoadD16U8 = _make_global_load_class("GlobalLoadD16U8", "global_load_d16_u8
 GlobalLoadD16HIU8 = _make_global_load_class("GlobalLoadD16HIU8", "global_load_d16_hi_u8", latency=1)
 
 
+# rocisa ``ReadWriteInstruction::typeConvert`` (``RW_TYPE0``): ISA major below
+# 11 spells the size token the old way (``dword``, ``dwordx4``, ``short_d16_hi``).
+# gfx11+ keeps the bit-width form stored in ``instStr``. Longest modern token
+# first so ``b128`` is not rewritten as ``b32`` / ``b8``.
+_RW_TYPE0_LEGACY_SUFFIX = (
+    ("d16_hi_u8", "ubyte_d16_hi"),
+    ("d16_hi_b8", "byte_d16_hi"),
+    ("d16_hi_b16", "short_d16_hi"),
+    ("d16_u8", "ubyte_d16"),
+    ("d16_b16", "short_d16"),
+    ("b512", "dwordx16"),
+    ("b256", "dwordx8"),
+    ("b128", "dwordx4"),
+    ("b96", "dwordx3"),
+    ("b64", "dwordx2"),
+    ("b32", "dword"),
+    ("b16", "short"),
+    ("u16", "ushort"),
+    ("b8", "byte"),
+    ("u8", "ubyte"),
+)
+
+
+def _rw_type0_mnemonic(mnemonic: str) -> str:
+    """ISA-dependent spelling of a memory opcode stored in its gfx11+ form.
+
+    An unset kernel ISA matches native ``IsaVersion{}`` (0, 0, 0) and takes
+    the legacy suffix. gfx11 and later return ``mnemonic`` unchanged.
+    """
+    from .base import getKernel
+    isa = getKernel().isa
+    major = int(isa[0]) if isa else 0
+    if major >= 11:
+        return mnemonic
+    for modern, legacy in _RW_TYPE0_LEGACY_SUFFIX:
+        token = "_" + modern
+        if mnemonic.endswith(token):
+            return mnemonic[:-len(token)] + "_" + legacy
+    return mnemonic
+
+
 # --- Global Store: rocisa(vaddr, src, saddr, modifier, comment) ---
 def _make_global_store_class(class_name: str, mnemonic: str, latency: int = 1, base: type = None):
-    """Factory for Global store shims: rocisa(vaddr, src, saddr, modifier, comment)."""
+    """Factory for Global store shims: rocisa(vaddr, src, saddr, modifier, comment).
+
+    Text matches ``GLOBALStoreInstruction``: ``preStr`` is ``global_store_``
+    plus ``typeConvert`` (``dword`` before gfx11, ``b32`` after), and the
+    operands are vaddr, data, saddr.
+    """
     if base is None:
         base = GlobalWriteInstruction
 
@@ -4817,6 +4868,22 @@ def _make_global_store_class(class_name: str, mnemonic: str, latency: int = 1, b
             srcs=[vaddr, saddr], dpp=None, sdwa=None, vop3=None, comment=comment)
         self.setInst(mnemonic)
         self._modifier = modifier
+
+    def preStr(self) -> str:
+        return _rw_type0_mnemonic(self.instStr)
+
+    def getArgStr(self) -> str:
+        # rocisa GLOBALStoreInstruction::getArgStr: vaddr, srcData, saddr.
+        vaddr = self.srcs[0] if self.srcs else None
+        saddr = self.srcs[1] if len(self.srcs) > 1 else None
+        return ", ".join(_input_to_str(p) for p in (vaddr, self.dst, saddr))
+
+    def toString(self) -> str:
+        kstr = self.preStr() + " " + self.getArgStr()
+        modifier = getattr(self, "_modifier", None)
+        if modifier is not None and hasattr(modifier, "toString"):
+            kstr += modifier.toString()
+        return self.formatWithComment(kstr)
 
     def to_stinky_logical(self) -> Any:
         import stinkytofu as _st
@@ -4832,6 +4899,9 @@ def _make_global_store_class(class_name: str, mnemonic: str, latency: int = 1, b
 
     cls = type(class_name, (base,), {
         "__init__": __init__,
+        "preStr": preStr,
+        "getArgStr": getArgStr,
+        "toString": toString,
         "to_stinky_logical": to_stinky_logical,
         "__deepcopy__": __deepcopy__,
         **_mem_issue_latency(latency),
@@ -5284,17 +5354,18 @@ class SAtomicUmaxX2(Instruction):
         return dup
 
 
-# --- TensorLoadToLds: rocisa(group0, group1, group2, group3, comment) ---
+# --- TensorLoadToLds: rocisa(group0, group1, group2, group3, comment, tensor) ---
 def _make_tensor_load_class():
     def __init__(self, group0: Any = None, group1: Any = None,
                  group2: Any = None, group3: Any = None,
-                 comment: str = "", **kw):
+                 comment: str = "", tensor: Any = None, **kw):
         _ = kw
         CommonInstruction.__init__(
             self, instType=InstType.INST_NOTYPE, dst=group0,
             srcs=[group1, group2, group3], dpp=None, sdwa=None,
             vop3=None, comment=comment)
         self.setInst("tensor_load_to_lds")
+        self.tensor = tensor
 
     def getArgStr(self) -> str:
         # Native getParams drops group2 and group3 unless both are set.
@@ -5304,7 +5375,11 @@ def _make_tensor_load_class():
         operands = [self.dst, self.srcs[0]]
         if group2 is not None and group3 is not None:
             operands.extend((group2, group3))
-        return ", ".join(_input_to_str(operand) for operand in operands if operand is not None)
+        argStr = ", ".join(_input_to_str(operand) for operand in operands if operand is not None)
+        tensor = getattr(self, "tensor", None)
+        if tensor is not None and hasattr(tensor, "toString"):
+            argStr += tensor.toString()
+        return argStr
 
     def to_stinky_logical(self) -> Any:
         import stinkytofu as _st
@@ -5323,6 +5398,10 @@ def _make_tensor_load_class():
             _to_stinky_register(self.dst),
             _to_stinky_register(self.srcs[0]),
             **kwargs)
+        tensor = getattr(self, "tensor", None)
+        if tensor is not None:
+            logical.set_tensor(scope=int(tensor.scope), th=int(tensor.th),
+                               nv=int(tensor.nv) != 0, is_store=bool(tensor.isStore))
         return logical
 
     def __deepcopy__(self, memo):
