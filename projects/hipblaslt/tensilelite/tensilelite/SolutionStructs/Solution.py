@@ -1131,6 +1131,18 @@ class Solution(collections.abc.Mapping):
       reject(state, "WaveSplitK currently only support dot2 kernel.")
       return
 
+    # Int8 with neither a matrix instruction nor a dot instruction has no
+    # correct MAC: the classic path unpacks each byte and runs v_mad_i32_i24,
+    # and the packed local-read/local-write layout it generates does not match
+    # the register layout MAC assumes (see the int8 dot4 note above).  gfx1013
+    # is such a part -- RDNA1 only has v_dot* from gfx1011 on -- so its int8
+    # logic entries are dropped instead of built broken.
+    if state["ProblemType"]["DataType"].isInt8() \
+      and not state["EnableMatrixInstruction"] \
+      and not state["UseDotInstruction"]:
+      reject(state, "int8 needs a dot instruction when there is no matrix instruction")
+      return
+
     # workaround for MX
     # set ASEM=minASEMforMX for not TLUA or not TLUB
     # so far, kernel code can support 16, but host code cannot hanlde it
