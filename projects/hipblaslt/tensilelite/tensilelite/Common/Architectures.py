@@ -55,6 +55,11 @@ architectureMap = {
     "gfx950:xnack+": "gfx950",
     "gfx950:xnack-": "gfx950",
     "gfx1010": "navi10",
+    # Cyan Skillfish (the BC-250's gfx1013) is Navi 10's ISA plus the A
+    # encoding, so it reads Navi 10's capability name.  It has no v_dot*
+    # instruction at all: the RDNA1 ISA only gained those in gfx1011
+    # (Navi 12), and gfx1013 is gfx10.1.0 plus FeatureGFX10_AEncoding.
+    "gfx1013": "navi10",
     "gfx1011": "navi12",
     "gfx1012": "navi14",
     "gfx1030": "navi21",
@@ -205,6 +210,10 @@ SUPPORTED_ISA = [
     IsaVersion(10, 1, 0),
     IsaVersion(10, 1, 1),
     IsaVersion(10, 1, 2),
+    # Cyan Skillfish (gfx1013): gfx10.1.0's instructions plus the A
+    # encoding, and none of the v_dot2/v_dot4 lines that gfx1011 and gfx1012
+    # carry.  The BC-250's GPU.
+    IsaVersion(10, 1, 3),
     IsaVersion(10, 3, 0),
     # The rest of RDNA2: Navi 22 (gfx1031), Navi 23 (gfx1032), Navi 24
     # (gfx1034) and the Rembrandt and Phoenix integrated GPUs (gfx1035).

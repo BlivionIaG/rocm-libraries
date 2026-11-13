@@ -18,6 +18,14 @@ Full documentation for hipBLASLt is available at [rocm.docs.amd.com/projects/hip
   other four architectures share the `gfx1030` solution set, because they use
   the same instruction set and the same register file. Build one with
   `./install.sh -a gfx1030` or with `--gpu-targets gfx1030`.
+* Support for `gfx1013` (Cyan Skillfish), the GPU in the AMD BC-250. It is
+  Navi 10's ISA plus the A encoding, and the one RDNA1 part with no dot
+  instruction at all: the ISA only gained `v_dot*` from `gfx1011` on. 16-bit
+  GEMM therefore runs the non-matrix-instruction path on `v_mac_f16` and
+  `v_pk_fma_f16` -- no `v_dot2`, so it is slower than RDNA2 for the same
+  shapes -- and 8-bit GEMM is not built, because the classic packed-int8 MAC
+  is the broken path the RDNA2 int8 work removed. Build it with
+  `--gpu-targets gfx1013`; the library reads Navi 10's capability name.
 * `HIPBLASLT_CHECK_SYNCHRONIZER` environment variable: opt-in post-launch
   dirty-buffer check for the handle's inter-workgroup flag buffers, which their
   kernels must leave at zero (`1`, `on` or `true` to enable; anything else

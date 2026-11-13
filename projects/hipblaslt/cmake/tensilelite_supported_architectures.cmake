@@ -8,6 +8,11 @@ set(SUPPORTED_ARCHITECTURES
     "gfx942"
     "gfx950"
     "gfx1030"
+    # RDNA1's semi-custom part: Cyan Skillfish (gfx1013), the BC-250's GPU.
+    # Same ISA as Navi 10 (gfx1010) plus the A encoding, and no dot product
+    # instructions at all -- the RDNA1 ISA only gained v_dot* in gfx1011,
+    # and gfx1013 does not have them.  Built from Navi 10's capabilities.
+    "gfx1013"
     # The rest of RDNA2, the same ISA under the other product names: Navi 22
     # (gfx1031), Navi 23 (gfx1032), Navi 24 (gfx1034) and the Rembrandt and
     # Phoenix integrated GPUs (gfx1035).  Same instructions as Navi 21, so
