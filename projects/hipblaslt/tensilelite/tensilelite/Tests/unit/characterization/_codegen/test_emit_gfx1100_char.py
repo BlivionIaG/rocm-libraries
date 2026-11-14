@@ -39,3 +39,13 @@ def test_valu_tail_with_inner_unroll(tmp_path):
     results = emit_kernels_from_logic(path)
     assert results
     assert all(err == 0 for _, _, err in results)
+
+
+def test_valu_auxiliary_output_codegen(tmp_path):
+    logic = yaml.safe_load((Path(data_dir(_ARCH)) / "SB.yaml").read_text())
+    logic[4]["UseE"] = True
+    path = tmp_path / "valu-aux.yaml"
+    path.write_text(yaml.safe_dump(logic))
+    results = emit_kernels_from_logic(path)
+    assert results
+    assert all(err == 0 for _, _, err in results)
