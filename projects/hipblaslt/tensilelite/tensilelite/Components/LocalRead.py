@@ -107,8 +107,7 @@ class LocalReadVALU(LocalRead):
                     srcAddr=vgpr("LocalReadAddr%s"%tc)
                 highBits = (not writer.states.archCaps["DSLow16NotPreserve"]
                             and not kernel["UseDotInstruction"]
-                            and ((kernel["ISA"] == (10, 3, 0)
-                                  and kernel["ProblemType"]["DataType"].isBFloat16())
+                            and (kernel["ProblemType"]["DataType"].isBFloat16()
                                  or (kernel["ISA"][0] == 10
                                      and kernel["ProblemType"]["DataType"].isHalf()
                                      and not kernel["ProblemType"]["HighPrecisionAccumulate"]))
