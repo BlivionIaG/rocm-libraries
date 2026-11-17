@@ -1339,14 +1339,26 @@ class Solution(collections.abc.Mapping):
         and isaInfoMap[state["ISA"]].asmCaps.get("v_dot4c_i32_i8", False)):
       state["UseDotInstruction"] = True
       state["NumDotElements"] = 4
-      state["InnerUnroll"] = 1
-      state["TransposeLDS"] = 2
-      state["VectorWidthA"] = state["VectorWidthB"] = 1
+      # The dot4 path uses one dot4 group per unroll step and scalar global reads.
+      # Reject unsupported geometry rather than silently changing tuned parameters.
+      if state["InnerUnroll"] != 1:
+        reject(state, printRejectionReason,
+               "int8 dot4 requires InnerUnroll = 1, got %u" % state["InnerUnroll"])
+        return
+      dotReadWidth = state["NumDotElements"] * state["InnerUnroll"]
+      for tc in ("A", "B"):
+        if state[f"LocalReadVectorWidth{tc}"] not in [-1, dotReadWidth]:
+          reject(state, printRejectionReason,
+                 "int8 dot4 requires LocalReadVectorWidth%s = %u, got %u"
+                 % (tc, dotReadWidth, state[f"LocalReadVectorWidth{tc}"]))
+          return
+      if state["GlobalReadVectorWidthA"] not in [-1, 1] \
+          or state["GlobalReadVectorWidthB"] not in [-1, 1]:
+        reject(state, printRejectionReason,
+               "int8 dot4 requires GlobalReadVectorWidthA/B = 1, got %d/%d"
+               % (state["GlobalReadVectorWidthA"], state["GlobalReadVectorWidthB"]))
+        return
       state["GlobalReadVectorWidthA"] = state["GlobalReadVectorWidthB"] = 1
-      state["LocalReadVectorWidth"] = 4
-      state["LocalReadVectorWidthA"] = state["LocalReadVectorWidthB"] = 4
-      state["LocalRead2A"] = state["LocalRead2B"] = False
-      state["LocalWrite2A"] = state["LocalWrite2B"] = False
     if not state["UseDotInstruction"] and state["WaveSplitK"]:
       reject(state, "WaveSplitK currently only support dot2 kernel.")
       return
